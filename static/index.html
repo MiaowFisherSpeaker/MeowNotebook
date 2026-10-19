@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MeowNotebook</title>
+<link rel="stylesheet" href="vendor/katex/katex.min.css">
+<link rel="stylesheet" href="vendor/xterm/xterm.css">
+<link rel="stylesheet" href="vendor/hljs/github.min.css" media="(prefers-color-scheme: light)">
+<link rel="stylesheet" href="vendor/hljs/github-dark.min.css" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<aside id="side">
+  <div class="brand">MeowNotebook <button id="toggle-side" title="收起侧栏">⟨</button></div>
+  <div class="side-actions">
+    <input id="search" type="search" placeholder="搜索标题 / 首问 / 目录…">
+  </div>
+  <nav class="side-tabs"><button data-side="sessions">会话</button><button data-side="files">文件</button></nav>
+  <div id="side-sessions" class="side-pane">
+    <a id="star-link" class="sess" href="#/stars"><div class="t">★ 收藏 <span id="star-count"></span></div></a>
+    <div id="sessions"></div>
+  </div>
+  <div id="side-files" class="side-pane" hidden>
+    <div id="fs-bar">
+      <button id="fs-up" title="上一级">↑</button>
+      <button id="fs-home" title="回到当前会话目录">⌂</button>
+      <label class="opt"><input type="checkbox" id="fs-hidden"> 隐藏文件</label>
+    </div>
+    <div id="fs-path"></div>
+    <div id="fs-list"></div>
+  </div>
+</aside>
+<main id="main">
+  <div id="empty" class="hint">从左侧选择一个会话;新会话请在终端里用 <code>cc</code> 启动。<br>
+    <span class="badge run">运行中</span> 的会话可以在页面底部直接对话;<span class="dot live"></span> 表示记录正在更新;<span class="badge">整理版</span> 表示已用 <code>/qa-notes</code> 整理过。</div>
+  <div id="view" hidden>
+    <header id="head" class="head">
+      <button class="show-side" title="展开侧栏">☰</button>
+      <div class="titles">
+        <h1 id="title"></h1>
+        <div id="sub" class="sub"></div>
+      </div>
+      <div class="actions" id="f-actions">
+        <a id="f-raw" class="btn" target="_blank">新标签页打开</a>
+        <a id="f-dl" class="btn">下载</a>
+      </div>
+      <div class="actions" id="s-actions">
+        <button data-copy="resume" title="复制恢复会话命令">复制 resume 命令</button>
+        <button data-copy="notes" title="复制整理命令,粘贴到任意 cc 会话执行">复制 /qa-notes 命令</button>
+      </div>
+    </header>
+    <nav id="tabs">
+      <button data-tab="note">整理版</button>
+      <button data-tab="raw">原始问答</button>
+      <label class="opt"><input type="checkbox" id="show-process"> 显示过程文字</label>
+      <label class="opt"><input type="checkbox" id="show-misc"> 显示命令 / Shell</label>
+    </nav>
+    <div id="content">
+      <nav id="toc"></nav>
+      <article id="article"></article>
+    </div>
+    <section id="dock">
+      <div id="dock-bar" title="拖动调整高度">
+        <span class="grip"></span>
+        <span id="dock-status"></span>
+        <span class="sp"></span>
+        <button id="dock-max" title="放大 / 还原(需要看完整菜单或长输出时)">放大</button>
+        <button id="dock-kill" class="danger" title="结束这个 cc 进程(记录保留,可随时继续)">结束会话</button>
+      </div>
+      <div id="dock-start">
+        <button id="dock-go">▶ 在此继续对话</button>
+        <span id="dock-tip">将以 <code>--resume</code> 在后台启动(bypass 模式),底部出现与终端完全相同的输入框。</span>
+      </div>
+      <div id="termbox"><div id="term-overlay" hidden></div></div>
+    </section>
+  </div>
+</main>
+<div id="qpop" hidden></div>
+<div id="toast"></div>
+<script src="vendor/marked.min.js"></script>
+<script src="vendor/purify.min.js"></script>
+<script src="vendor/katex/katex.min.js"></script>
+<script src="vendor/xterm/xterm.js"></script>
+<script src="vendor/xterm/addon-fit.js"></script>
+<script src="vendor/hljs/highlight.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

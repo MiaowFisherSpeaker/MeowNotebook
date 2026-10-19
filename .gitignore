@@ -1,0 +1,6 @@
+# 个人数据只留在本地,不进仓库
+data/*
+!data/notes/
+data/notes/*
+!data/notes/.gitkeep
+__pycache__/
