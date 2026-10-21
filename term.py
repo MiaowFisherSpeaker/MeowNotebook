@@ -160,8 +160,22 @@ def _recv_exact(sock, n):
     return buf
 
 
+WS_MAX_MESSAGE = 1 << 20  # 单条消息(含分片拼接后)上限 1 MiB:键盘输入 / 粘贴 / resize 远用不到
+
+
+class MessageTooBig(ValueError):
+    pass
+
+
+def _unmask(data, mask):
+    if not data:
+        return data
+    k = int.from_bytes((mask * (len(data) // 4 + 1))[:len(data)], "big")
+    return (int.from_bytes(data, "big") ^ k).to_bytes(len(data), "big")
+
+
 def ws_recv(sock):
-    """读一条完整消息,返回 (opcode, payload)。"""
+    """读一条完整消息,返回 (opcode, payload)。超过大小上限时在读 payload 之前抛 MessageTooBig。"""
     data, first_op = b"", None
     while True:
         b1, b2 = _recv_exact(sock, 2)
@@ -171,8 +185,12 @@ def ws_recv(sock):
             n = struct.unpack(">H", _recv_exact(sock, 2))[0]
         elif n == 127:
             n = struct.unpack(">Q", _recv_exact(sock, 8))[0]
+        if op >= 8 and (n > 125 or not fin):  # 协议规定控制帧不分片、payload ≤ 125
+            raise MessageTooBig
+        if op < 8 and len(data) + n > WS_MAX_MESSAGE:
+            raise MessageTooBig
         mask = _recv_exact(sock, 4) if b2 & 0x80 else b"\0\0\0\0"
-        payload = bytes(c ^ mask[i % 4] for i, c in enumerate(_recv_exact(sock, n)))
+        payload = _unmask(_recv_exact(sock, n), mask)
         if op >= 8:  # 控制帧可以插在分片中间
             return op, payload
         first_op = first_op if op == 0 else op
@@ -214,6 +232,7 @@ def bridge(handler, name):
         env.update(TERM="xterm-256color", COLORTERM="truecolor", LANG=env.get("LANG", "C.UTF-8"))
         os.execvpe("tmux", ["tmux", "-L", SOCKET, "-f", str(TMUX_CONF), "attach", "-t", f"={name}"], env)
     set_winsize(fd, 40, 120)
+    close_code = b""
     try:
         while True:
             r, _, _ = select.select([sock, fd], [], [], 30)
@@ -243,6 +262,8 @@ def bridge(handler, name):
                     set_winsize(fd, max(5, int(size["rows"])), max(20, int(size["cols"])))
             if not r:
                 ws_send(sock, b"", 9)  # 保活 ping
+    except MessageTooBig:
+        close_code = struct.pack(">H", 1009)  # 1009 = message too big
     except (ConnectionError, OSError, ValueError):
         pass
     finally:
@@ -253,6 +274,6 @@ def bridge(handler, name):
             pass
         os.close(fd)
         try:
-            ws_send(sock, b"", 8)
+            ws_send(sock, close_code, 8)
         except OSError:
             pass

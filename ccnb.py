@@ -18,8 +18,11 @@ import json
 import os
 import re
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -467,12 +470,31 @@ def fs_list(path, hidden=False):
             "entries": entries[:3000], "truncated": len(entries) > 3000}
 
 
+def read_regular(f, limit):
+    """只读普通文件,最多 limit 字节;超过返回 None。
+    O_NONBLOCK:打开 FIFO 不会卡住;fstat 检查打开后的那个文件,设备 / 管道 / socket 一律拒绝;
+    读的时候限长,不依赖 stat 的大小(文件可能正在变大)。"""
+    fd = os.open(f, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"不是普通文件: {f}")
+        with os.fdopen(fd, "rb") as fh:
+            fd = None
+            data = fh.read(limit + 1)
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return None if len(data) > limit else data
+
+
 def fs_read(path, cwd=None):
     f = fs_path(path, cwd)
     if not f.exists():
         raise ValueError(f"文件不存在: {f}")
     if f.is_dir():
         return {"path": str(f), "kind": "dir"}
+    if not f.is_file():
+        raise ValueError(f"不是普通文件: {f}")
     st = f.stat()
     info = {"path": str(f), "name": f.name, "size": st.st_size, "mtime": st.st_mtime}
     ext = f.suffix.lower()
@@ -482,7 +504,9 @@ def fs_read(path, cwd=None):
         return {**info, "kind": "pdf"}
     if st.st_size > TEXT_LIMIT:
         return {**info, "kind": "large"}
-    data = f.read_bytes()
+    data = read_regular(f, TEXT_LIMIT)
+    if data is None:
+        return {**info, "kind": "large"}
     if b"\0" in data[:8192]:
         return {**info, "kind": "binary"}
     try:
@@ -498,6 +522,9 @@ def fs_read(path, cwd=None):
 
 # ---------------------------------------------------------------- 收藏
 
+_stars_lock = threading.Lock()  # 收藏的"读-改-写"必须串行,否则并发请求会互相覆盖
+
+
 def load_stars():
     try:
         return json.loads(STARS.read_text(encoding="utf-8"))
@@ -507,26 +534,37 @@ def load_stars():
 
 def save_stars(stars):
     STARS.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STARS.with_suffix(".tmp")
-    tmp.write_text(json.dumps(stars, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(STARS)
+    fd, tmp = tempfile.mkstemp(dir=STARS.parent, prefix=".stars-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(stars, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, STARS)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def migrate_stars():
     """收藏所在的会话被接续后,把收藏改挂到最新的会话上(问答时间戳随历史一起复制,保持不变)。"""
-    stars, changed = load_stars(), False
-    for x in stars:
-        p = find_session(x["sid"])
-        latest = latest_continuation(p) if p else None
-        if latest and latest != p:
-            x["sid"], changed = latest.stem, True
-    if changed:
-        save_stars(stars)
-    return stars
+    with _stars_lock:
+        stars, changed = load_stars(), False
+        for x in stars:
+            p = find_session(x["sid"])
+            latest = latest_continuation(p) if p else None
+            if latest and latest != p:
+                x["sid"], changed = latest.stem, True
+        if changed:
+            save_stars(stars)
+        return stars
 
 
 def toggle_star(sid, ts, on):
     """收藏以 (会话, 提问时间戳) 为键,并保存问答快照:即使原始记录被清理,收藏仍在。"""
+    with _stars_lock:
+        return _toggle_star(sid, ts, on)
+
+
+def _toggle_star(sid, ts, on):
     stars = [x for x in load_stars() if not (x["sid"] == sid and x["ts"] == ts)]
     if on:
         p = find_session(sid)
