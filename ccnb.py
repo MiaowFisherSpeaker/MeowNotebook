@@ -88,7 +88,7 @@ def _clean_user_text(text):
 def parse_session(path):
     """把一个 .jsonl 会话解析成问答轮次。"""
     meta = {"id": path.stem, "file": str(path), "cwd": None, "title": None,
-            "ai_title": None, "first_q": None, "started": None, "updated": None}
+            "ai_title": None, "first_q": None, "started": None, "updated": None, "continued_in": None}
     turns = []
     images = []  # base64 图片,turn 里只存索引;通过 /api/image/<sid>/<k> 取
     cur = None
@@ -114,6 +114,9 @@ def parse_session(path):
             t = d.get("type")
             if t == "ai-title":
                 meta["ai_title"] = d.get("aiTitle")
+                continue
+            if t == "continued-in":  # 从 agent 视图重新进入会话时,cc 会把历史复制到新会话继续,并在旧会话末尾留下这条记录
+                meta["continued_in"] = d.get("continuedInSessionId")
                 continue
             if t in ("custom-title", "agent-name"):
                 meta["title"] = d.get("customTitle") or d.get("agentName") or meta["title"]
@@ -219,6 +222,45 @@ def find_session(sid):
     return None
 
 
+def successor(path):
+    """会话已在别的会话里继续(continued-in)→ 返回新会话的路径,否则 None。
+    新会话必须存在且确实带着复制过去的历史(提问数不少于旧会话),否则旧会话仍是唯一完整的记录。"""
+    meta = cached_parse(path)[0]
+    nxt = find_session(meta["continued_in"]) if meta["continued_in"] else None
+    return nxt if nxt and cached_parse(nxt)[0]["questions"] >= meta["questions"] else None
+
+
+def latest_continuation(path):
+    """沿 continued-in 链走到最新的那个会话。"""
+    for _ in range(50):  # 防环
+        nxt = successor(path)
+        if not nxt:
+            break
+        path = nxt
+    return path
+
+
+def predecessors(path):
+    """在 path 之前、被它接续的旧会话(由近到远)。"""
+    out, cur = [], path
+    for _ in range(50):
+        prev = next((p for p in cur.parent.glob("*.jsonl") if cached_parse(p)[0]["continued_in"] == cur.stem), None)
+        if not prev or prev in out:
+            break
+        out.append(prev)
+        cur = prev
+    return out
+
+
+def find_note(path):
+    """整理版可能是在接续之前写的,挂在旧会话 id 上。"""
+    for p in [path, *predecessors(path)]:
+        note = read_note(p.stem)
+        if note:
+            return note
+    return None
+
+
 def project_dir_for(cwd):
     return PROJECTS / re.sub(r"[^A-Za-z0-9]", "-", str(Path(cwd).resolve()))
 
@@ -281,6 +323,11 @@ def link_terms(terms):
         if rec and rec["ts"] >= t["created"] - 5:
             t["sid"] = rec["session_id"]
             t["source"] = rec.get("source") or rec.get("event")
+            # 换到了新 id 但还没有问答(不是 /clear):多半是 cc 正把旧会话接续到新 id,先留在旧会话上
+            cur, prev = find_session(t["sid"]), rec.get("prev") and find_session(rec["prev"])
+            if rec.get("source") not in ("clear", "startup") and prev and not (cur and cached_parse(cur)[0]["questions"]) \
+                    and cached_parse(prev)[0]["questions"]:
+                t["sid"] = prev.stem
             continue
         # 2. 兜底(旧终端没有 hook 时):启动参数 + /clear 推测
         sid = t["launch_sid"]
@@ -301,6 +348,10 @@ def link_terms(terms):
         if newer:
             sid = max(newer)[1]
         t["sid"] = sid if sid and find_session(sid) else None
+    for t in terms:  # 和网页的跳转保持一致:已被接续的会话 → 最新的那个,避免网页在新旧 id 之间来回跳
+        p = t["sid"] and find_session(t["sid"])
+        if p:
+            t["sid"] = latest_continuation(p).stem
     return terms
 
 
@@ -350,6 +401,8 @@ def search(q, scope="all", per_session=5, max_sessions=60):
     for p in all_session_files():
         try:
             meta, turns = cached_parse(p)
+            if successor(p):
+                continue
         except OSError:
             continue
         if not meta["questions"]:
@@ -459,6 +512,19 @@ def save_stars(stars):
     tmp.replace(STARS)
 
 
+def migrate_stars():
+    """收藏所在的会话被接续后,把收藏改挂到最新的会话上(问答时间戳随历史一起复制,保持不变)。"""
+    stars, changed = load_stars(), False
+    for x in stars:
+        p = find_session(x["sid"])
+        latest = latest_continuation(p) if p else None
+        if latest and latest != p:
+            x["sid"], changed = latest.stem, True
+    if changed:
+        save_stars(stars)
+    return stars
+
+
 def toggle_star(sid, ts, on):
     """收藏以 (会话, 提问时间戳) 为键,并保存问答快照:即使原始记录被清理,收藏仍在。"""
     stars = [x for x in load_stars() if not (x["sid"] == sid and x["ts"] == ts)]
@@ -503,7 +569,7 @@ def session_summary(path):
         "first_q": meta["first_q"], "questions": meta["questions"],
         "started": meta["started"], "updated": meta["updated"], "mtime": mtime,
         "active": time.time() - mtime < ACTIVE_SECONDS,
-        "noted": note_path(meta["id"]).exists(),
+        "noted": note_path(meta["id"]).exists() or any(note_path(x.stem).exists() for x in predecessors(path)),
     }
 
 
@@ -703,7 +769,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         try:
             if u.path == "/api/stars":
-                return self._json({"stars": load_stars()})
+                return self._json({"stars": migrate_stars()})
             m = re.fullmatch(r"/api/image/([\w-]+)/(\d+)", u.path)
             if m:
                 p = find_session(m.group(1))
@@ -737,6 +803,8 @@ class Handler(SimpleHTTPRequestHandler):
                                       "active": True, "noted": False, "running": t["name"]})
                 for p in all_session_files():
                     try:
+                        if successor(p):  # 已在新会话里继续,只列最新的那个
+                            continue
                         s = session_summary(p)
                     except OSError:
                         continue
@@ -756,7 +824,10 @@ class Handler(SimpleHTTPRequestHandler):
                                                     "questions": 0, "started": None, "updated": None}})
                 if not p:
                     return self._json({"error": "not found"}, 404)
-                note = read_note(m.group(1))
+                latest = latest_continuation(p)
+                if latest != p:
+                    return self._json({"moved": latest.stem})
+                note = find_note(p)
                 version = f"{p.stat().st_mtime_ns}-{note['mtime'] if note else 0}"
                 if q.get("v", [""])[0] == version:
                     return self._json({"unchanged": True, "version": version})
@@ -867,7 +938,7 @@ def cmd_current(args):
 
 def cmd_list(args):
     for p in all_session_files():
-        if args.project and project_dir_for(args.project) != p.parent:
+        if args.project and project_dir_for(args.project) != p.parent or successor(p):
             continue
         s = session_summary(p)
         if s["questions"]:

@@ -17,9 +17,16 @@ try:
     if pane.isdigit() and data.get("session_id"):
         d = Path(__file__).resolve().parent / "data" / "panes"
         d.mkdir(parents=True, exist_ok=True)
+        # 记下切换前的会话:从 agent 视图重新进入时 cc 会换新 id,新会话写出历史之前网页先留在旧会话上
+        try:
+            old = json.loads((d / f"{pane}.json").read_text())
+        except (OSError, ValueError):
+            old = {}
+        prev = old.get("session_id") if old.get("session_id") != data["session_id"] else old.get("prev")
         tmp = d / f"{pane}.tmp"
         tmp.write_text(json.dumps({"session_id": data["session_id"], "event": data.get("hook_event_name"),
-                                   "source": data.get("source"), "cwd": data.get("cwd"), "ts": time.time()}))
+                                   "source": data.get("source"), "cwd": data.get("cwd"), "ts": time.time(),
+                                   "prev": prev}))
         tmp.replace(d / f"{pane}.json")
 except Exception:  # noqa: BLE001  hook 失败绝不能影响 cc
     pass

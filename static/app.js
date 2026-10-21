@@ -218,6 +218,8 @@ async function loadSession(force = false) {
   const v = force ? '' : (state.version || '');
   const r = await fetch(`/api/session/${sid}?v=${encodeURIComponent(v)}`).then(r => r.json()).catch(() => null);
   if (!r || sid !== state.sid || r.unchanged) return;
+  // 这个会话已在新会话里继续(从 agent 视图重新进入时 cc 会换新 id)→ 跳到最新的那个
+  if (r.moved) { location.replace('#/s/' + r.moved + (state.jump ? '/' + state.jump : '')); return; }
   if (r.error) { $('#article').innerHTML = `<div class="hint">${esc(r.error)}</div>`; return; }
   const atBottom = $('#main').scrollTop + $('#main').clientHeight > $('#main').scrollHeight - 80;
   const first = !state.data || state.data.meta.id !== r.meta.id;
