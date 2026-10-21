@@ -344,14 +344,15 @@ function mapTarget(i) {
 }
 function layoutMap() {
   const toc = $('#toc');
-  const top = ($('#head')?.offsetHeight || 80) + 8;
+  const top = ($('#top')?.offsetHeight || 80) + 8;
+  $('#main').style.setProperty('--top-h', (top - 8) + 'px');
   const dockH = $('#view').classList.contains('file') || $('#view').classList.contains('stars') ? 0 : dock.offsetHeight;
   toc.style.setProperty('--toc-top', top + 'px');
   toc.style.setProperty('--toc-h', Math.max(160, window.innerHeight - top - dockH - 8) + 'px');
 }
 function spy() {
   if (!qmap.items.length) return;
-  const line = ($('#head')?.getBoundingClientRect().bottom || 0) + 60;
+  const line = ($('#top')?.getBoundingClientRect().bottom || 0) + 60;
   let cur = 0;
   for (let i = 0; i < qmap.items.length; i++) {
     const el = mapTarget(i);

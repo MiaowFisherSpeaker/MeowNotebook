@@ -62,8 +62,9 @@ body.side-hidden #side { display: none; }
    否则它们不受 #main 的 overflow 裁剪,会把整个页面撑高,滚到底后出现一大片空白 */
 #main { flex: 1; height: 100vh; overflow-y: auto; position: relative; }
 .hint { margin: 20vh auto; max-width: 420px; color: var(--muted); text-align: center; }
-.head { display: flex; gap: 14px; align-items: flex-start; padding: 18px 28px 10px; border-bottom: 1px solid var(--line);
-  position: sticky; top: 0; background: var(--bg); z-index: 2; }
+/* 标题栏和标签栏一起吸顶,滚到哪里都能切换整理版 / 原始问答 */
+#top { position: sticky; top: 0; background: var(--bg); z-index: 2; }
+.head { display: flex; gap: 14px; align-items: flex-start; padding: 18px 28px 10px; border-bottom: 1px solid var(--line); }
 .show-side { display: none; }
 body.side-hidden .show-side { display: inline-block; }
 .titles { flex: 1; min-width: 0; }
@@ -104,7 +105,7 @@ body.side-hidden .show-side { display: inline-block; }
 #article { flex: 1; min-width: 0; max-width: 920px; }
 
 /* 问答 */
-.turn { margin-bottom: 30px; scroll-margin-top: 130px; }
+.turn { margin-bottom: 30px; scroll-margin-top: calc(var(--top-h, 130px) + 10px); }
 .q { background: var(--q-bg); border: 1px solid var(--q-line); border-radius: 10px; padding: 10px 16px; }
 .q .lab, .a .lab { font-size: 11.5px; color: var(--muted); display: flex; gap: 10px; }
 .q.command, .q.shell { background: var(--code-bg); border-color: var(--line); font-family: monospace; font-size: 13px; }
@@ -118,7 +119,7 @@ details.proc .md { opacity: .85; }
 
 /* Markdown */
 .md h1 { font-size: 1.45em; } .md h2 { font-size: 1.25em; border-bottom: 1px solid var(--line); padding-bottom: 4px; }
-.md h3 { font-size: 1.08em; } .md h1, .md h2, .md h3 { margin: 1.2em 0 .5em; line-height: 1.4; scroll-margin-top: 130px; }
+.md h3 { font-size: 1.08em; } .md h1, .md h2, .md h3 { margin: 1.2em 0 .5em; line-height: 1.4; scroll-margin-top: calc(var(--top-h, 130px) + 10px); }
 .md p { margin: .55em 0; }
 .md pre { background: var(--code-bg); padding: 10px 14px; border-radius: 8px; overflow-x: auto; }
 .md :not(pre) > code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
