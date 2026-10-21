@@ -186,7 +186,8 @@ button.danger:hover { border-color: #c0392b; color: #c0392b; }
 #dock-start { display: flex; align-items: center; gap: 12px; padding: 14px 20px; background: var(--bg); font-size: 13px; color: var(--muted); }
 #dock-start button { background: var(--accent); border-color: var(--accent); color: #fff; padding: 6px 16px; font-size: 14px; }
 #dock-start button:disabled { opacity: .45; cursor: default; }
-#termbox { height: var(--dock-h); position: relative; padding: 4px 0 0 8px; }
+/* overflow:hidden:xterm 的隐藏输入框按光标行绝对定位,终端调矮后它会留在原处撑高页面,滚到底时底部出现空白 */
+#termbox { height: var(--dock-h); position: relative; padding: 4px 0 0 8px; overflow: hidden; }
 #termbox .xterm { height: 100%; }
 #dock.max { --dock-h: 72vh; }
 #dock:not(.on) #termbox, #dock:not(.on) #dock-max, #dock:not(.on) #dock-kill { display: none; }
