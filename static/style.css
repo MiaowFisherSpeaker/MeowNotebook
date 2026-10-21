@@ -75,7 +75,9 @@ body.side-hidden .show-side { display: inline-block; }
 
 #content { display: flex; gap: 28px; padding: 20px 28px 80px; align-items: flex-start; }
 /* 问题地图:垂直居中,最多 15 根横条;平时一样长,指针移上去按问题长短展开 */
+/* 负的下外边距:地图高度按视口算,不能参与撑高 #content,否则短会话也会多出一截可滚动的空白 */
 #toc { width: 132px; flex: none; position: sticky; top: var(--toc-top, 120px); height: var(--toc-h, 60vh);
+  margin-bottom: calc(-1 * var(--toc-h, 60vh));
   display: flex; flex-direction: column; justify-content: center; overflow: hidden; padding: 0 8px 0 0; }
 #toc:empty { display: none; }
 .qi { display: block; padding: 5px 0; cursor: pointer; }
