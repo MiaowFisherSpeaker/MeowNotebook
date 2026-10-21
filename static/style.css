@@ -58,7 +58,9 @@ body.side-hidden #side { display: none; }
 .badge { font-size: 10.5px; padding: 0 6px; border-radius: 9px; background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent); }
 
 /* 主区 */
-#main { flex: 1; height: 100vh; overflow-y: auto; }
+/* relative:让正文里的绝对定位元素(如 KaTeX 的 .katex-mathml)以 #main 为包含块,
+   否则它们不受 #main 的 overflow 裁剪,会把整个页面撑高,滚到底后出现一大片空白 */
+#main { flex: 1; height: 100vh; overflow-y: auto; position: relative; }
 .hint { margin: 20vh auto; max-width: 420px; color: var(--muted); text-align: center; }
 .head { display: flex; gap: 14px; align-items: flex-start; padding: 18px 28px 10px; border-bottom: 1px solid var(--line);
   position: sticky; top: 0; background: var(--bg); z-index: 2; }
