@@ -14,6 +14,9 @@
 <aside id="side">
   <div class="brand">MeowNotebook <button id="toggle-side" title="收起侧栏">⟨</button></div>
   <div class="side-actions">
+    <select id="search-mode" title="搜索范围:标题最快;提问 / 全文会搜索会话正文">
+      <option value="title">标题</option><option value="q">提问</option><option value="all">全文</option>
+    </select>
     <input id="search" type="search" placeholder="搜索标题 / 首问 / 目录…">
   </div>
   <nav class="side-tabs"><button data-side="sessions">会话</button><button data-side="files">文件</button></nav>

@@ -155,6 +155,15 @@ details.proc .md { opacity: .85; }
 /* 侧栏:新会话按钮、运行中标记 */
 .side-actions { display: flex; gap: 6px; margin: 0 12px 10px; }
 .side-actions #search { margin: 0; flex: 1; min-width: 0; }
+#search-mode { flex: none; padding: 0 4px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--card); color: var(--text); font: inherit; font-size: 12.5px; }
+.sr-sum { padding: 2px 16px 6px; font-size: 11.5px; color: var(--muted); }
+.sr-hit { display: block; margin: 2px 0 4px 12px; padding: 3px 8px; font-size: 12px; line-height: 1.5; color: var(--muted);
+  text-decoration: none; border-radius: 6px; overflow-wrap: anywhere; }
+.sr-hit:hover { background: var(--accent-soft); color: var(--text); }
+.sr-hit b { font-weight: 600; color: var(--accent); margin-right: 4px; }
+.sr-more { margin-left: 20px; font-size: 11.5px; color: var(--muted); }
+mark { background: color-mix(in srgb, var(--accent) 30%, transparent); color: inherit; border-radius: 2px; padding: 0 1px; }
 .side-actions button { flex: none; background: var(--accent); border-color: var(--accent); color: #fff; }
 .badge.run { background: color-mix(in srgb, var(--live) 15%, transparent); color: var(--live); border-color: var(--live); }
 

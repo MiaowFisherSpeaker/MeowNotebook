@@ -329,6 +329,54 @@ def read_note(sid):
     return {"meta": fm, "body": text, "mtime": p.stat().st_mtime}
 
 
+# ---------------------------------------------------------------- 搜索
+
+def _snippet(text, words, width=90):
+    """取第一个命中词附近的一段文字(折叠空白)。"""
+    flat = re.sub(r"\s+", " ", text)
+    low = flat.lower()
+    i = min((low.find(w) for w in words if w in low), default=0)
+    a = max(0, i - 30)
+    return ("…" if a else "") + flat[a:a + width] + ("…" if a + width < len(flat) else "")
+
+
+def search(q, scope="all", per_session=5, max_sessions=60):
+    """在会话正文里搜索。scope: q = 只搜提问;all = 提问 + 回答(含过程文字)+ 整理版。
+    多个词以空格分隔,同一轮内全部出现才算命中(不区分大小写)。"""
+    words = [w for w in q.lower().split() if w]
+    if not words:
+        return {"results": [], "sessions": 0, "hits": 0}
+    results, total = [], 0
+    for p in all_session_files():
+        try:
+            meta, turns = cached_parse(p)
+        except OSError:
+            continue
+        if not meta["questions"]:
+            continue
+        hits = []
+        for t in turns:
+            if t["kind"] not in ("question", "summary"):
+                continue
+            fields = [("问", t["q"])]
+            if scope == "all":
+                fields += [("答", x) for x in reversed(t["texts"])]  # 最终回答在最后,优先显示
+            hay = "\n".join(x for _, x in fields).lower()
+            if not all(w in hay for w in words):
+                continue
+            where, text = next(((k, x) for k, x in fields if any(w in x.lower() for w in words)), fields[0])
+            hits.append({"n": t["n"], "where": where, "snip": _snippet(text, words)})
+        if scope == "all":
+            note = read_note(meta["id"])
+            if note and all(w in note["body"].lower() for w in words):
+                hits.insert(0, {"n": None, "where": "整理版", "snip": _snippet(note["body"], words)})
+        if hits:
+            total += len(hits)
+            results.append({"id": meta["id"], "title": meta["title"], "cwd": meta["cwd"] or p.parent.name,
+                            "mtime": p.stat().st_mtime, "count": len(hits), "hits": hits[:per_session]})
+    return {"results": results[:max_sessions], "sessions": len(results), "hits": total}
+
+
 # ---------------------------------------------------------------- 只读文件浏览
 
 TEXT_LIMIT = 2 * 1024 * 1024
@@ -673,6 +721,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._raw_file(q.get("path", [""])[0], q.get("dl", ["0"])[0] == "1")
             if u.path == "/api/file":
                 return self._local_image(q.get("path", [""])[0], q.get("cwd", [""])[0])
+            if u.path == "/api/search":
+                return self._json(search(q.get("q", [""])[0], q.get("scope", ["all"])[0]))
             if u.path == "/api/terms":
                 return self._json({"terms": link_terms(term.list_sessions())})
             if u.path == "/api/sessions":

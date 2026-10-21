@@ -112,6 +112,7 @@ async function loadSessions() {
 
 function renderSessions() {
   const kw = $('#search').value.trim().toLowerCase();
+  if (kw && searchMode() !== 'title') return renderSearch();
   const groups = new Map();
   for (const s of state.sessions) {
     if (kw && !`${s.title} ${s.first_q} ${s.cwd} ${s.id}`.toLowerCase().includes(kw)) continue;
@@ -142,7 +143,73 @@ $('#sessions').addEventListener('click', e => {
   localSet('collapsed', JSON.stringify([...state.collapsed]));
   renderSessions();
 });
-$('#search').addEventListener('input', renderSessions);
+// ---------- 搜索:标题(本地过滤,最轻)/ 提问 / 全文(服务器搜索会话正文)----------
+const PH = { title: '搜索标题 / 首问 / 目录…', q: '搜索所有提问,空格分隔多个词…', all: '搜索提问 + 回答 + 整理版…' };
+const sr = { kw: '', mode: '', data: null, timer: null, seq: 0 };
+const searchMode = () => $('#search-mode').value;
+const searchWords = () => searchMode() === 'title' ? [] : $('#search').value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+
+function markSnip(text, words) {
+  let h = esc(text);
+  for (const w of words) h = h.replace(new RegExp(esc(w).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), m => `\x02${m}\x03`);
+  return h.replace(/\x02/g, '<mark>').replace(/\x03/g, '</mark>');
+}
+
+function renderSearch() {
+  const kw = $('#search').value.trim(), mode = searchMode();
+  if (sr.kw !== kw || sr.mode !== mode) {  // 关键词变了才请求;定时刷新列表时沿用结果
+    sr.kw = kw; sr.mode = mode; sr.data = null;
+    const seq = ++sr.seq;
+    fetch(`/api/search?scope=${mode}&q=${encodeURIComponent(kw)}`).then(r => r.json()).then(r => {
+      if (seq === sr.seq) { sr.data = r; renderSessions(); }
+    }).catch(() => {});
+  }
+  if (!sr.data) { $('#sessions').innerHTML = '<div class="sr-sum">搜索中…</div>'; return; }
+  const words = searchWords(), d = sr.data;
+  $('#sessions').innerHTML = !d.results?.length ? '<div class="hint">没有匹配的问答</div>'
+    : `<div class="sr-sum">${d.sessions} 个会话 · ${d.hits} 处命中${d.sessions > d.results.length ? `(显示前 ${d.results.length} 个会话)` : ''}</div>` +
+      d.results.map(s => `<a class="sess${s.id === state.sid ? ' on' : ''}" href="#/s/${s.id}" title="${esc(s.cwd)}">
+        <div class="t">${esc(s.title)}</div><div class="m">${fmtTime(s.mtime)} · ${s.count} 处命中</div></a>` +
+        s.hits.map(h => `<a class="sr-hit" href="#/s/${s.id}${h.n ? '/' + h.n : ''}"><b>${h.n ? '#' + h.n + ' ' : ''}${h.where}</b>${markSnip(h.snip, words)}</a>`).join('') +
+        (s.count > s.hits.length ? `<div class="sr-more">还有 ${s.count - s.hits.length} 处,打开会话后可用浏览器查找</div>` : '')).join('');
+}
+
+// 在正文里高亮搜索词,并展开包含命中的"过程文字"
+function markArticle() {
+  const words = searchWords();
+  if (!words.length) return;
+  const re = new RegExp(words.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'gi');
+  const walk = document.createTreeWalker($('#article'), NodeFilter.SHOW_TEXT, {
+    acceptNode: n => n.parentElement.closest('.katex, script, style, mark') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
+  });
+  const nodes = [];
+  while (walk.nextNode()) if (re.test(walk.currentNode.data)) nodes.push(walk.currentNode);
+  for (const n of nodes) {
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    n.data.replace(re, (m, i) => {
+      frag.append(n.data.slice(last, i), Object.assign(document.createElement('mark'), { textContent: m }));
+      last = i + m.length;
+    });
+    frag.append(n.data.slice(last));
+    n.replaceWith(frag);
+  }
+  $('#article').querySelectorAll('details.proc').forEach(d => { if (d.querySelector('mark')) d.open = true; });
+}
+
+$('#search').addEventListener('input', () => {
+  clearTimeout(sr.timer);
+  if (searchMode() === 'title') return renderSessions();
+  sr.timer = setTimeout(renderSessions, 300);
+});
+$('#search-mode').addEventListener('change', () => {
+  localSet('search-mode', searchMode());
+  $('#search').placeholder = PH[searchMode()];
+  renderSessions();
+  if (state.data) renderSession();
+});
+$('#search-mode').value = localGet('search-mode', 'title');
+$('#search').placeholder = PH[searchMode()];
 
 // ---------- 单个会话 ----------
 async function loadSession(force = false) {
@@ -184,6 +251,7 @@ function renderSession() {
     $('#article').innerHTML = '<div class="hint">新会话,还没有提问。<br>在下方的输入框里开始对话,问答会实时显示在这里。</div>';
     $('#toc').innerHTML = '';
   } else tab === 'note' ? renderNote(note) : renderRaw(turns);
+  markArticle();
   syncDock();
 }
 
@@ -196,7 +264,8 @@ function jumpToTurn() {
   const qs = state.data.turns.filter(t => t.kind === 'question');
   const n = want ?? qs[qs.length - 1]?.n;
   const el = n && document.getElementById('t' + n);
-  if (el) requestAnimationFrame(() => el.scrollIntoView({ block: 'start' }));
+  const mk = want && el?.querySelector('mark');  // 从搜索结果跳来:定位到这一轮里第一个命中处
+  if (el) requestAnimationFrame(() => (mk || el).scrollIntoView({ block: mk ? 'center' : 'start' }));
 }
 
 function renderNote(note) {
