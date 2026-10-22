@@ -32,6 +32,9 @@ cd ~/projects/MeowNotebook && ./install.sh     # 卸载: ./install.sh --uninstal
 5. 第一次运行 `cc` 时会在终端里再提示一次以上要点。
 6. 想继续历史会话时可以用 `ccr`(或 `cc -r`)直接进选择列表。先 `cc` 再在里面 `/resume`,cc 会在启动时的新会话里
    记下这条命令,留下一个没有问答的空白会话(网站会自动隐藏这类会话,但 cc 自己的 `/resume` 列表里能看到)。
+7. **Windows 的 PowerShell / cmd 里鼠标乱码**:经 ssh 用 `cc` 时,移动鼠标可能在 cc 输入框里打出 `[<35;12;5M` 这类文字
+   (Windows 一侧的 ssh / 控制台把 tmux 打开的鼠标上报弄坏了)。在服务器的 `~/.bashrc` 里 `export CCNB_MOUSE=off`,
+   之后 `cc` / `cca` 进入的终端不再开启鼠标上报(滚动改用 tmux 的 `Ctrl-b [`);网页终端照常可以用鼠标。
 
 ## 图片
 

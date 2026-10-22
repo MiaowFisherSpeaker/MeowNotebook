@@ -930,8 +930,7 @@ def cmd_launch(args):
             input("按回车继续…")
     if args.detach or not sys.stdin.isatty():
         return
-    env = {k: v for k, v in term.clean_env(os.environ).items() if k not in ("TMUX", "TMUX_PANE")}
-    subprocess.call(["tmux", "-L", term.SOCKET, "-f", str(term.TMUX_CONF), "attach", "-t", f"={name}"], env=env)
+    term.attach(name)
     if term.session_exists(name):  # 只是离开了终端(detach / 关窗口),cc 还在跑
         print(f"\n已离开终端,cc 仍在后台运行。\n  网页: http://localhost:{PORT}/#/t/{name}\n"
               f"  回到终端: cca {name}    结束: 网页上点「结束会话」,或在终端里 /exit")
@@ -1006,6 +1005,9 @@ def main():
     la.add_argument("--detach", action="store_true", help="只在后台启动,不在本终端 attach")
     la.add_argument("cc_args", nargs=argparse.REMAINDER)
     la.set_defaults(fn=cmd_launch)
+    at = sub.add_parser("attach")
+    at.add_argument("name")
+    at.set_defaults(fn=lambda a: sys.exit(term.attach(a.name)))
     ls = sub.add_parser("list")
     ls.add_argument("--project")
     ls.set_defaults(fn=cmd_list)

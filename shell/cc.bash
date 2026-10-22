@@ -15,6 +15,8 @@
 #   2. bypass 模式下 cc 执行命令、改文件都不会再询问,只在你信任的目录里用。
 #   3. 网页终端等于一个免密的 bypass shell:只监听 127.0.0.1,远程服务器请用 VS Code 端口转发
 #      或 `ssh -L 8765:localhost:8765 …` 访问,不要把 8765 暴露到公网。
+#   4. 从 Windows 的 PowerShell / cmd ssh 过来时,如果移动鼠标会在 cc 里打出 `[<35;12;5M` 这类乱码,
+#      在 ~/.bashrc 里 export CCNB_MOUSE=off:cc / cca 进入的终端不再上报鼠标(网页终端不受影响)。
 
 CCNB_HOME="${CCNB_HOME:-$HOME/projects/MeowNotebook}"
 
@@ -26,5 +28,5 @@ ccls()  { tmux -L ccnb ls -F '#{session_name}	#{session_path}	#{?session_attache
 cca()   {
   local name="${1:-$(tmux -L ccnb ls -F '#{session_created} #{session_name}' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2)}"
   [ -n "$name" ] || { echo "没有运行中的 cc 会话"; return 1; }
-  TMUX= tmux -L ccnb -f "$CCNB_HOME/tmux.conf" attach -t "=$name"
+  python3 "$CCNB_HOME/ccnb.py" attach "$name"
 }

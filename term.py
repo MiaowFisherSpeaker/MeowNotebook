@@ -46,6 +46,25 @@ def clean_env(env):
     return {k: v for k, v in env.items() if k not in CC_RUNTIME_ENV}
 
 
+def attach(name):
+    """在当前终端 attach 到会话。
+
+    CCNB_MOUSE=off 时给这个 client 换一个去掉 kmous 的 terminfo,tmux 就不会让这个终端上报鼠标
+    (Windows 的 PowerShell / cmd 经 ssh 时,鼠标事件可能变成乱码文字输进 cc)。
+    tmux 按 client 读 terminfo,所以网页终端和其他终端照常用鼠标。
+    """
+    env = {k: v for k, v in clean_env(os.environ).items() if k not in ("TMUX", "TMUX_PANE")}
+    base = env.get("TERM", "")
+    if env.get("CCNB_MOUSE") == "off" and base and not base.endswith("-ccnb-nomouse"):
+        nomouse = f"{base}-ccnb-nomouse"  # 保留原名前缀,tmux.conf 里 xterm* 的 terminal-features 仍然匹配
+        if subprocess.run(["infocmp", nomouse], capture_output=True).returncode != 0:
+            subprocess.run(["tic", "-x", "-"], input=f"{nomouse}|{base} without mouse (MeowNotebook),\n\tkmous@, use={base},\n",
+                           capture_output=True, text=True)
+        if subprocess.run(["infocmp", nomouse], capture_output=True).returncode == 0:
+            env["TERM"] = nomouse
+    return subprocess.call(["tmux", "-L", SOCKET, "-f", str(TMUX_CONF), "attach", "-t", f"={name}"], env=env)
+
+
 def tmux(*args, check=False):
     return subprocess.run(["tmux", "-L", SOCKET, "-f", str(TMUX_CONF), *args],
                           capture_output=True, text=True, check=check)
