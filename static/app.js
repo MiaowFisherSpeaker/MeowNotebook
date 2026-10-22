@@ -175,11 +175,11 @@ function renderSearch() {
 }
 
 // 在正文里高亮搜索词,并展开包含命中的"过程文字"
-function markArticle() {
+function markArticle(root = $('#article')) {
   const words = searchWords();
   if (!words.length) return;
   const re = new RegExp(words.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'gi');
-  const walk = document.createTreeWalker($('#article'), NodeFilter.SHOW_TEXT, {
+  const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode: n => n.parentElement.closest('.katex, script, style, mark') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT,
   });
   const nodes = [];
@@ -194,7 +194,7 @@ function markArticle() {
     frag.append(n.data.slice(last));
     n.replaceWith(frag);
   }
-  $('#article').querySelectorAll('details.proc').forEach(d => { if (d.querySelector('mark')) d.open = true; });
+  root.querySelectorAll('details.proc').forEach(d => { if (d.querySelector('mark')) d.open = true; });
 }
 
 $('#search').addEventListener('input', () => {
@@ -223,14 +223,26 @@ async function loadSession(force = false) {
   if (r.error) { $('#article').innerHTML = `<div class="hint">${esc(r.error)}</div>`; return; }
   const atBottom = $('#main').scrollTop + $('#main').clientHeight > $('#main').scrollHeight - 80;
   const first = !state.data || state.data.meta.id !== r.meta.id;
-  state.data = r; state.version = r.version;
-  if (first && (r.active || state.jump)) state.tab = 'raw';  // 进行中的会话、或指定了某一轮 → 原始问答
-  renderSession();
+  if (r.delta && !first && !state.data.pending) {
+    // 增量:服务器只回了变化 / 新增的轮次(按编号 n,从 1 开始连续),合并后只重画这些轮
+    const old = state.data.turns, turns = old.slice(0, r.count);
+    for (const t of r.turns) turns[t.n - 1] = t;
+    const redraw = new Set(r.turns.map(t => t.n));
+    if (old.length) redraw.add(old[old.length - 1].n);  // 原来的最后一轮:"回答生成中…"可能要撤掉
+    state.data = { ...state.data, meta: r.meta, active: r.active, turns };
+    state.version = r.version;
+    patchSession(redraw, old.length);
+  } else {
+    if (r.delta) return loadSession(true);  // 手里没有可合并的基础数据,要完整的
+    state.data = r; state.version = r.version;
+    if (first && (r.active || state.jump)) state.tab = 'raw';  // 进行中的会话、或指定了某一轮 → 原始问答
+    renderSession();
+  }
   if (first) jumpToTurn();
   else if (atBottom && r.active && state.tab === 'raw') $('#main').scrollTop = $('#main').scrollHeight;
 }
 
-function renderSession() {
+function renderHead() {
   const { meta, turns, note, active } = state.data;
   mdCwd = meta.cwd || '';
   $('#empty').hidden = true; $('#view').hidden = false;
@@ -246,6 +258,11 @@ function renderSession() {
   const noteBtn = $('#tabs [data-tab=note]');
   noteBtn.disabled = !note;
   noteBtn.textContent = note ? `整理版${note.meta.covered_turns && +note.meta.covered_turns < turns.length ? `(覆盖到第 ${note.meta.covered_turns} 轮,共 ${turns.length})` : ''}` : '整理版(未整理)';
+}
+
+function renderSession() {
+  const { turns, note } = state.data;
+  renderHead();
   const tab = note ? state.tab : 'raw';
   document.querySelectorAll('#tabs [data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
   $('#show-process').parentElement.hidden = $('#show-misc').parentElement.hidden = tab !== 'raw';
@@ -254,6 +271,39 @@ function renderSession() {
     $('#toc').innerHTML = '';
   } else tab === 'note' ? renderNote(note) : renderRaw(turns);
   markArticle();
+  syncDock();
+}
+
+// 增量更新:只重画 redraw 里的轮次,其余 DOM 原样保留(长会话不必每 3 秒整页重排 Markdown / 公式)
+function patchSession(redraw, oldCount) {
+  const { turns, note, active, meta } = state.data;
+  renderHead();
+  if ((note && state.tab === 'note') || state.data.pending) return;  // 整理版页面不受原始记录变化影响
+  if (turns.length < oldCount || !$('#article').querySelector('.turn')) return renderSession();
+  const showProc = $('#show-process').checked, showMisc = $('#show-misc').checked;
+  const last = turns[turns.length - 1];
+  for (const n of [...redraw].sort((a, b) => a - b)) {
+    const t = turns[n - 1];
+    const old = document.getElementById('t' + n);
+    const html = t ? rawHTML([t], active, showProc, showMisc, meta.id, last) : '';
+    if (!html) { old?.remove(); continue; }
+    const tpl = document.createElement('template');
+    tpl.innerHTML = html.trim();
+    const el = tpl.content.firstElementChild;
+    if (old) {
+      // 保留用户展开过的"过程文字 / 图片"
+      const opened = [...old.querySelectorAll('details')].map(d => d.open);
+      el.querySelectorAll('details').forEach((d, i) => { if (opened[i]) d.open = true; });
+      old.replaceWith(el);
+    } else {
+      // 插到编号比它小的最后一个已显示轮次后面(新轮次一般就是追加到末尾)
+      const prev = [...$('#article').querySelectorAll('.turn')].reverse().find(x => +x.id.slice(1) < n);
+      prev ? prev.after(el) : $('#article').prepend(el);
+    }
+    markArticle(el);
+  }
+  renderMap(turns.filter(t => t.kind === 'question' && document.getElementById('t' + t.n))
+    .map(t => ({ id: 't' + t.n, n: t.n, text: t.q.replace(/\s+/g, ' ').slice(0, 240), len: t.q.length })));
   syncDock();
 }
 
@@ -279,10 +329,9 @@ function renderNote(note) {
   renderMap(hs.map(h => ({ id: h.id, text: h.textContent, len: h.textContent.length * 3, lv: +h.tagName[1] })));
 }
 
-function rawHTML(turns, active, showProc, showMisc, sid) {
+function rawHTML(turns, active, showProc, showMisc, sid, last = turns[turns.length - 1]) {
   const label = { question: '问', command: '命令', shell: 'Shell', summary: '上下文压缩摘要' };
   const items = turns.filter(t => showMisc || t.kind === 'question' || t.kind === 'summary');
-  const last = turns[turns.length - 1];
   return items.map(t => {
     const main = t.texts.length ? t.texts[t.texts.length - 1] : '';
     const proc = t.texts.slice(0, -1);

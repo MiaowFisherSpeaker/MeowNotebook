@@ -14,6 +14,7 @@
 """
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -24,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -93,13 +95,19 @@ def parse_session(path):
     meta = {"id": path.stem, "file": str(path), "cwd": None, "title": None,
             "ai_title": None, "first_q": None, "started": None, "updated": None, "continued_in": None}
     turns = []
-    images = []  # base64 图片,turn 里只存索引;通过 /api/image/<sid>/<k> 取
+    # 图片只记位置 (类型, 所在行的字节偏移, 该行第几个 base64 块),turn 里存索引;
+    # /api/image/<sid>/<k> 时再回文件读那一行。图片数据不进缓存(动辄几十 MB)
+    images = []
     cur = None
     seen_text = set()  # 同一条 assistant 消息可能被重复写入
+    line_b64 = None  # 当前行里所有 base64 块的 id(),按出现顺序
 
     def add_image(src):
+        nonlocal line_b64
         if isinstance(src, dict) and src.get("type") == "base64" and src.get("data"):
-            images.append((src.get("media_type") or "image/png", src["data"]))
+            if line_b64 is None:
+                line_b64 = [id(x) for x in _base64_blocks(d)]
+            images.append((src.get("media_type") or "image/png", offset, line_b64.index(id(src))))
             return len(images) - 1
         return None
 
@@ -108,10 +116,13 @@ def parse_session(path):
         cur = {"kind": kind, "q": text, "ts": ts, "texts": [], "tools": 0, "notes": [], "q_images": [], "images": []}
         turns.append(cur)
 
-    with open(path, encoding="utf-8", errors="replace") as f:
-        for line in f:
+    with open(path, "rb") as f:
+        pos = 0
+        for raw in f:
+            offset, pos = pos, pos + len(raw)
+            line_b64 = None
             try:
-                d = json.loads(line)
+                d = json.loads(raw.decode("utf-8", errors="replace"))
             except ValueError:
                 continue
             t = d.get("type")
@@ -201,58 +212,160 @@ def parse_session(path):
     return meta, turns
 
 
-_cache = {}
+def _base64_blocks(obj):
+    """按出现顺序列出 obj 里所有 {"type": "base64", "data": ...} 块。"""
+    if isinstance(obj, dict):
+        if obj.get("type") == "base64" and obj.get("data"):
+            yield obj
+        for v in obj.values():
+            yield from _base64_blocks(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _base64_blocks(v)
+
+
+def read_image(path, ref):
+    """按 parse_session 记下的位置取回一张图片:(类型, 二进制)。"""
+    mt, offset, j = ref
+    with open(path, "rb") as f:
+        f.seek(offset)
+        d = json.loads(f.readline().decode("utf-8", errors="replace"))
+    src = next(x for k, x in enumerate(_base64_blocks(d)) if k == j)
+    return mt, base64.b64decode(src["data"])
+
+
+# 两级缓存:元数据(列表、索引用)很小,常驻;完整问答按文本量做 LRU。键都是 (mtime_ns, size),文件一变就失效
+_meta_cache = {}
+_full_cache = OrderedDict()
+FULL_CACHE_BUDGET = 32 * 1024 * 1024  # 完整问答的文本总量上限(字符数,近似)
+_full_cache_size = 0
+_cache_lock = threading.Lock()
+
+
+def _file_key(path):
+    st = path.stat()
+    return st.st_mtime_ns, st.st_size
+
+
+def _turns_size(turns):
+    return sum(len(t["q"] or "") + sum(map(len, t["texts"])) + sum(map(len, t["notes"])) + 200 for t in turns)
 
 
 def cached_parse(path):
-    st = path.stat()
-    key = (st.st_mtime_ns, st.st_size)
-    hit = _cache.get(path)
-    if hit and hit[0] == key:
-        return hit[1]
+    """完整解析结果 (meta, turns),LRU 缓存。"""
+    global _full_cache_size
+    key = _file_key(path)
+    with _cache_lock:
+        hit = _full_cache.get(path)
+        if hit and hit[0] == key:
+            _full_cache.move_to_end(path)
+            return hit[1]
     res = parse_session(path)
-    _cache[path] = (key, res)
+    size = _turns_size(res[1])
+    with _cache_lock:
+        old = _full_cache.pop(path, None)
+        if old:
+            _full_cache_size -= old[2]
+        _full_cache[path] = (key, res, size)
+        _full_cache_size += size
+        while _full_cache_size > FULL_CACHE_BUDGET and len(_full_cache) > 1:
+            _, (_, _, sz) = _full_cache.popitem(last=False)
+            _full_cache_size -= sz
+        _meta_cache[path] = (key, res[0])
     return res
 
 
+def cached_meta(path):
+    """只要元数据(标题、时间、问题数、接续关系…)时用这个:命中时不碰完整问答缓存。"""
+    key = _file_key(path)
+    hit = _meta_cache.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    return cached_parse(path)[0]
+
+
 def all_session_files():
-    return sorted(PROJECTS.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return [p for p, _ in session_index().files]
 
 
 def find_session(sid):
-    for p in PROJECTS.glob(f"*/{sid}.jsonl"):
+    p = session_index().by_id.get(sid)
+    if p and p.exists():
+        return p
+    for p in PROJECTS.glob(f"*/{sid}.jsonl"):  # 索引建立之后才出现的会话
         return p
     return None
 
 
+class SessionIndex:
+    """所有会话的元数据 + 接续关系,一次建好,列表 / 搜索 / 终端关联都从这里查,避免每条摘要再扫一遍目录。
+    只要有文件新增、删除或变化(mtime / 大小)就重建;重建只读元数据缓存,通常是毫秒级。"""
+
+    def __init__(self, files):
+        self.files = files  # [(path, mtime)],按 mtime 从新到旧
+        self.meta = {p: cached_meta(p) for p, _ in files}
+        self.by_id = {p.stem: p for p, _ in files}
+        self.succ, self.prev = {}, {}
+        for p, m in self.meta.items():
+            nxt = self.by_id.get(m["continued_in"]) if m["continued_in"] else None
+            # 新会话必须确实带着复制过去的历史(提问数不少于旧会话),否则旧会话仍是唯一完整的记录
+            if nxt and nxt != p and self.meta[nxt]["questions"] >= m["questions"]:
+                self.succ[p] = nxt
+                self.prev[nxt] = p
+
+    def latest(self, path):
+        """沿接续链走到最新的会话。"""
+        for _ in range(50):  # 防环
+            nxt = self.succ.get(path)
+            if not nxt:
+                break
+            path = nxt
+        return path
+
+    def predecessors(self, path):
+        """被 path 接续的旧会话(由近到远)。"""
+        out = []
+        while (path := self.prev.get(path)) and path not in out and len(out) < 50:
+            out.append(path)
+        return out
+
+
+_index = None  # (建立时间, 文件指纹, SessionIndex)
+_index_lock = threading.Lock()
+INDEX_MAX_AGE = 1.0  # 秒:同一个请求里(列表循环、终端关联)反复调用时复用,不必每次 stat 全部文件
+
+
+def session_index():
+    global _index
+    with _index_lock:
+        if _index and time.monotonic() - _index[0] < INDEX_MAX_AGE:
+            return _index[2]
+    files = []
+    for p in PROJECTS.glob("*/*.jsonl"):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        files.append((p, st.st_mtime, st.st_mtime_ns, st.st_size))
+    files.sort(key=lambda x: x[1], reverse=True)
+    key = tuple((p, ns, sz) for p, _, ns, sz in files)
+    with _index_lock:
+        idx = _index[2] if _index and _index[1] == key else SessionIndex([(p, mt) for p, mt, _, _ in files])
+        _index = (time.monotonic(), key, idx)
+        return idx
+
+
 def successor(path):
-    """会话已在别的会话里继续(continued-in)→ 返回新会话的路径,否则 None。
-    新会话必须存在且确实带着复制过去的历史(提问数不少于旧会话),否则旧会话仍是唯一完整的记录。"""
-    meta = cached_parse(path)[0]
-    nxt = find_session(meta["continued_in"]) if meta["continued_in"] else None
-    return nxt if nxt and cached_parse(nxt)[0]["questions"] >= meta["questions"] else None
+    """会话已在别的会话里继续且新会话带着完整历史 → 新会话的路径,否则 None。"""
+    return session_index().succ.get(path)
 
 
 def latest_continuation(path):
-    """沿 continued-in 链走到最新的那个会话。"""
-    for _ in range(50):  # 防环
-        nxt = successor(path)
-        if not nxt:
-            break
-        path = nxt
-    return path
+    return session_index().latest(path)
 
 
 def predecessors(path):
-    """在 path 之前、被它接续的旧会话(由近到远)。"""
-    out, cur = [], path
-    for _ in range(50):
-        prev = next((p for p in cur.parent.glob("*.jsonl") if cached_parse(p)[0]["continued_in"] == cur.stem), None)
-        if not prev or prev in out:
-            break
-        out.append(prev)
-        cur = prev
-    return out
+    return session_index().predecessors(path)
 
 
 def find_note(path):
@@ -283,7 +396,7 @@ def _epoch(ts):
 
 def _started_epoch(p):
     try:
-        return _epoch(cached_parse(p)[0]["started"])
+        return _epoch(cached_meta(p)["started"])
     except OSError:
         return 0
 
@@ -292,15 +405,15 @@ def sid_by_title(cwd, title):
     if not title:
         return None
     prefix = title[:-1].rstrip() if title.endswith("…") else None
-    best = None
-    for p in project_dir_for(cwd).glob("*.jsonl"):
-        meta = cached_parse(p)[0]
+    d = project_dir_for(cwd)
+    for p, _ in session_index().files:  # 从新到旧,第一个匹配的就是最近更新的
+        if p.parent != d:
+            continue
+        meta = cached_meta(p)
         names = {meta["title"], meta["ai_title"]} - {None}
         if title in names or (prefix and any(n.startswith(prefix) for n in names)):
-            mt = p.stat().st_mtime
-            if not best or mt > best[0]:
-                best = (mt, p.stem)
-    return best[1] if best else None
+            return p.stem
+    return None
 
 
 def pane_record(pane):
@@ -328,8 +441,8 @@ def link_terms(terms):
             t["source"] = rec.get("source") or rec.get("event")
             # 换到了新 id 但还没有问答(不是 /clear):多半是 cc 正把旧会话接续到新 id,先留在旧会话上
             cur, prev = find_session(t["sid"]), rec.get("prev") and find_session(rec["prev"])
-            if rec.get("source") not in ("clear", "startup") and prev and not (cur and cached_parse(cur)[0]["questions"]) \
-                    and cached_parse(prev)[0]["questions"]:
+            if rec.get("source") not in ("clear", "startup") and prev and not (cur and cached_meta(cur)["questions"]) \
+                    and cached_meta(prev)["questions"]:
                 t["sid"] = prev.stem
             continue
         # 2. 兜底(旧终端没有 hook 时):启动参数 + /clear 推测
@@ -338,12 +451,12 @@ def link_terms(terms):
         after = t["created"] - 5
         base_last = 0
         if base:
-            bm = cached_parse(base)[0]
+            bm = cached_meta(base)
             after = max(after, _epoch(bm["started"]))
             base_last = _epoch(bm["updated"]) if bm["questions"] else 0
         newer = []
         for p in project_dir_for(t["cwd"]).glob("*.jsonl"):
-            if p.stem in claimed or p.stem == sid or not cached_parse(p)[0]["questions"]:
+            if p.stem in claimed or p.stem == sid or not cached_meta(p)["questions"]:
                 continue
             st = _started_epoch(p)
             if st > after and st >= base_last - 5:
@@ -403,12 +516,10 @@ def search(q, scope="all", per_session=5, max_sessions=60):
     results, total = [], 0
     for p in all_session_files():
         try:
-            meta, turns = cached_parse(p)
-            if successor(p):
+            if successor(p) or not cached_meta(p)["questions"]:
                 continue
+            meta, turns = cached_parse(p)
         except OSError:
-            continue
-        if not meta["questions"]:
             continue
         hits = []
         for t in turns:
@@ -595,12 +706,40 @@ def continue_session(sid):
     if time.time() - p.stat().st_mtime < 60:
         raise ValueError("这个会话正在别的终端里运行(不是用 cc 启动的)。为避免两个进程同时写同一会话,"
                          "请在原终端里继续,或先退出它再从网页继续。")
-    meta, _ = cached_parse(p)
+    meta = cached_meta(p)
     return term.new_session(meta["cwd"] or str(Path.home()), ["--resume", sid])
 
 
+# 每个会话最近几个版本里各轮的签名,用来算出"客户端手里的版本 → 当前版本"之间变了哪些轮
+_turn_sigs = OrderedDict()  # path → OrderedDict(version → [sig, ...])
+_turn_sigs_lock = threading.Lock()
+
+
+def _turn_sig(t):
+    return hashlib.blake2b(json.dumps(t, ensure_ascii=False, sort_keys=True).encode(), digest_size=8).hexdigest()
+
+
+def changed_turns(path, have, version, turns):
+    """客户端持有版本 have,返回从 have 到 version 之间变化 / 新增的轮次;
+    认不出 have、整理版变了或轮次变少时返回 None,让调用方回完整数据。"""
+    sigs = [_turn_sig(t) for t in turns]
+    with _turn_sigs_lock:
+        hist = _turn_sigs.setdefault(path, OrderedDict())
+        _turn_sigs.move_to_end(path)
+        old = hist.get(have)
+        hist[version] = sigs
+        while len(hist) > 8:
+            hist.popitem(last=False)
+        while len(_turn_sigs) > 32:
+            _turn_sigs.popitem(last=False)
+    # 版本号 = "<文件 mtime>-<整理版 mtime>";整理版变了就整页重画
+    if old is None or have.rsplit("-", 1)[-1] != version.rsplit("-", 1)[-1] or len(sigs) < len(old):
+        return None
+    return [t for i, t in enumerate(turns) if i >= len(old) or old[i] != sigs[i]]
+
+
 def session_summary(path):
-    meta, _ = cached_parse(path)
+    meta = cached_meta(path)
     mtime = path.stat().st_mtime
     return {
         "id": meta["id"], "title": meta["title"], "cwd": meta["cwd"] or path.parent.name,
@@ -815,8 +954,8 @@ class Handler(SimpleHTTPRequestHandler):
                 k = int(m.group(2))
                 if k >= len(imgs):
                     return self._json({"error": "not found"}, 404)
-                mt, data = imgs[k]
-                return self._bytes(base64.b64decode(data), mt)
+                mt, data = read_image(p, imgs[k])
+                return self._bytes(data, mt)
             if u.path == "/api/fs/list":
                 return self._json(fs_list(q.get("path", ["~"])[0], q.get("hidden", ["0"])[0] == "1"))
             if u.path == "/api/fs/read":
@@ -835,7 +974,7 @@ class Handler(SimpleHTTPRequestHandler):
                 items = []
                 for t in terms:  # 刚启动、还没提问的会话也列出来
                     sid = t["sid"] or t["launch_sid"]
-                    if sid and not (find_session(sid) and cached_parse(find_session(sid))[0]["questions"]):
+                    if sid and not (find_session(sid) and cached_meta(find_session(sid))["questions"]):
                         items.append({"id": sid, "title": "新会话(尚未提问)", "cwd": t["cwd"], "first_q": "",
                                       "questions": 0, "started": None, "updated": None, "mtime": t["created"],
                                       "active": True, "noted": False, "running": t["name"]})
@@ -853,7 +992,7 @@ class Handler(SimpleHTTPRequestHandler):
             m = re.fullmatch(r"/api/session/([\w-]+)", u.path)
             if m:
                 p = find_session(m.group(1))
-                if not p or not cached_parse(p)[0]["questions"]:
+                if not p or not cached_meta(p)["questions"]:
                     t = next((t for t in link_terms(term.list_sessions())
                               if (t["sid"] or t["launch_sid"]) == m.group(1)), None)
                     if t:
@@ -867,12 +1006,16 @@ class Handler(SimpleHTTPRequestHandler):
                     return self._json({"moved": latest.stem})
                 note = find_note(p)
                 version = f"{p.stat().st_mtime_ns}-{note['mtime'] if note else 0}"
-                if q.get("v", [""])[0] == version:
+                have = q.get("v", [""])[0]
+                if have == version:
                     return self._json({"unchanged": True, "version": version})
                 meta, turns = cached_parse(p)
                 meta = {k: v for k, v in meta.items() if k != "_images"}
-                return self._json({"meta": meta, "turns": turns, "note": note, "version": version,
-                                   "active": time.time() - p.stat().st_mtime < ACTIVE_SECONDS})
+                res = {"meta": meta, "version": version, "active": time.time() - p.stat().st_mtime < ACTIVE_SECONDS}
+                changed = changed_turns(p, have, version, turns)
+                if changed is not None:  # 进行中的会话:只回变化的轮次,前端只重画这些
+                    return self._json({**res, "delta": True, "count": len(turns), "turns": changed})
+                return self._json({**res, "turns": turns, "note": note})
         except Exception as e:  # noqa: BLE001  本地工具,错误直接回给页面
             return self._json({"error": repr(e)}, 500)
         if u.path.startswith("/api/"):
