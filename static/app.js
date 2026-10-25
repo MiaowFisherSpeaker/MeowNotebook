@@ -51,7 +51,7 @@ function highlightCode(html) {
     try {
       const r = lang && hljs.getLanguage(lang) ? hljs.highlight(code, { language: lang, ignoreIllegals: true })
         : code.length < 4000 ? hljs.highlightAuto(code) : null;
-      return r ? `<pre><code class="hljs">${r.value}</code></pre>` : m;
+      return r ? `<pre><code class="hljs${lang ? ' language-' + lang : ''}">${r.value}</code></pre>` : m;
     } catch { return m; }
   });
 }
@@ -100,6 +100,141 @@ function renderMD(src) {
   });
   return html;
 }
+
+// ---------- 复制为 Markdown ----------
+// 正文里选中后右键:复制为 Markdown(表格、公式 $…$、代码块、列表、加粗等都还原成源码,
+// 粘到 Markdown 编辑器里能直接渲染)/ 纯文本 / 富文本。Ctrl+C 保持浏览器默认行为。
+const MD_SKIP = 'button, summary, script, style, .lab, .pending, .katex-mathml';
+const mdBlock = s => s.trim() ? `\n\n${s.trim()}\n\n` : '';
+const mdKids = (el, ctx) => [...el.childNodes].map(n => toMD(n, ctx)).join('');
+const mdTex = k => k.querySelector('annotation[encoding="application/x-tex"]')?.textContent.trim() ?? k.textContent;
+function mdWrap(inner, w) {
+  const m = inner.match(/^(\s*)([\s\S]*?)(\s*)$/);
+  return m[2] ? m[1] + w + m[2] + w + m[3] : inner;
+}
+function mdTable(t) {
+  const trs = [...t.querySelectorAll('tr')];
+  const rows = trs.map(tr => [...tr.children].map(c =>
+    mdKids(c, { cell: true }).trim().replace(/\s*\n\s*/g, '<br>').replace(/(?<!\\)\|/g, '\\|')));
+  if (!rows.length) return '';
+  const w = Math.max(...rows.map(r => r.length));
+  const align = [...Array(w)].map((_, i) => {
+    const c = trs[0].children[i], a = c && (c.style.textAlign || c.getAttribute('align'));
+    return a === 'center' ? ':---:' : a === 'right' ? '---:' : a === 'left' ? ':---' : '---';
+  });
+  const line = r => '| ' + [...Array(w)].map((_, i) => r[i] ?? '').join(' | ') + ' |';
+  return mdBlock([line(rows[0]), '| ' + align.join(' | ') + ' |', ...rows.slice(1).map(line)].join('\n'));
+}
+function mdList(el, ctx) {
+  let i = +(el.getAttribute('start') || 1);
+  return mdBlock([...el.children].filter(li => li.tagName === 'LI').map(li => {
+    const mark = el.tagName === 'OL' ? `${i++}. ` : '- ';
+    return mark + mdKids(li, ctx).trim().replace(/\n{2,}/g, '\n').replace(/\n/g, '\n' + ' '.repeat(mark.length));
+  }).join('\n'));
+}
+function toMD(n, ctx = {}) {
+  if (n.nodeType === 3) return /^\s*\n\s*$/.test(n.nodeValue) ? '' : n.nodeValue.replace(/\s*\n\s*/g, ' ');
+  if (n.nodeType === 11) return mdKids(n, ctx);
+  if (n.nodeType !== 1 || n.matches(MD_SKIP)) return '';
+  if (n.classList.contains('katex-display')) {
+    const k = n.querySelector('.katex');
+    return !k ? '' : ctx.cell ? `$$${mdTex(k)}$$` : mdBlock(`$$\n${mdTex(k)}\n$$`);
+  }
+  if (n.classList.contains('katex')) return `$${mdTex(n)}$`;
+  const tag = n.tagName.toLowerCase(), kids = () => mdKids(n, ctx);
+  switch (tag) {
+    case 'h1': case 'h2': case 'h3': case 'h4': case 'h5': case 'h6':
+      return mdBlock('#'.repeat(+tag[1]) + ' ' + kids().trim());
+    case 'p': case 'div': case 'section': case 'article': case 'details': return mdBlock(kids());
+    case 'pre': {
+      const code = n.textContent.replace(/\n$/, '');
+      const lang = n.querySelector('code')?.className.match(/language-([\w+#-]+)/)?.[1] || '';
+      let f = '```'; while (code.includes(f)) f += '`';
+      return mdBlock(`${f}${lang}\n${code}\n${f}`);
+    }
+    case 'code': { const t = n.textContent; return t.includes('`') ? '`` ' + t + ' ``' : '`' + t + '`'; }
+    case 'strong': case 'b': return mdWrap(kids(), '**');
+    case 'em': case 'i': return mdWrap(kids(), '*');
+    case 'del': case 's': return mdWrap(kids(), '~~');
+    case 'a': {
+      const href = n.getAttribute('href') || '';
+      return !href || href.startsWith('#') || n.querySelector('img') ? kids() : `[${kids()}](${href})`;
+    }
+    case 'img': {
+      let src = n.getAttribute('src') || '';
+      src = src.startsWith('/api/file?') ? new URLSearchParams(src.split('?')[1]).get('path') : new URL(src, location.href).href;
+      return `![${n.getAttribute('alt') || ''}](${src})`;
+    }
+    case 'input': return n.type === 'checkbox' ? (n.checked ? '[x] ' : '[ ] ') : '';
+    case 'br': return '\n';
+    case 'hr': return mdBlock('---');
+    case 'blockquote': return mdBlock(kids().trim().split('\n').map(l => l ? '> ' + l : '>').join('\n'));
+    case 'ul': case 'ol': return mdList(n, ctx);
+    case 'table': return mdTable(n);
+    default: return kids();
+  }
+}
+// 当前选区克隆成 DOM(公式扩成整个、跨格选表格取整行并补表头);不在正文里返回 null
+function selectionBox() {
+  const sel = getSelection();
+  if (!sel.rangeCount || sel.isCollapsed) return null;
+  const elOf = n => n.nodeType === 1 ? n : n.parentElement;
+  const range = sel.getRangeAt(0).cloneRange();
+  const anc = elOf(range.commonAncestorContainer);
+  if (!$('#article').contains(anc)) return null;
+  const kx = n => { const k = elOf(n)?.closest('.katex'); return k?.closest('.katex-display') || k; };
+  const ks = kx(range.startContainer), ke = kx(range.endContainer);
+  if (ks) range.setStartBefore(ks);
+  if (ke) range.setEndAfter(ke);
+  const box = document.createElement('div');
+  const tbl = anc.closest('table');
+  if (tbl && !anc.closest('td, th')) {
+    const t = document.createElement('table');
+    [...tbl.rows].filter((r, i) => i === 0 || range.intersectsNode(r)).forEach(r => t.appendChild(r.cloneNode(true)));
+    box.appendChild(t);
+  } else box.appendChild(range.cloneContents());
+  return box;
+}
+
+// 右键菜单选好格式后借 execCommand('copy') 写剪贴板:非 https 访问时 navigator.clipboard 不可用,这条路都能用
+let copyAs = null;
+document.addEventListener('copy', e => {
+  if (!copyAs) return;
+  for (const [type, data] of Object.entries(copyAs)) e.clipboardData.setData(type, data);
+  copyAs = null; e.preventDefault();
+});
+function copyData(data, label) {
+  copyAs = data;
+  const ok = document.execCommand('copy');
+  copyAs = null;
+  toast(ok ? '已复制为 ' + label : '复制失败');
+}
+
+const cmenu = document.createElement('div');
+cmenu.id = 'cmenu'; cmenu.hidden = true;
+cmenu.innerHTML = '<button data-as="md">复制为 Markdown</button><button data-as="text">复制为纯文本</button><button data-as="html">复制为富文本</button>';
+document.body.appendChild(cmenu);
+cmenu.addEventListener('mousedown', e => e.preventDefault());  // 点菜单时保住选区
+cmenu.addEventListener('click', e => {
+  const as = e.target.dataset?.as; if (!as) return;
+  cmenu.hidden = true;
+  const box = selectionBox(); if (!box) return;
+  if (as === 'md') copyData({ 'text/plain': toMD(box).replace(/\n{3,}/g, '\n\n').trim() }, 'Markdown');
+  else if (as === 'text') copyData({ 'text/plain': getSelection().toString() }, '纯文本');
+  else copyData({ 'text/html': box.innerHTML, 'text/plain': getSelection().toString() }, '富文本');
+});
+document.addEventListener('contextmenu', e => {
+  cmenu.hidden = true;
+  if (e.shiftKey || !$('#article').contains(e.target) || !selectionBox()) return;  // Shift+右键 = 浏览器原生菜单
+  e.preventDefault();
+  cmenu.hidden = false;
+  const { innerWidth: W, innerHeight: H } = window, r = cmenu.getBoundingClientRect();
+  cmenu.style.left = Math.min(e.clientX, W - r.width - 4) + 'px';
+  cmenu.style.top = Math.min(e.clientY, H - r.height - 4) + 'px';
+});
+document.addEventListener('mousedown', e => { if (!cmenu.contains(e.target)) cmenu.hidden = true; });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') cmenu.hidden = true; });
+$('#main').addEventListener('scroll', () => { cmenu.hidden = true; });
 
 // ---------- 会话列表 ----------
 async function loadSessions() {

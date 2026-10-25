@@ -241,3 +241,8 @@ a.btn:hover { border-color: var(--accent); color: var(--accent); }
 .md pre code.hljs { background: transparent; padding: 0; }
 a.fpath { color: inherit; text-decoration: underline dotted; text-underline-offset: 3px; }
 a.fpath:hover { color: var(--accent); }
+#cmenu { position: fixed; z-index: 1000; display: flex; flex-direction: column; padding: 4px; min-width: 150px;
+  background: var(--card); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,.18); }
+#cmenu[hidden] { display: none; }
+#cmenu button { border: 0; background: none; text-align: left; padding: 6px 10px; border-radius: 5px; color: var(--text); }
+#cmenu button:hover { background: var(--panel); }
