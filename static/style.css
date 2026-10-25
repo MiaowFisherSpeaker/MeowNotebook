@@ -171,6 +171,28 @@ details.proc .md { opacity: .85; }
 mark { background: color-mix(in srgb, var(--accent) 30%, transparent); color: inherit; border-radius: 2px; padding: 0 1px; }
 .side-actions button { flex: none; background: var(--accent); border-color: var(--accent); color: #fff; }
 .badge.run { background: color-mix(in srgb, var(--live) 15%, transparent); color: var(--live); border-color: var(--live); }
+.badge.via { background: transparent; color: var(--muted); border-color: var(--line); }
+.brand-r { display: flex; align-items: center; gap: 8px; font-weight: 400; }
+#qq-status { font-size: 12px; color: var(--muted); display: inline-flex; align-items: center; gap: 4px; cursor: default; }
+#qq-status[hidden] { display: none; }
+#qq-status .dot.off { background: #c0392b; }
+#qq-pending { margin: 0 12px 8px; padding: 6px 10px; font-size: 12.5px; line-height: 1.5; border: 1px solid var(--accent);
+  border-radius: 8px; background: var(--accent-soft); }
+#qq-pending[hidden] { display: none; }
+#qq-pending button { margin-top: 4px; font-size: 12px; padding: 1px 10px; }
+/* 侧栏项目名右边的 new:在这个目录新开 cc */
+.proj .pn:has(+ .proj-new) { flex: 0 1 auto; }
+.proj .proj-new { flex: none; margin-right: auto; padding: 0 6px; font-size: 11px; line-height: 17px; border-radius: 5px;
+  color: var(--muted); background: transparent; }
+.proj .proj-new:hover { color: var(--accent); border-color: var(--accent); }
+#src-filter { display: flex; gap: 4px; margin: 0 12px 8px; flex-wrap: wrap; }
+#src-filter[hidden] { display: none; }
+#src-filter button { font-size: 11.5px; padding: 0 8px; border-radius: 9px; background: transparent; color: var(--muted); }
+#src-filter button.on { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+#net { position: fixed; right: 16px; bottom: 16px; z-index: 1001; padding: 4px 12px; border-radius: 14px; font-size: 12.5px;
+  background: #b45309; color: #fff; box-shadow: 0 4px 14px rgba(0,0,0,.2); }
+#net[hidden] { display: none; }
+#dock-status .warn { color: #d97706; }
 
 /* 底部 TUI 输入区:就是那个 cc 的真实终端,只是放在问答下方 */
 #view { min-height: 100vh; display: flex; flex-direction: column; }
@@ -246,3 +268,27 @@ a.fpath:hover { color: var(--accent); }
 #cmenu[hidden] { display: none; }
 #cmenu button { border: 0; background: none; text-align: left; padding: 6px 10px; border-radius: 5px; color: var(--text); }
 #cmenu button:hover { background: var(--panel); }
+
+/* 总结:主题 + 日期 → cc 生成的总结 */
+#sum-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; padding: 12px 14px; margin-bottom: 16px;
+  background: var(--card); border: 1px solid var(--line); border-radius: 10px; font-size: 13.5px; }
+#sum-form input[type=text] { flex: 1 1 260px; min-width: 0; padding: 6px 10px; border: 1px solid var(--line); border-radius: 7px;
+  background: var(--bg); color: var(--text); font: inherit; }
+#sum-form input[type=date] { padding: 4px 6px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg);
+  color: var(--text); font: inherit; color-scheme: light dark; }
+#sum-form .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+#sum-form .seg button { border: 0; border-radius: 0; background: transparent; }
+#sum-form .seg button.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+#sum-form .presets button { font-size: 12px; padding: 1px 8px; background: transparent; color: var(--muted); }
+#sum-go { background: var(--accent); border-color: var(--accent); color: #fff; padding: 5px 16px; }
+#sum-go:hover { color: #fff; filter: brightness(1.08); }
+#sum-go:disabled { opacity: .5; cursor: default; }
+.sum-item { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 7px; color: inherit;
+  text-decoration: none; font-size: 13.5px; }
+.sum-item:hover, .sum-item.on { background: var(--accent-soft); }
+.sum-item .when { color: var(--muted); font-size: 12px; flex: none; }
+.sum-item .topic { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sum-item .st { flex: none; font-size: 11.5px; color: var(--muted); }
+.sum-item .st.err { color: #c0392b; }
+.sum-actions { display: flex; gap: 8px; margin: 18px 0 8px; align-items: center; color: var(--muted); font-size: 12.5px; }
+.sum-actions .sp { flex: 1; }

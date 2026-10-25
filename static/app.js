@@ -8,7 +8,30 @@ const state = {
 function localGet(k, d) { try { return localStorage.getItem('ccnb.' + k) ?? d; } catch { return d; } }
 function localSet(k, v) { try { localStorage.setItem('ccnb.' + k, v); } catch {} }
 function esc(s) { return (s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
-function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 1400); }
+function toast(msg, ms = 1400) {
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => t.classList.remove('show'), ms);
+}
+// 请求带超时:网络差时请求可能挂很久,定时刷新会一个个叠起来;连续失败时右下角提示网络不稳定
+const net = { fails: 0 };
+async function api(url, opts = {}, ms = 15000) {
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), ms);
+  try {
+    const r = await (await fetch(url, { ...opts, signal: ctl.signal })).json();
+    netState(true);
+    return r;
+  } catch (e) {
+    if (e.name !== 'SyntaxError') netState(false);
+    throw e;
+  } finally { clearTimeout(timer); }
+}
+function netState(ok) {
+  net.fails = ok ? 0 : net.fails + 1;
+  $('#net').hidden = net.fails < 2;
+}
+const post = (url, body) => api(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify(body || {}) }, 60000);
+
 function fmtTime(ts) {
   if (!ts) return '';
   const d = typeof ts === 'number' ? new Date(ts * 1000) : new Date(ts);
@@ -238,19 +261,23 @@ $('#main').addEventListener('scroll', () => { cmenu.hidden = true; });
 
 // ---------- 会话列表 ----------
 async function loadSessions() {
-  const r = await fetch('/api/sessions').then(r => r.json()).catch(() => null);
+  const r = await api('/api/sessions').catch(() => null);
   if (!r) return;
   state.sessions = r.sessions;
+  renderQQ(r.qq || {});
   onTerms(r.terms);
   renderSessions();
+  if (state.data) renderSendNote();
 }
 
 function renderSessions() {
   const kw = $('#search').value.trim().toLowerCase();
   if (kw && searchMode() !== 'title') return renderSearch();
+  renderSrcFilter();
   const groups = new Map();
   for (const s of state.sessions) {
-    if (kw && !`${s.title} ${s.first_q} ${s.cwd} ${s.id}`.toLowerCase().includes(kw)) continue;
+    if (state.src !== 'all' && (s.via?.platform || 'local') !== state.src) continue;
+    if (kw && !`${s.title} ${s.first_q} ${s.cwd} ${s.id} ${s.via?.label || ''}`.toLowerCase().includes(kw)) continue;
     if (!groups.has(s.cwd)) groups.set(s.cwd, []);
     groups.get(s.cwd).push(s);
   }
@@ -261,16 +288,46 @@ function renderSessions() {
     const col = state.collapsed.has(cwd) && !kw ? ' collapsed' : '';
     const live = list.some(x => x.running) ? '<span class="dot live" title="有运行中的会话"></span>' : '';
     return `<div class="proj${col}" data-cwd="${esc(cwd)}" title="${esc(cwd)}"><span class="caret"></span>` +
-      `<span class="pn"><span class="pp">${esc(name.slice(0, cut))}</span>${esc(name.slice(cut) || name)}</span>${live}<span class="cnt">${list.length}</span></div><div class="proj-list">` +
+      `<span class="pn"><span class="pp">${esc(name.slice(0, cut))}</span>${esc(name.slice(cut) || name)}</span>` +
+      (cwd.startsWith('/') ? '<button class="proj-new" title="cc in this project">new</button>' : '') +
+      `${live}<span class="cnt">${list.length}</span></div><div class="proj-list">` +
       list.map(s => `<a class="sess${s.id === state.sid ? ' on' : ''}" href="#/s/${s.id}">
         <div class="t">${esc(s.title)}</div>
-        <div class="m">${s.running ? '<span class="badge run">运行中</span>' : ''}${s.active ? '<span class="dot live" title="记录正在更新"></span>' : ''}${fmtTime(s.mtime)} · ${s.questions} 问
+        <div class="m">${s.running ? '<span class="badge run">运行中</span>' : ''}${s.via ? `<span class="badge via" title="在 ${esc(s.via.label)} 里开的会话">${esc(s.via.label)}</span>` : ''}${s.active ? '<span class="dot live" title="记录正在更新"></span>' : ''}${fmtTime(s.mtime)} · ${s.questions} 问
         ${s.noted ? '<span class="badge">整理版</span>' : ''}</div></a>`).join('') + '</div>';
   }).join('');
   $('#sessions').innerHTML = html || '<div class="hint">没有匹配的会话</div>';
 }
 
-$('#sessions').addEventListener('click', e => {
+// 来源筛选:有在 QQ 里开的会话时才显示
+state.src = localGet('src', 'all');
+function renderSrcFilter() {
+  const plats = new Map(state.sessions.filter(s => s.via).map(s => [s.via.platform, s.via.label]));
+  const box = $('#src-filter');
+  box.hidden = !plats.size;
+  if (!plats.size) { state.src = 'all'; return; }
+  if (state.src !== 'all' && state.src !== 'local' && !plats.has(state.src)) state.src = 'all';
+  box.innerHTML = [['all', '全部'], ['local', '本机'], ...plats].map(([k, l]) =>
+    `<button data-src="${esc(k)}" class="${k === state.src ? 'on' : ''}">${esc(l)}</button>`).join('');
+}
+$('#src-filter').addEventListener('click', e => {
+  const b = e.target.closest('[data-src]'); if (!b) return;
+  state.src = b.dataset.src; localSet('src', state.src); renderSessions();
+});
+
+$('#sessions').addEventListener('click', async e => {
+  const nb = e.target.closest('.proj-new');
+  if (nb) {  // 在这个项目目录新开一个 cc,打开它的会话页,底部就是它的输入框
+    e.stopPropagation();
+    nb.disabled = true;
+    const r = await post('/api/terms/new', { cwd: nb.closest('.proj').dataset.cwd }).catch(() => ({ error: '网络错误' }));
+    nb.disabled = false;
+    if (r.error) return toast(r.error);
+    await loadTerms();
+    if (r.sid) location.hash = '#/s/' + r.sid;
+    loadSessions();
+    return;
+  }
   const p = e.target.closest('.proj');
   if (!p) return;
   const cwd = p.dataset.cwd;
@@ -347,12 +404,23 @@ $('#search-mode').value = localGet('search-mode', 'title');
 $('#search').placeholder = PH[searchMode()];
 
 // ---------- 单个会话 ----------
-async function loadSession(force = false) {
-  if (!state.sid) return;
-  const sid = state.sid;
+// 网络差时请求会重叠、乱序返回:晚到的旧回复若合并到新数据上,刚出现的轮次会消失、增量对不上。
+// 所以每个请求编号,只应用比已应用的更新的回复;增量回复的基础版本不是手里的版本就重新要。
+const sess = { seq: 0, applied: 0, inflight: 0 };
+async function loadSession(force = false, poll = false) {
+  if (!state.sid || (poll && sess.inflight)) return;  // 定时刷新:上一个请求还没回来就不叠加
+  const sid = state.sid, seq = ++sess.seq;
   const v = force ? '' : (state.version || '');
-  const r = await fetch(`/api/session/${sid}?v=${encodeURIComponent(v)}`).then(r => r.json()).catch(() => null);
-  if (!r || sid !== state.sid || r.unchanged) return;
+  sess.inflight++;
+  const r = await api(`/api/session/${sid}?v=${encodeURIComponent(v)}`).catch(() => null);
+  sess.inflight--;
+  if (!r || sid !== state.sid || seq < sess.applied) return;
+  sess.applied = seq;
+  if (state.data && !r.error && JSON.stringify(state.data.owner ?? null) !== JSON.stringify(r.owner ?? null)) {
+    state.data.owner = r.owner; syncDock();
+  }
+  if (r.unchanged) return;
+  if (r.delta && v !== (state.version || '')) return loadSession();
   // 这个会话已在新会话里继续(从 agent 视图重新进入时 cc 会换新 id)→ 跳到最新的那个
   if (r.moved) { location.replace('#/s/' + r.moved + (state.jump ? '/' + state.jump : '')); return; }
   if (r.error) { $('#article').innerHTML = `<div class="hint">${esc(r.error)}</div>`; return; }
@@ -381,7 +449,7 @@ function renderHead() {
   const { meta, turns, note, active } = state.data;
   mdCwd = meta.cwd || '';
   $('#empty').hidden = true; $('#view').hidden = false;
-  $('#view').classList.remove('stars', 'file'); $('#star-link').classList.remove('on');
+  $('#view').classList.remove('stars', 'file', 'summary'); $('#star-link').classList.remove('on'); $('#sum-link').classList.remove('on');
   fs.lastCwd = meta.cwd;
   $('#title').textContent = meta.title;
   document.title = meta.title + ' · MeowNotebook';
@@ -392,6 +460,7 @@ function renderHead() {
   ].join('');
   const noteBtn = $('#tabs [data-tab=note]');
   noteBtn.disabled = !note;
+  renderSendNote();
   noteBtn.textContent = note ? `整理版${note.meta.covered_turns && +note.meta.covered_turns < turns.length ? `(覆盖到第 ${note.meta.covered_turns} 轮,共 ${turns.length})` : ''}` : '整理版(未整理)';
 }
 
@@ -609,7 +678,8 @@ window.addEventListener('resize', () => { layoutMap(); spy(); });
 
 // ---------- 底部输入区(真实的 cc TUI)----------
 // 会话页底部嵌入运行这个会话的 tmux 终端;输入框、斜杠菜单、权限确认、Esc 打断等与终端完全一致。
-const tv = { name: null, term: null, fit: null, ws: null, retry: null, ro: null, terms: [], bySid: new Map() };
+const tv = { name: null, term: null, fit: null, ws: null, retry: null, ro: null, terms: [], bySid: new Map(),
+  cid: null, seq: 0, unacked: [] };
 const dock = $('#dock');
 
 function onTerms(terms) {
@@ -627,7 +697,7 @@ function onTerms(terms) {
 }
 
 async function loadTerms() {
-  const r = await fetch('/api/terms').then(r => r.json()).catch(() => null);
+  const r = await api('/api/terms').catch(() => null);
   if (r) onTerms(r.terms);
 }
 
@@ -637,17 +707,18 @@ function syncDock() {
   const t = tv.bySid.get(state.data.meta.id);
   if (t) {
     dock.classList.add('on');
-    $('#dock-status').innerHTML = `<span class="badge run">运行中</span> ${esc(t.name)} · ${t.clients} 个连接 · 点击终端后直接输入`;
+    $('#dock-status').innerHTML = `<span class="badge run">运行中</span> ${esc(t.name)} · ${t.clients} 个连接 · 点击终端后直接输入<span class="warn" id="input-wait"></span>`;
+    inputStatus();
     if (tv.name !== t.name) attachTerm(t.name);
   } else {
     detachTerm();
     dock.classList.remove('on');
-    const busyElsewhere = state.data.active && !state.data.pending;
-    $('#dock-go').disabled = busyElsewhere;
-    $('#dock-status').textContent = '未运行';
-    $('#dock-tip').innerHTML = busyElsewhere
-      ? '这个会话正在别的终端里运行(不是用 cc 启动的)。为避免两个进程同时写同一会话,请在原终端继续,或退出它后再从这里继续。'
-      : '将以 <code>--resume</code> 在后台启动(bypass 模式),底部出现与终端完全相同的输入框。';
+    // 服务器按 cc 登记的运行中进程判断(正在回答 QQ 消息的也认得出),不再看记录最近有没有写
+    const owner = !state.data.pending && state.data.owner;
+    $('#dock-go').disabled = !!owner;
+    $('#dock-status').textContent = owner ? `在${owner.label}里运行中` : '未运行';
+    if (owner) $('#dock-tip').textContent = owner.message;
+    else $('#dock-tip').innerHTML = '将以 <code>--resume</code> 在后台启动(bypass 模式),底部出现与终端完全相同的输入框。';
   }
 }
 
@@ -659,11 +730,11 @@ function fitTerm() {
 
 function detachTerm() {
   clearTimeout(tv.retry);
-  if (tv.ws) { tv.ws.onclose = null; tv.ws.close(); }
+  if (tv.ws) retireWS(tv.ws);
   tv.ro?.disconnect();
   tv.term?.dispose();
   $('#termbox').querySelectorAll('.xterm').forEach(x => x.remove());
-  Object.assign(tv, { name: null, term: null, ws: null, ro: null });
+  Object.assign(tv, { name: null, term: null, ws: null, ro: null, unacked: [] });
 }
 
 // 先等内置等宽字体加载完再建终端,否则 xterm 会按后备字体测量字宽,导致字间距错乱
@@ -681,29 +752,90 @@ async function attachTerm(name) {
   tv.fit = new FitAddon.FitAddon();
   tv.term.loadAddon(tv.fit);
   tv.term.open($('#termbox'));
-  tv.term.onData(d => { if (tv.ws?.readyState === 1) tv.ws.send('0' + d); });
+  Object.assign(tv, { cid: crypto.randomUUID?.() || String(Math.random()).slice(2) + Date.now(), seq: 0, unacked: [] });
+  tv.term.onData(sendInput);
   tv.ro = new ResizeObserver(() => fitTerm());
   tv.ro.observe($('#termbox'));
   connectTerm();
 }
 
+// 键盘输入带序号发送,服务器确认("a<序号>")后才算送达。网络差时连接可能悄悄断掉,
+// 浏览器发送缓冲里的按键会跟着丢;没确认的输入一直留着,重连后补发(服务器按序号去重,不会重复输入)。
+function sendInput(d) {
+  const m = { seq: ++tv.seq, d, t: Date.now() };
+  tv.unacked.push(m);
+  const ws = tv.ws;
+  if (ws?.readyState === 1 && ws.mode === 'ack') ws.send('2' + m.seq + ':' + d);
+  else if (ws?.readyState === 1 && ws.mode === 'legacy') { ws.send('0' + d); tv.unacked.pop(); }
+}
+
+function inputStatus() {
+  const el = $('#input-wait'); if (!el) return;
+  const n = tv.unacked.reduce((a, m) => a + m.d.length, 0);
+  const late = tv.unacked.length && Date.now() - tv.unacked[0].t > 1500;
+  el.textContent = late ? ` · 网络慢,${n} 个字符等待送达…` : '';
+}
+
+function retireWS(ws) {
+  ws.onclose = ws.onmessage = ws.onopen = null;
+  try { ws.close(); } catch {}
+}
+
 function connectTerm() {
   const name = tv.name;
-  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/term/${name}`);
+  if (tv.ws) retireWS(tv.ws);
+  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/term/${name}?cid=${tv.cid}`);
   ws.binaryType = 'arraybuffer';
+  ws.mode = null;  // 'ack':服务器支持带确认的输入;'legacy':旧版服务器(还没重启),退回直接发送
   tv.ws = ws;
-  ws.onopen = () => { $('#term-overlay').hidden = true; fitTerm(); };
-  ws.onmessage = e => tv.term.write(new Uint8Array(e.data));
+  ws.onopen = () => {
+    $('#term-overlay').hidden = true; fitTerm();
+    setTimeout(() => {
+      if (ws.mode || tv.ws !== ws || ws.readyState !== 1) return;
+      ws.mode = 'legacy';
+      for (const m of tv.unacked.splice(0)) ws.send('0' + m.d);
+    }, 5000);
+  };
+  ws.onmessage = e => {
+    if (typeof e.data === 'string') {  // "a<序号>":这之前的输入都已写进终端
+      const n = +e.data.slice(1);
+      tv.unacked = tv.unacked.filter(m => m.seq > n);
+      if (!ws.mode) {  // 刚连上:服务器告诉我们它收到哪了,补发其余的
+        ws.mode = 'ack';
+        for (const m of tv.unacked) ws.send('2' + m.seq + ':' + m.d);
+      }
+      inputStatus();
+      return;
+    }
+    tv.term.write(new Uint8Array(e.data));
+  };
   ws.onclose = async () => {
-    if (tv.name !== name) return;
+    if (tv.name !== name || tv.ws !== ws) return;
     await loadTerms();
     if (tv.name !== name) return;  // 会话已结束,syncDock 已切回"继续"按钮
     const ov = $('#term-overlay');
     ov.hidden = false;
-    ov.textContent = '连接断开,正在重连…(点击立即重连)';
+    ov.textContent = '连接断开,正在重连…(点击立即重连)' + (tv.unacked.length ? ',已输入的内容会在重连后补发' : '');
     tv.retry = setTimeout(connectTerm, 2000);
   };
 }
+
+// 输入迟迟没有确认:连接多半已经死了(浏览器要很久才发现),换一条;断开太久的输入不再补发,明确告诉用户
+setInterval(() => {
+  if (!tv.unacked.length) return;
+  const age = Date.now() - tv.unacked[0].t;
+  if (age > 30000) {
+    const n = tv.unacked.reduce((a, m) => a + m.d.length, 0);
+    tv.unacked = [];
+    toast(`网络中断太久,${n} 个字符没有送达,已丢弃,请重新输入`);
+  } else if (age > 6000 && tv.ws?.readyState === 1 && tv.name && !tv.stale) {
+    tv.stale = true;
+    clearTimeout(tv.retry);
+    connectTerm();
+    setTimeout(() => { tv.stale = false; }, 5000);
+  }
+  inputStatus();
+}, 1000);
 
 // 高度:拖动标题栏调整,记住;"放大"在常用高度与 72vh 之间切换
 function setDockH(px) {
@@ -733,8 +865,7 @@ $('#dock-go').addEventListener('click', async () => {
   if (!state.data) return;
   const b = $('#dock-go');
   b.disabled = true; b.textContent = '启动中…';
-  const r = await fetch(`/api/sessions/${state.data.meta.id}/continue`, { method: 'POST' })
-    .then(r => r.json()).catch(() => ({ error: '网络错误' }));
+  const r = await post(`/api/sessions/${state.data.meta.id}/continue`).catch(() => ({ error: '网络错误' }));
   b.disabled = false; b.textContent = '▶ 在此继续对话';
   if (r.error) return alert(r.error);
   await loadTerms();
@@ -742,7 +873,7 @@ $('#dock-go').addEventListener('click', async () => {
 });
 $('#dock-kill').addEventListener('click', async () => {
   if (!tv.name || !confirm(`结束 ${tv.name}?其中的 cc 会被关闭(对话记录保留,可随时"在此继续")。`)) return;
-  await fetch(`/api/terms/${tv.name}/kill`, { method: 'POST' });
+  await post(`/api/terms/${tv.name}/kill`).catch(() => null);
   detachTerm();
   await loadSessions();
   if (state.data?.pending) location.hash = '';
@@ -797,7 +928,7 @@ async function openFile(path, line) {
   detachTerm();
   const r = await fetch(`/api/fs/read?path=${encodeURIComponent(path)}`).then(r => r.json()).catch(() => ({ error: '网络错误' }));
   $('#empty').hidden = true; $('#view').hidden = false;
-  $('#view').classList.remove('stars'); $('#view').classList.add('file'); $('#star-link').classList.remove('on');
+  $('#view').classList.remove('stars', 'summary'); $('#view').classList.add('file'); $('#star-link').classList.remove('on'); $('#sum-link').classList.remove('on');
   renderSessions();
   if (r.error) {
     $('#title').textContent = path.split('/').pop(); $('#sub').innerHTML = `<span>${esc(path)}</span>`;
@@ -876,7 +1007,8 @@ document.addEventListener('click', async e => {
 
 function renderStars() {
   $('#empty').hidden = true; $('#view').hidden = false;
-  $('#view').classList.remove('file'); $('#view').classList.add('stars'); detachTerm(); $('#star-link').classList.add('on');
+  $('#view').classList.remove('file', 'summary'); $('#view').classList.add('stars'); detachTerm(); $('#star-link').classList.add('on');
+  $('#sum-link').classList.remove('on');
   $('#title').textContent = '★ 收藏';
   document.title = '收藏 · MeowNotebook';
   $('#sub').innerHTML = `<span>${state.stars.length} 条</span><span>存放在本地 data/stars.json(含问答快照)</span>`;
@@ -888,11 +1020,142 @@ function renderStars() {
   renderMap(state.stars.map((x, i) => ({ id: 'star' + i, n: i + 1, text: x.q.replace(/\s+/g, ' ').slice(0, 240), len: x.q.length })));
 }
 
+// ---------- 总结:输入要求(如"只要论文""开发 MeowNotebook"),选某一天或一段时间,让 cc 总结这期间的问答 ----------
+const sum = { list: [], cur: null, mode: localGet('sum-mode', 'day'), timer: null };
+const isoDay = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const dayAgo = n => { const d = new Date(); d.setDate(d.getDate() - n); return isoDay(d); };
+
+async function openSummary(id) {
+  $('#empty').hidden = true; $('#view').hidden = false;
+  $('#view').classList.remove('file'); $('#view').classList.add('stars', 'summary'); detachTerm();
+  $('#star-link').classList.remove('on'); $('#sum-link').classList.add('on');
+  $('#title').textContent = '✦ 总结';
+  document.title = '总结 · MeowNotebook';
+  $('#sub').innerHTML = '<span>按你的要求,让 cc 总结某一天或一段时间里的问答</span><span>存放在本地 data/summaries/</span>';
+  if (!$('#sum-form')) renderSumForm();
+  const [l, cur] = await Promise.all([api('/api/summaries').catch(() => null), id ? api('/api/summaries/' + id).catch(() => null) : null]);
+  if (l) sum.list = l.summaries;
+  sum.cur = cur && !cur.error ? cur : null;
+  renderSumBody();
+  clearTimeout(sum.timer);
+  if (sum.list.some(x => x.status === 'running') && location.hash.startsWith('#/summary'))
+    sum.timer = setTimeout(() => location.hash.startsWith('#/summary') && openSummary(id), 2500);
+}
+
+function renderSumForm() {
+  $('#article').innerHTML = `<form id="sum-form" autocomplete="off">
+      <input type="text" id="sum-topic" placeholder="要求,如:只要论文 / 我开发 MeowNotebook 的进展(留空 = 全部)">
+      <span class="seg"><button type="button" data-mode="day">某一天</button><button type="button" data-mode="range">一段时间</button></span>
+      <input type="date" id="sum-from"><span id="sum-to-wrap">至 <input type="date" id="sum-to"></span>
+      <span class="presets"><button type="button" data-preset="0">今天</button><button type="button" data-preset="1">昨天</button><button type="button" data-preset="7">近 7 天</button><button type="button" data-preset="30">近 30 天</button></span>
+      <button id="sum-go" type="submit">生成总结</button>
+    </form><div id="sum-body"></div>`;
+  $('#sum-topic').value = localGet('sum-topic', '');
+  $('#sum-from').value = $('#sum-to').value = isoDay(new Date());
+  $('#sum-from').max = $('#sum-to').max = isoDay(new Date());
+  setSumMode(sum.mode);
+  $('#sum-form').addEventListener('click', e => {
+    const m = e.target.closest('[data-mode]'); if (m) return setSumMode(m.dataset.mode);
+    const pr = e.target.closest('[data-preset]'); if (!pr) return;
+    const n = +pr.dataset.preset;
+    if (n <= 1) { setSumMode('day'); $('#sum-from').value = dayAgo(n); }
+    else { setSumMode('range'); $('#sum-from').value = dayAgo(n - 1); $('#sum-to').value = dayAgo(0); }
+  });
+  $('#sum-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const from = $('#sum-from').value, to = sum.mode === 'day' ? from : $('#sum-to').value;
+    if (!from || !to) return toast('请选择日期');
+    const topic = $('#sum-topic').value.trim();
+    localSet('sum-topic', topic);
+    $('#sum-go').disabled = true;
+    const r = await post('/api/summaries', { topic, from, to }).catch(() => ({ error: '网络错误' }));
+    $('#sum-go').disabled = false;
+    if (r.error) return toast(r.error, 4000);
+    location.hash = '#/summary/' + r.id;
+  });
+}
+function setSumMode(m) {
+  sum.mode = m; localSet('sum-mode', m);
+  $('#sum-form').querySelectorAll('[data-mode]').forEach(b => b.classList.toggle('on', b.dataset.mode === m));
+  $('#sum-to-wrap').hidden = m === 'day';
+}
+
+const sumSpan = x => x.from === x.to ? x.from : `${x.from} 至 ${x.to}`;
+function renderSumBody() {
+  const st = x => x.status === 'running' ? '<span class="st">生成中…</span>'
+    : x.status === 'error' ? '<span class="st err">失败</span>' : `<span class="st">${x.sessions} 个会话 · ${x.turns} 问</span>`;
+  const list = sum.list.map(x => `<a class="sum-item${sum.cur?.id === x.id ? ' on' : ''}" href="#/summary/${x.id}">
+      <span class="when">${esc(sumSpan(x))}</span><span class="topic">${esc(x.topic)}</span>${st(x)}</a>`).join('');
+  let cur = '';
+  const c = sum.cur;
+  if (c) {
+    const head = `<div class="sum-actions"><b>${esc(c.topic)}</b><span>${esc(sumSpan(c))} · ${c.sessions} 个会话 · ${c.turns} 问</span><span class="sp"></span>
+      ${c.status === 'done' && state.qq?.enabled ? `<button data-sum-send="${c.id}" ${state.qq.can_send ? '' : 'disabled title="QQ 只允许在你给机器人发消息后 60 分钟内回复"'}>发送到 QQ</button>` : ''}
+      <button class="danger" data-sum-del="${c.id}">删除</button></div>`;
+    cur = head + (c.status === 'running' ? '<div class="hint">cc 正在阅读这段时间的问答并总结,通常要一两分钟…</div>'
+      : c.status === 'error' ? `<div class="hint">生成失败:${esc(c.error || '')}</div>`
+      : `<div class="md">${renderMD(c.body)}</div>`);
+  }
+  mdCwd = '';
+  $('#sum-body').innerHTML = cur + (list ? `<div class="sum-actions"><span>历史总结</span></div>${list}` : '');
+  markArticle($('#sum-body'));
+  renderMap([]);
+}
+$('#article').addEventListener('click', async e => {
+  const sd = e.target.closest('[data-sum-send]'), dl = e.target.closest('[data-sum-del]');
+  if (sd) {
+    sd.disabled = true;
+    const r = await post(`/api/summaries/${sd.dataset.sumSend}/send`).catch(() => ({ error: '网络错误' }));
+    sd.disabled = false;
+    toast(r.error ? '发送失败:' + r.error : '已发送到' + r.to, r.error ? 5000 : 2000);
+  } else if (dl && confirm('删除这份总结?')) {
+    await post(`/api/summaries/${dl.dataset.sumDel}/delete`).catch(() => null);
+    location.hash = '#/summary';
+  }
+});
+
 // ---------- 交互 ----------
 document.querySelectorAll('#tabs [data-tab]').forEach(b => b.addEventListener('click', () => {
   state.tab = b.dataset.tab; localSet('tab', state.tab); renderSession();
 }));
 ['#show-process', '#show-misc'].forEach(id => $(id).addEventListener('change', renderSession));
+
+// QQ 机器人(data/qqbot.json 配好才有):侧栏顶部的连接状态,以及第一次发消息的用户等你允许
+function renderQQ(qq) {
+  state.qq = qq;
+  const st = $('#qq-status');
+  st.hidden = !qq.enabled;
+  if (qq.enabled) {
+    st.innerHTML = `<span class="dot ${qq.connected ? 'live' : 'off'}"></span>QQ`;
+    st.title = qq.connected ? `QQ 机器人已连接 · 允许 ${qq.allowed} 个用户`
+      : 'QQ 机器人未连接' + (qq.error ? ':' + qq.error : '') + '\n一直连不上?欢迎到 github.com/MiaowFisherSpeaker/MeowNotebook/issues 提 issue';
+  }
+  const pd = $('#qq-pending'), p = qq.pending;
+  pd.hidden = !p;
+  if (p) pd.innerHTML = `QQ 用户 <code>${esc(p.openid.slice(0, 8))}…</code> 发来:「${esc(p.text)}」<br>
+    是你自己就允许它使用机器人(允许后它能在这台机器上运行 cc)。<br><button data-qq-allow="${esc(p.openid)}">允许</button>`;
+}
+$('#qq-pending').addEventListener('click', async e => {
+  const b = e.target.closest('[data-qq-allow]'); if (!b) return;
+  const r = await post('/api/qq/allow', { openid: b.dataset.qqAllow }).catch(() => ({ error: '网络错误' }));
+  if (r.error) return toast(r.error, 4000);
+  renderQQ(r.qq); toast('已允许,再在 QQ 里发一条消息试试', 3000);
+});
+
+// 整理版发回 QQ:QQ 只允许在你给机器人发消息后 60 分钟内回复,超时按钮变灰
+function renderSendNote() {
+  const b = $('#send-note');
+  b.hidden = !(state.qq?.enabled && state.data?.note);
+  b.disabled = !state.qq?.can_send;
+  b.title = state.qq?.can_send ? '把整理版正文作为文字发到 QQ' : 'QQ 只允许在你给机器人发消息后 60 分钟内回复:先在 QQ 里给机器人发一条消息';
+}
+$('#send-note').addEventListener('click', async () => {
+  const b = $('#send-note'), sid = state.data?.meta.id; if (!sid) return;
+  b.disabled = true;
+  const r = await post(`/api/sessions/${sid}/send-note`).catch(() => ({ error: '网络错误' }));
+  b.disabled = false;
+  toast(r.error ? '发送失败:' + r.error : '整理版已发送到' + r.to, r.error ? 5000 : 2000);
+});
 
 document.querySelectorAll('[data-copy]').forEach(b => b.addEventListener('click', async () => {
   const m = state.data?.meta; if (!m) return;
@@ -920,6 +1183,8 @@ function route() {
   if (location.hash === '#/stars') {
     state.sid = null; state.data = null; renderSessions(); loadStars().then(renderStars); return;
   }
+  const sm = location.hash.match(/^#\/summary(?:\/([\w-]+))?$/);
+  if (sm) { state.sid = null; state.data = null; renderSessions(); openSummary(sm[1] || null); return; }
   const m = location.hash.match(/^#\/s\/([\w-]+)(?:\/(\d+))?/);
   const sid = m ? m[1] : null;
   if (m?.[2]) state.jump = +m[2];
@@ -933,10 +1198,48 @@ function route() {
 }
 window.addEventListener('hashchange', route);
 
-// 进行中的会话每 3 秒检查一次;列表每 15 秒刷新
-// 记录在更新(或底部终端在运行)时每 3 秒刷新问答;终端状态每 3 秒、会话列表每 15 秒刷新
-setInterval(() => { if (!document.hidden && (state.data?.active || tv.name)) loadSession(); }, 3000);
-setInterval(() => { if (!document.hidden) loadTerms(); }, 3000);
-setInterval(() => { if (!document.hidden) { loadSessions(); if (state.data && !state.data.active) loadSession(); } }, 15000);
+// 服务器推送变化(SSE):记录、整理版或终端变了才取数据。推送连着时不再每 3 秒轮询;
+// 断开时(网络差、代理不支持)EventSource 自己重连,其间退回轮询。会话列表 / 当前会话另有 15 秒的兜底刷新。
+const live = { ok: false, es: null, last: 0, listT: 0, listTimer: null };
+function refreshList() {  // 记录在写时每秒都有变化,列表最多 5 秒刷新一次
+  if (live.listTimer) return;
+  live.listTimer = setTimeout(() => { live.listTimer = null; live.listT = Date.now(); loadSessions(); },
+    Math.max(0, 5000 - (Date.now() - live.listT)));
+}
+function onChanged(ids) {
+  if (document.hidden) { live.missed = true; return; }
+  const known = new Set(state.sessions.map(s => s.id));
+  if (state.sid && (ids.includes(state.sid) || ids.some(id => !known.has(id)))) loadSession(false, true);
+  refreshList();
+}
+function connectLive() {
+  if (!window.EventSource) return;
+  const es = live.es = new EventSource('/api/events');
+  es.onmessage = e => {
+    live.last = Date.now();
+    let ev; try { ev = JSON.parse(e.data); } catch { return; }
+    if (ev.hello) {  // 连上 / 重连:断开期间的变化不会补推,全量刷新一次
+      live.ok = true; netState(true);
+      loadTerms(); loadSessions(); loadSession(false, true);
+      return;
+    }
+    if (ev.terms) onTerms(ev.terms);
+    if (ev.changed) onChanged(ev.changed);
+  };
+  es.onerror = () => { live.ok = false; };
+}
+// 服务器至少每 15 秒发一次;40 秒没动静 = 连接卡死了(网络差时浏览器不一定察觉),先退回轮询并重连
+setInterval(() => {
+  if (!live.ok || Date.now() - live.last < 40000) return;
+  live.ok = false; live.es.close(); connectLive();
+}, 5000);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || !live.missed) return;
+  live.missed = false; loadSession(false, true); loadSessions();
+});
+setInterval(() => { if (!document.hidden && !live.ok && (state.data?.active || tv.name)) loadSession(false, true); }, 3000);
+setInterval(() => { if (!document.hidden && !live.ok) loadTerms(); }, 3000);
+setInterval(() => { if (!document.hidden) { loadSessions(); if (state.data && (live.ok || !state.data.active)) loadSession(false, true); } }, 15000);
+connectLive();
 setSide(localGet('side-tab', 'sessions'));
 Promise.all([loadSessions(), loadStars()]).then(route);

@@ -16,8 +16,10 @@ import signal
 import struct
 import subprocess
 import termios
+import threading
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -71,12 +73,17 @@ def tmux(*args, check=False):
 
 
 def list_sessions():
-    r = tmux("list-sessions", "-F", "#{session_name}\t#{session_path}\t#{session_created}\t#{session_attached}\t#{@ccnb_sid}\t#{pane_id}")
+    """ccnb socket 上跑着 cc 的 tmux 会话。别的程序(比如在这里开着的 cc-connect)不算,
+    否则网页会把它们当成 cc 终端,猜一个会话挂上去,底部的输入就打进了那个程序。"""
+    r = tmux("list-sessions", "-F", "#{session_name}\t#{session_path}\t#{session_created}\t#{session_attached}"
+             "\t#{@ccnb_sid}\t#{pane_id}\t#{pane_pid}\t#{pane_start_command}")
     out = []
     for line in r.stdout.splitlines():
-        name, path, created, attached, sid, pane = (line.split("\t") + [""] * 6)[:6]
-        out.append({"name": name, "cwd": path, "created": int(created or 0),
-                    "clients": int(attached or 0), "launch_sid": sid or None, "pane": pane.lstrip("%")})
+        name, path, created, attached, sid, pane, pid, cmd = (line.split("\t", 7) + [""] * 8)[:8]
+        if shlex.join(CC_CMD) not in cmd:
+            continue
+        out.append({"name": name, "cwd": path, "created": int(created or 0), "clients": int(attached or 0),
+                    "launch_sid": sid or None, "pane": pane.lstrip("%"), "pid": int(pid) if pid.isdigit() else None})
     return sorted(out, key=lambda s: -s["created"])
 
 
@@ -234,13 +241,39 @@ def set_winsize(fd, rows, cols):
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
-def bridge(handler, name):
+# 带序号的键盘输入:每个网页终端(cid)已写进 PTY 的最大序号。网络差时连接可能悄悄断掉,
+# 还在浏览器发送缓冲里的按键就丢了;客户端会保留没确认的输入,重连后补发,这里按序号去重,保证每个按键只写一次。
+_input_seq = OrderedDict()
+_input_lock = threading.Lock()
+
+
+def _last_seq(cid):
+    with _input_lock:
+        return _input_seq.get(cid, 0)
+
+
+def _claim_seq(cid, seq):
+    """seq 还没写过就记下并返回 True。旧连接还没察觉断开、新连接已在补发时,两边可能同时收到同一条。"""
+    with _input_lock:
+        if seq <= _input_seq.get(cid, 0):
+            return False
+        _input_seq[cid] = seq
+        _input_seq.move_to_end(cid)
+        while len(_input_seq) > 256:
+            _input_seq.popitem(last=False)
+        return True
+
+
+def bridge(handler, name, cid=None):
     """把一个 WebSocket 连接接到 `tmux attach -t name` 的 PTY 上。
-    协议:客户端发文本帧,首字符 '0' = 键盘输入,'1' = {"cols","rows"} 调整大小。"""
+    协议:客户端发文本帧,首字符 '0' = 键盘输入,'1' = {"cols","rows"} 调整大小,
+    '2' = "<序号>:<输入>"(带确认的键盘输入,需要 URL 带 cid)。
+    服务端发二进制帧 = 终端输出;文本帧 "a<序号>" = 该序号及之前的输入都已写入(连上时先发一次)。"""
     handler.close_connection = True  # WebSocket 结束后不再复用这条 HTTP 连接
     if not ws_accept(handler):
         return
     sock = handler.connection
+    cid = cid and (name, cid)
     if not session_exists(name):
         ws_send(sock, "\r\n[会话不存在或已结束]\r\n".encode(), 2)
         ws_send(sock, b"", 8)
@@ -253,6 +286,8 @@ def bridge(handler, name):
     set_winsize(fd, 40, 120)
     close_code = b""
     try:
+        if cid:
+            ws_send(sock, f"a{_last_seq(cid)}".encode(), 1)
         while True:
             r, _, _ = select.select([sock, fd], [], [], 30)
             if fd in r:
@@ -276,6 +311,12 @@ def bridge(handler, name):
                 kind, body = payload[:1], payload[1:]
                 if kind == b"0":
                     os.write(fd, body)
+                elif kind == b"2" and cid:
+                    seq, _, data = body.partition(b":")
+                    seq = int(seq)
+                    if _claim_seq(cid, seq):
+                        os.write(fd, data)
+                    ws_send(sock, f"a{seq}".encode(), 1)
                 elif kind == b"1":
                     size = json.loads(body)
                     set_winsize(fd, max(5, int(size["rows"])), max(20, int(size["cols"])))

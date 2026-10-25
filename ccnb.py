@@ -8,6 +8,11 @@
   extract (--current | --session ID) [--new-only]
                            以 Markdown 输出某会话的问答(供 /qa-notes skill 整理)
   current                  打印当前目录最新会话的 ID
+  link [--session ID] [--turn N]
+                           打印会话(某一轮)的网页链接;在 cc 里调用时默认是调用它的那个会话
+  pending [--days N]       列出最近 N 天(默认 1 = 今天)更新过、整理版还没覆盖全部轮次的会话
+  qq setup                 QQ 机器人:输入 AppID / AppSecret(不回显),写 data/qqbot.json 并验证
+  qq probe                 QQ 机器人:只连接并打印收到的所有事件(排查"收不到消息")
   launch [--detach] [cc 参数...]
                            在当前目录以 bypass 模式启动 cc(tmux 会话),
                            并确保网站运行;本地终端与网页终端共享同一会话
@@ -31,13 +36,16 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import qqbot
 import term
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
 NOTES = ROOT / "data" / "notes"
 STARS = ROOT / "data" / "stars.json"
+SUMMARIES = ROOT / "data" / "summaries"
 PROJECTS = term.CC_HOME / "projects"
+PROCS = term.CC_HOME / "sessions"  # cc 给每个运行中的进程登记的 <pid>.json(当前会话 ID、目录…)
 HOST = os.environ.get("CCNB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CCNB_PORT", "8765"))
 IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
@@ -423,6 +431,85 @@ def pane_record(pane):
         return None
 
 
+def _proc_start(pid):
+    try:  # /proc/<pid>/stat 第 22 项:进程启动时间(时钟滴答),和登记里的 procStart 对上才是同一个进程
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+_procs = (0.0, None)
+
+
+def live_processes():
+    """正在运行的 cc 进程:[{pid, sid, cwd, platform}]。只认 pid 还活着、启动时间和登记一致的(防 pid 复用)。
+    platform:正在处理 QQ 消息的进程是 "qq",否则 None。cc 版本太老、没有这份登记时返回 None。"""
+    global _procs
+    if time.monotonic() - _procs[0] < INDEX_MAX_AGE:
+        return _procs[1]
+    out = None
+    if PROCS.is_dir():
+        out = []
+        for f in PROCS.glob("*.json"):
+            try:
+                rec = json.loads(f.read_text())
+                pid, sid = int(rec["pid"]), str(rec["sessionId"])
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            start = _proc_start(pid)
+            if start is None or ("procStart" in rec and str(rec["procStart"]) != start):
+                continue
+            out.append({"pid": pid, "sid": sid, "cwd": rec.get("cwd"), "platform": "qq" if pid in qqbot.RUNNING else None})
+    _procs = (time.monotonic(), out)
+    return out
+
+
+def session_owner(path, terms=None):
+    """不是网页能接管的(cc 启动的 tmux 终端之外的)、正在使用这个会话的 cc 进程,没有则 None。
+    同一条接续链上的会话算同一个(cc 接续时会换新 id)。"""
+    procs = live_processes()
+    if procs is None:  # 老版本 cc:只能看记录文件最近有没有被写过
+        if time.time() - path.stat().st_mtime < 60:
+            owner = {"pid": None, "label": "别的终端"}
+            return {**owner, "message": owner_message(owner)}
+        return None
+    ours = {t["pid"] for t in (terms if terms is not None else term.list_sessions())}
+    head = latest_continuation(path)
+    for pr in procs:
+        q = find_session(pr["sid"])
+        if pr["pid"] not in ours and (pr["sid"] == path.stem or (q and latest_continuation(q) == head)):
+            owner = {"pid": pr["pid"], "label": "QQ" if pr["platform"] else "别的终端", "platform": pr["platform"]}
+            return {**owner, "message": owner_message(owner)}
+    return None
+
+
+def owner_message(owner):
+    who = f"pid {owner['pid']}" if owner.get("pid") else "不是用 cc 启动的"
+    if owner.get("platform") == "qq":
+        return f"cc 正在回答 QQ 发来的消息({who})。为避免两个进程同时写同一会话,等它回复完再从网页继续。"
+    return (f"这个会话正在别的终端里运行({who})。为避免两个进程同时写同一会话,"
+            "请在原终端里继续,或先退出它再从网页继续。")
+
+
+def session_via(path):
+    """会话是在 QQ 里开的 → "qq";本机终端里开的返回 None。"""
+    origins = qqbot.origins()
+    return "qq" if any(q.stem in origins for q in [path, *predecessors(path)]) else None
+
+
+def qq_owner(sid):
+    """QQ 机器人要继续这个会话前问一下:它是不是正开在网页终端 / 别的终端里。返回占用者名称或 None。"""
+    p = find_session(sid)
+    if not p:
+        return None
+    terms = link_terms(term.list_sessions())
+    head = latest_continuation(p).stem
+    if any((t["sid"] or t["launch_sid"]) in (sid, head) for t in terms):
+        return "网页终端"
+    o = session_owner(p, terms)
+    return o["label"] if o and o.get("platform") != "qq" else None
+
+
 def link_terms(terms):
     """tmux 终端 → 它当前所在的 cc 会话。
     优先用启动时指定的会话(--session-id / --resume);若终端里用 /clear 开了新会话,则取同目录下满足以下条件的最新会话:
@@ -434,7 +521,12 @@ def link_terms(terms):
         if sid:
             t["sid"], t["source"] = sid, "title"
             continue
-        # 2. hook 报告的当前会话(启动、/resume、/clear;后台 worker 接管时可能不触发)
+        # 2. cc 自己登记的这个进程的当前会话(窗格里的进程就是 cc);还没写出记录的新 id 先不用,走下面的推测
+        rec = next((pr for pr in live_processes() or () if pr["pid"] == t.get("pid")), None)
+        if rec and find_session(rec["sid"]) and cached_meta(find_session(rec["sid"]))["questions"]:
+            t["sid"], t["source"] = rec["sid"], "registry"
+            continue
+        # 3. hook 报告的当前会话(启动、/resume、/clear;后台 worker 接管时可能不触发)
         rec = pane_record(t.get("pane"))
         if rec and rec["ts"] >= t["created"] - 5:
             t["sid"] = rec["session_id"]
@@ -445,7 +537,7 @@ def link_terms(terms):
                     and cached_meta(prev)["questions"]:
                 t["sid"] = prev.stem
             continue
-        # 2. 兜底(旧终端没有 hook 时):启动参数 + /clear 推测
+        # 4. 兜底(旧终端没有 hook 时):启动参数 + /clear 推测
         sid = t["launch_sid"]
         base = find_session(sid) if sid else None
         after = t["created"] - 5
@@ -703,9 +795,9 @@ def continue_session(sid):
     p = find_session(sid)
     if not p:
         raise ValueError("会话不存在")
-    if time.time() - p.stat().st_mtime < 60:
-        raise ValueError("这个会话正在别的终端里运行(不是用 cc 启动的)。为避免两个进程同时写同一会话,"
-                         "请在原终端里继续,或先退出它再从网页继续。")
+    owner = session_owner(p, terms)
+    if owner:
+        raise ValueError(owner_message(owner))
     meta = cached_meta(p)
     return term.new_session(meta["cwd"] or str(Path.home()), ["--resume", sid])
 
@@ -747,7 +839,204 @@ def session_summary(path):
         "started": meta["started"], "updated": meta["updated"], "mtime": mtime,
         "active": time.time() - mtime < ACTIVE_SECONDS,
         "noted": note_path(meta["id"]).exists() or any(note_path(x.stem).exists() for x in predecessors(path)),
+        "via": {"platform": "qq", "label": "QQ"} if session_via(path) else None,
     }
+
+
+# ---------------------------------------------------------------- 整理版发回 QQ
+
+def note_file(path):
+    """整理稿文件(可能挂在接续前的旧 id 上)。"""
+    return next((note_path(q.stem) for q in [path, *predecessors(path)] if note_path(q.stem).exists()), None)
+
+
+def send_note(sid):
+    """把整理版正文作为文字发回 QQ(QQ 私聊发不了 .md 文件)。只能在你最近一次给机器人发消息后 60 分钟内。"""
+    p = find_session(sid)
+    note = p and find_note(p)
+    if not note:
+        raise ValueError("这个会话还没有整理版,先执行 /qa-notes")
+    qqbot.send_text(f"📒 {note['meta'].get('title') or cached_meta(p)['title']}\n\n{note['body'].strip()}")
+    return "QQ"
+
+
+# ---------------------------------------------------------------- 总结:按主题 + 日期范围让 cc 总结问答
+
+SUMMARY_SOURCE_LIMIT = 400_000  # 交给 cc 的问答原文上限(字符);超出时逐步缩短每轮回答
+SUMMARY_PROMPT = """标准输入里是我在 {span} 和 cc(命令行 AI 编程助手)的问答记录,按会话分组,每轮是"问"和"答"。
+请按我的要求写一份总结。我的要求:{topic}
+
+- 只总结和要求相关的会话与问题,无关的忽略;一条相关的都没有就直接说明。
+- 用中文 Markdown:开头 3-5 条要点,然后按主题分节(## 标题),每节末尾用"来源:"列出会话标题。
+- 公式用 LaTeX(行内 $...$,独立 $$...$$)。
+- 忠实于记录,不编造记录里没有的内容;记录里后来被纠正的结论以纠正后的为准。
+- 直接输出总结正文,不要寒暄,不要说"以下是总结"。"""
+
+
+def _local_day(ts):
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().date().isoformat()
+    except (ValueError, AttributeError):
+        return None
+
+
+def summary_source(day_from, day_to):
+    """[day_from, day_to](本地日期 YYYY-MM-DD,含两端)里提的问题及回答,按会话分组的 Markdown。返回 (文本, 会话数, 轮数)。"""
+    picked = []
+    for p in all_session_files():
+        if successor(p):  # 接续后的新会话带着完整历史,只取最新的那个
+            continue
+        meta, turns = cached_parse(p)
+        sel = [t for t in turns if t["kind"] == "question" and day_from <= (_local_day(t["ts"]) or "") <= day_to]
+        if sel:
+            picked.append((meta, sel))
+    picked.sort(key=lambda x: x[1][0]["ts"])
+    for cap in (4000, 1500, 600, 200, 0):
+        out = []
+        for meta, sel in picked:
+            out += [f"# 会话:{meta['title']}", f"目录:{meta['cwd']}", ""]
+            for t in sel:
+                ans = "\n\n".join(t["texts"])
+                if len(ans) > cap:
+                    ans = ans[:cap] + "…(后略)"
+                out += [f"## 问({_local_day(t['ts'])})", t["q"] or "", "", "### 答", ans, ""]
+        text = "\n".join(out)
+        if len(text) <= SUMMARY_SOURCE_LIMIT:
+            break
+    return text[:SUMMARY_SOURCE_LIMIT], len(picked), sum(len(x[1]) for x in picked)
+
+
+def _summary_meta(sid):
+    try:
+        return json.loads((SUMMARIES / f"{sid}.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _summary_save(meta):
+    SUMMARIES.mkdir(parents=True, exist_ok=True)
+    tmp = SUMMARIES / f"{meta['id']}.json.tmp"
+    tmp.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(SUMMARIES / f"{meta['id']}.json")
+
+
+def list_summaries():
+    out = [m for f in SUMMARIES.glob("*.json") if (m := _summary_meta(f.stem))] if SUMMARIES.is_dir() else []
+    return sorted(out, key=lambda m: m["created"], reverse=True)
+
+
+def read_summary(sid):
+    meta = _summary_meta(sid)
+    if not meta:
+        return None
+    f = SUMMARIES / f"{sid}.md"
+    return {**meta, "body": f.read_text(encoding="utf-8") if f.exists() else ""}
+
+
+def start_summary(topic, day_from, day_to):
+    """在后台用 `cc -p`(不带工具、不保存会话)生成总结,结果存到 data/summaries/<id>.md。"""
+    topic = (topic or "").strip()[:500] or "全部内容"
+    for d in (day_from, day_to):
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d or ""):
+            raise ValueError("日期格式应为 YYYY-MM-DD")
+    if day_from > day_to:
+        day_from, day_to = day_to, day_from
+    src, n_sess, n_turns = summary_source(day_from, day_to)
+    if not n_turns:
+        raise ValueError("这段时间里没有提问记录")
+    sid = time.strftime("%Y%m%d-%H%M%S-") + hashlib.blake2b(os.urandom(8), digest_size=3).hexdigest()
+    meta = {"id": sid, "topic": topic, "from": day_from, "to": day_to, "status": "running", "error": None,
+            "sessions": n_sess, "turns": n_turns, "created": time.time(), "finished": None}
+    _summary_save(meta)
+    span = day_from if day_from == day_to else f"{day_from} 至 {day_to}"
+    prompt = SUMMARY_PROMPT.format(span=span, topic=topic)
+
+    def run():
+        try:
+            r = subprocess.run([term.CC_BIN, "-p", "--no-session-persistence", "--tools", "", prompt], input=src,
+                               capture_output=True, text=True, timeout=900, cwd=str(SUMMARIES),
+                               env=term.clean_env(os.environ))
+            if r.returncode or not r.stdout.strip():
+                raise RuntimeError((r.stderr or r.stdout).strip()[-500:] or f"退出码 {r.returncode}")
+            (SUMMARIES / f"{sid}.md").write_text(r.stdout.strip() + "\n", encoding="utf-8")
+            meta["status"] = "done"
+        except Exception as e:  # noqa: BLE001
+            meta.update(status="error", error=str(e))
+        meta["finished"] = time.time()
+        _summary_save(meta)
+
+    threading.Thread(target=run, daemon=True).start()
+    return meta
+
+
+def delete_summary(sid):
+    for ext in (".json", ".md"):
+        (SUMMARIES / f"{sid}{ext}").unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- 变化推送(SSE)
+# 一个后台线程每秒看一次记录文件、整理稿和终端有没有变化,变了就推给所有打开的网页;
+# 网页收到再取数据,不必每 3 秒轮询。推送断了(老浏览器、代理不支持)网页会退回轮询。
+
+class _Sub:
+    """一个打开着的网页:待发的事件 + 唤醒发送线程的信号。"""
+
+    def __init__(self):
+        self.q, self.ev = [], threading.Event()
+
+    def push(self, data):
+        self.q.append(data)
+        self.ev.set()
+
+
+_subs = set()
+_subs_lock = threading.Lock()
+
+
+def _notes_key():
+    try:
+        return {f.stem: f.stat().st_mtime_ns for f in NOTES.glob("*.md")}
+    except OSError:
+        return {}
+
+
+def _publish(event):
+    data = ("data: " + json.dumps(event, ensure_ascii=False) + "\n\n").encode()
+    with _subs_lock:
+        subs = list(_subs)
+    for sub in subs:
+        sub.push(data)
+
+
+def watcher():
+    files, notes, terms_key, last_terms = {}, _notes_key(), None, 0
+    while True:
+        time.sleep(1)
+        with _subs_lock:
+            if not _subs:
+                files, terms_key = {}, None  # 没人看就不干活;下次有人连上时全量比一次
+                continue
+        try:
+            idx = session_index()
+            now = {p.stem: mt for p, mt in idx.files}
+            changed = [sid for sid, mt in now.items() if files.get(sid) != mt] if files else []
+            changed += [sid for sid in files if sid not in now]
+            nk = _notes_key()
+            changed += [sid for sid in set(nk) | set(notes) if nk.get(sid) != notes.get(sid)]
+            files, notes = now, nk
+            ev = {}
+            if changed:
+                ev["changed"] = sorted(set(changed))
+            if time.monotonic() - last_terms >= 2:  # 终端状态要读屏幕标题(tmux capture-pane),两秒一次
+                last_terms = time.monotonic()
+                terms = link_terms(term.list_sessions())
+                k = json.dumps(terms, sort_keys=True)
+                if k != terms_key:
+                    terms_key, ev["terms"] = k, terms
+            if ev:
+                _publish(ev)
+        except Exception as e:  # noqa: BLE001  推送失败不能让线程退出
+            print("watcher:", repr(e), file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------- Markdown 导出(供 skill 使用)
@@ -882,6 +1171,34 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _events(self):
+        """SSE:推送 {"changed": [会话 ID…], "terms": [...]};没事时每 15 秒发一次 {"ping": 1}。"""
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        sub = _Sub()
+        with _subs_lock:
+            _subs.add(sub)
+        try:
+            self.wfile.write(b"retry: 3000\ndata: {\"hello\": true}\n\n")
+            self.wfile.flush()
+            while True:
+                if sub.ev.wait(15):
+                    sub.ev.clear()
+                    while sub.q:
+                        self.wfile.write(sub.q.pop(0))
+                else:  # 用数据事件而不是注释保活:网页靠它判断推送连接是不是还活着
+                    self.wfile.write(b'data: {"ping": 1}\n\n')
+                self.wfile.flush()
+        except OSError:
+            pass
+        finally:
+            with _subs_lock:
+                _subs.discard(sub)
+
     def _local_image(self, path, cwd):
         """Markdown 里引用的本地图片(绝对路径、~ 或相对会话目录)。只放行位图格式,不放 SVG(可含脚本)。"""
         if path.startswith("file://"):
@@ -930,6 +1247,32 @@ class Handler(SimpleHTTPRequestHandler):
             if m:
                 term.kill_session(m.group(1))
                 return self._json({"ok": True})
+            if u.path == "/api/terms/new":  # 侧栏项目名右边的 new:在这个目录新开一个 cc
+                cwd = self._body().get("cwd") or ""
+                if not os.path.isabs(cwd):
+                    raise ValueError("需要绝对路径")
+                name = term.new_session(cwd)
+                t = next((t for t in term.list_sessions() if t["name"] == name), None)
+                return self._json({"term": name, "sid": t and t["launch_sid"]})
+            m = re.fullmatch(r"/api/sessions/([\w-]+)/send-note", u.path)
+            if m:
+                return self._json({"ok": True, "to": send_note(m.group(1))})
+            if u.path == "/api/qq/allow":  # 网页上"允许"第一次给机器人发消息的 QQ 用户
+                qqbot.allow(str(self._body().get("openid") or ""))
+                return self._json({"ok": True, "qq": qqbot.info()})
+            if u.path == "/api/summaries":
+                b = self._body()
+                return self._json(start_summary(b.get("topic"), b.get("from"), b.get("to")))
+            m = re.fullmatch(r"/api/summaries/([\w-]+)/(send|delete)", u.path)
+            if m:
+                if m.group(2) == "delete":
+                    delete_summary(m.group(1))
+                    return self._json({"ok": True})
+                f = SUMMARIES / f"{m.group(1)}.md"
+                if not f.exists():
+                    raise ValueError("总结还没生成完")
+                qqbot.send_text(f"✦ 总结\n\n{f.read_text(encoding='utf-8').strip()}")
+                return self._json({"ok": True, "to": "QQ"})
         except Exception as e:  # noqa: BLE001
             return self._json({"error": str(e)}, 400)
         return self._json({"error": "not found"}, 404)
@@ -942,8 +1285,11 @@ class Handler(SimpleHTTPRequestHandler):
         m = re.fullmatch(r"/ws/term/([\w-]+)", u.path)
         if m:
             if self._same_origin():
-                term.bridge(self, m.group(1))
+                cid = q.get("cid", [""])[0]
+                term.bridge(self, m.group(1), cid if re.fullmatch(r"[\w-]{8,64}", cid) else None)
             return
+        if u.path == "/api/events":
+            return self._events()
         try:
             if u.path == "/api/stars":
                 return self._json({"stars": migrate_stars()})
@@ -968,6 +1314,12 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json(search(q.get("q", [""])[0], q.get("scope", ["all"])[0]))
             if u.path == "/api/terms":
                 return self._json({"terms": link_terms(term.list_sessions())})
+            if u.path == "/api/summaries":
+                return self._json({"summaries": list_summaries()})
+            m = re.fullmatch(r"/api/summaries/([\w-]+)", u.path)
+            if m:
+                res = read_summary(m.group(1))
+                return self._json(res or {"error": "not found"}, 200 if res else 404)
             if u.path == "/api/sessions":
                 terms = link_terms(term.list_sessions())
                 running = {t["sid"] or t["launch_sid"]: t["name"] for t in terms}
@@ -988,7 +1340,7 @@ class Handler(SimpleHTTPRequestHandler):
                     if s["questions"]:
                         s["running"] = running.get(s["id"])
                         items.append(s)
-                return self._json({"sessions": items, "terms": terms, "now": time.time()})
+                return self._json({"sessions": items, "terms": terms, "now": time.time(), "qq": qqbot.info()})
             m = re.fullmatch(r"/api/session/([\w-]+)", u.path)
             if m:
                 p = find_session(m.group(1))
@@ -1007,11 +1359,13 @@ class Handler(SimpleHTTPRequestHandler):
                 note = find_note(p)
                 version = f"{p.stat().st_mtime_ns}-{note['mtime'] if note else 0}"
                 have = q.get("v", [""])[0]
+                owner = session_owner(p)
                 if have == version:
-                    return self._json({"unchanged": True, "version": version})
+                    return self._json({"unchanged": True, "version": version, "owner": owner})
                 meta, turns = cached_parse(p)
                 meta = {k: v for k, v in meta.items() if k != "_images"}
-                res = {"meta": meta, "version": version, "active": time.time() - p.stat().st_mtime < ACTIVE_SECONDS}
+                res = {"meta": meta, "version": version, "active": time.time() - p.stat().st_mtime < ACTIVE_SECONDS,
+                       "owner": owner, "via": session_summary(p)["via"]}
                 changed = changed_turns(p, have, version, turns)
                 if changed is not None:  # 进行中的会话:只回变化的轮次,前端只重画这些
                     return self._json({**res, "delta": True, "count": len(turns), "turns": changed})
@@ -1022,7 +1376,15 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json({"error": "not found"}, 404)
         if u.path != "/" and not (STATIC / u.path.lstrip("/")).exists():
             self.path = "/"
+        self._static = True
         return super().do_GET()
+
+    def end_headers(self):
+        # 前端文件每次都向服务器确认(没变时 304,很便宜);否则浏览器可能一直用旧的 app.js,更新后看不到新功能
+        if getattr(self, "_static", False):
+            self.send_header("Cache-Control", "no-cache")
+            self._static = False
+        super().end_headers()
 
 
 def port_open():
@@ -1039,6 +1401,8 @@ def cmd_serve(_):
     NOTES.mkdir(parents=True, exist_ok=True)
     ThreadingHTTPServer.daemon_threads = True
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    threading.Thread(target=watcher, daemon=True).start()
+    qqbot.start(owner=qq_owner, link=lambda sid: url(sid))  # 有 data/qqbot.json 才会连 QQ
     print(f"MeowNotebook: {url()}  (读取 {PROJECTS})", flush=True)
     srv.serve_forever()
 
@@ -1116,6 +1480,70 @@ def cmd_current(args):
     print(resolve(args).stem)
 
 
+def cmd_link(args):
+    sid = args.session or os.environ.get(f"{term._P}_CODE_SESSION_ID")  # cc 给工具子进程设的当前会话 ID
+    p = find_session(sid) if sid else current_session()
+    if not p:
+        sys.exit("找不到会话")
+    print(url(latest_continuation(p).stem) + (f"/{args.turn}" if args.turn else ""))
+
+
+def cmd_pending(args):
+    day0 = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() \
+        - 86400 * (args.days - 1)
+    for p in all_session_files():
+        if successor(p) or p.stat().st_mtime < day0:
+            continue
+        meta = cached_meta(p)
+        if not meta["questions"]:
+            continue
+        note = find_note(p)
+        covered = int((note or {}).get("meta", {}).get("covered_turns", "0") or 0)
+        total = len(cached_parse(p)[1])
+        if covered < total:
+            print(f"{p.stem}\t{meta['questions']}问\t已整理到第 {covered}/{total} 轮\t{meta['title']}")
+
+
+def qq_setup():
+    """交互式写 data/qqbot.json。AppSecret 用 getpass 输入,不会出现在屏幕、命令历史或 cc 的会话记录里。"""
+    import getpass
+    if not sys.stdin.isatty():
+        sys.exit("请在你自己的终端里运行(需要输入 AppSecret),不要在 cc 里用 ! 运行")
+    old = qqbot.load_config() or {}
+    hint = f" [{old['app_id']}]" if old.get("app_id") else ""
+    default_dir = old.get("work_dir") or str(Path.home())
+    try:
+        app_id = input(f"AppID{hint}: ").strip() or old.get("app_id")
+        secret = getpass.getpass("AppSecret(输入时不显示,回车沿用原来的): ").strip() or old.get("app_secret")
+        work_dir = input(f"QQ 里新会话的工作目录 [{default_dir}]: ").strip() or default_dir
+    except (EOFError, KeyboardInterrupt):
+        sys.exit("\n已取消,什么都没改")
+    if not (app_id and secret):
+        sys.exit("AppID / AppSecret 不能为空,什么都没改")
+    cfg = {**old, "app_id": app_id, "app_secret": secret, "work_dir": str(Path(work_dir).expanduser()),
+           "allow_from": old.get("allow_from", []), "sandbox": old.get("sandbox", False)}
+    try:
+        bot = qqbot.Bot(cfg)
+        bot.token()
+        name = bot.api("GET", "/users/@me").get("username")
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"验证失败,没有保存:{e}\n(AppID / AppSecret 对吗?服务器的公网 IP 加进 q.qq.com 的 IP 白名单了吗?)")
+    qqbot.CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    qqbot._write_private(qqbot.CONFIG, cfg)
+    print(f"已保存 {qqbot.CONFIG}(权限 600),机器人:{name}")
+    print("下一步:重启网站(结束旧的 ccnb.py serve,再 ccweb),然后在 QQ 里给机器人发一条消息,到网页侧栏点「允许」。")
+
+
+def cmd_qq(args):
+    if args.action == "setup":
+        return qq_setup()
+    if args.action == "probe":
+        cfg = qqbot.load_config()
+        if not cfg:
+            sys.exit(f"没有 {qqbot.CONFIG}(app_id / app_secret)")
+        qqbot.Bot(cfg, verbose=True).run()
+
+
 def cmd_list(args):
     for p in all_session_files():
         if args.project and project_dir_for(args.project) != p.parent or successor(p):
@@ -1144,6 +1572,16 @@ def main():
     c = sub.add_parser("current")
     c.add_argument("--cwd")
     c.set_defaults(fn=cmd_current)
+    lk = sub.add_parser("link")
+    lk.add_argument("--session")
+    lk.add_argument("--turn", type=int)
+    lk.set_defaults(fn=cmd_link)
+    pe = sub.add_parser("pending")
+    pe.add_argument("--days", type=int, default=1)
+    pe.set_defaults(fn=cmd_pending)
+    qa = sub.add_parser("qq")
+    qa.add_argument("action", choices=["setup", "probe"])
+    qa.set_defaults(fn=cmd_qq)
     la = sub.add_parser("launch")
     la.add_argument("--detach", action="store_true", help="只在后台启动,不在本终端 attach")
     la.add_argument("cc_args", nargs=argparse.REMAINDER)

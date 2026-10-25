@@ -12,16 +12,19 @@
 </head>
 <body>
 <aside id="side">
-  <div class="brand">MeowNotebook <button id="toggle-side" title="收起侧栏">⟨</button></div>
+  <div class="brand">MeowNotebook <span class="brand-r"><span id="qq-status" hidden></span><button id="toggle-side" title="收起侧栏">⟨</button></span></div>
   <div class="side-actions">
     <select id="search-mode" title="搜索范围:标题最快;提问 / 全文会搜索会话正文">
       <option value="title">标题</option><option value="q">提问</option><option value="all">全文</option>
     </select>
     <input id="search" type="search" placeholder="搜索标题 / 首问 / 目录…">
   </div>
+  <div id="qq-pending" hidden></div>
+  <div id="src-filter" hidden></div>
   <nav class="side-tabs"><button data-side="sessions">会话</button><button data-side="files">文件</button></nav>
   <div id="side-sessions" class="side-pane">
     <a id="star-link" class="sess" href="#/stars"><div class="t">★ 收藏 <span id="star-count"></span></div></a>
+    <a id="sum-link" class="sess" href="#/summary"><div class="t">✦ 总结</div></a>
     <div id="sessions"></div>
   </div>
   <div id="side-files" class="side-pane" hidden>
@@ -52,6 +55,7 @@
       <div class="actions" id="s-actions">
         <button data-copy="resume" title="复制恢复会话命令">复制 resume 命令</button>
         <button data-copy="notes" title="复制整理命令,粘贴到任意 cc 会话执行">复制 /qa-notes 命令</button>
+        <button id="send-note" hidden>发送到 QQ</button>
       </div>
     </header>
     <nav id="tabs">
@@ -83,6 +87,7 @@
 </main>
 <div id="qpop" hidden></div>
 <div id="toast"></div>
+<div id="net" hidden>网络不稳定,正在重试…</div>
 <script src="vendor/marked.min.js"></script>
 <script src="vendor/purify.min.js"></script>
 <script src="vendor/katex/katex.min.js"></script>
