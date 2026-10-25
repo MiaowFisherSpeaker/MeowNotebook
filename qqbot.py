@@ -275,29 +275,86 @@ def update_state(fn):
         return st
 
 
+_origins = (None, set())  # (状态文件 mtime, 会话 ID 集合):侧栏每个会话都要问一次,不必每次读文件
+
+
 def origins():
     """经 QQ 使用过的 cc 会话 ID 集合。"""
-    st = load_state()
-    return {sid for u in st.values() if isinstance(u, dict) for sid in [u.get("sid"), *u.get("past", [])] if sid}
+    global _origins
+    try:
+        mt = STATE.stat().st_mtime_ns
+    except OSError:
+        return set()
+    if _origins[0] != mt:
+        st = load_state()
+        _origins = (mt, {sid for u in st.values() if isinstance(u, dict)
+                         for sid in [u.get("sid"), *u.get("past", [])] if sid})
+    return _origins[1]
 
 
-def _reply_all(openid, msg_id, text, start_seq=1):
-    """把一段文字按条数限制发出去;返回用掉的序号。超出部分换成网页链接提示。"""
-    parts = [text[i:i + CHUNK] for i in range(0, len(text), CHUNK)] or ["(空回复)"]
-    room = REPLY_MAX - start_seq + 1
-    if len(parts) > room:
-        parts = parts[:max(room, 1)]
-        parts[-1] = parts[-1][:CHUNK - 60] + "\n…(太长,后面省略;完整内容看 MeowNotebook)"
-    seq = start_seq
-    for part in parts:
-        _bot.reply(openid, msg_id, seq, part)
-        seq += 1
-    return seq
+# 回复序号:QQ 要求同一条用户消息的每次回复 msg_seq 都不同(1~5),重复的会被拒。
+# 命令回复、cc 的回答、网页上的"发送到 QQ"可能同时回复同一条消息,所以序号统一在这里领。
+_seq_lock = threading.Lock()
 
 
-def _note_last(openid, msg_id, seq):
+def _next_seq(u, msg_id):
+    last = u.get("last") or {}
+    old = last.get("seq", 1) if last.get("id") == msg_id else 1  # 旧版状态把序号记在 last.seq 里
+    return max(u.get("seqs", {}).get(msg_id, 1), old)
+
+
+def _take_seq(openid, msg_id):
+    """领下一个序号并记到状态里(重启后接着用);5 次用完返回 None。"""
+    with _seq_lock:
+        out = []
+
+        def f(st):
+            u = st.setdefault(openid, {})
+            seq = _next_seq(u, msg_id)
+            seqs = u.setdefault("seqs", {})
+            if seq <= REPLY_MAX:
+                seqs[msg_id] = seq + 1
+                out.append(seq)
+            for k in list(seqs)[:-20]:  # 只留最近 20 条消息的记录
+                del seqs[k]
+        update_state(f)
+        return out[0] if out else None
+
+
+def _seqs_left(openid, msg_id):
+    return max(0, REPLY_MAX - _next_seq(load_state().get(openid, {}), msg_id) + 1)
+
+
+def _reply_all(openid, msg_id, text, arrived, strict=False):
+    """回复一条用户消息:按条数限制分条发,超出部分换成提示。arrived 是这条消息到达的时间(回复窗口从它算起)。
+    strict=False(机器人线程里)出错只记日志;strict=True(网页发送)把错误抛给调用方。"""
+    try:
+        if time.time() - arrived > REPLY_WINDOW:
+            raise RuntimeError("距离这条 QQ 消息已超过 60 分钟,QQ 不再允许回复")
+        room = _seqs_left(openid, msg_id)
+        if not room:
+            raise RuntimeError("这条 QQ 消息的 5 次回复已经用完,先在 QQ 里再发一条消息")
+        parts = [text[i:i + CHUNK] for i in range(0, len(text), CHUNK)] or ["(空回复)"]
+        if len(parts) > room:
+            parts = parts[:room]
+            parts[-1] = parts[-1][:CHUNK - 60] + "\n…(太长,后面省略;完整内容看 MeowNotebook)"
+        for part in parts:
+            seq = _take_seq(openid, msg_id)
+            if seq is None:  # 同时有别的回复用掉了剩下的次数
+                break
+            _bot.reply(openid, msg_id, seq, part)
+    except Exception as e:  # noqa: BLE001
+        if strict:
+            raise
+        log("回复失败:", e)
+
+
+def _note_last(openid, msg_id, arrived):
+    """记下用户最新的一条消息(网页"发送到 QQ"借它的回复机会)。队列里先到的消息回完时不会把它改回旧的。"""
     def f(st):
-        st.setdefault(openid, {})["last"] = {"id": msg_id, "ts": time.time(), "seq": seq}
+        u = st.setdefault(openid, {})
+        if (u.get("last") or {}).get("ts", 0) <= arrived:
+            u["last"] = {"id": msg_id, "ts": arrived}
     update_state(f)
 
 
@@ -306,6 +363,7 @@ HELP = ("在 QQ 里直接和 cc 对话(回复可能要几十秒)。命令:\n"
 
 
 def handle_message(d):
+    arrived = time.time()
     openid = (d.get("author") or {}).get("user_openid")
     text, msg_id = (d.get("content") or "").strip(), d.get("id")
     if not openid or not msg_id:
@@ -315,27 +373,30 @@ def handle_message(d):
         log("未授权的用户,不响应:", openid)
         update_state(lambda st: st.__setitem__("_pending", {"openid": openid, "ts": time.time(), "text": text[:80]}))
         return
-    _note_last(openid, msg_id, 1)
+    _note_last(openid, msg_id, arrived)
     user = load_state().get(openid, {})
+
+    def reply(t):
+        _reply_all(openid, msg_id, t, arrived)
     if text in ("/help", "帮助"):
-        return _reply_all(openid, msg_id, HELP)
+        return reply(HELP)
     if text == "/where":
         sid = user.get("sid")
-        return _reply_all(openid, msg_id, f"会话 {sid}\n目录 {user.get('cwd') or cfg.get('work_dir')}\n{_hooks['link'](sid)}"
-                          if sid else "还没有会话,直接发消息就会开一个。")
+        return reply(f"会话 {sid}\n目录 {user.get('cwd') or cfg.get('work_dir')}\n{_hooks['link'](sid)}"
+                     if sid else "还没有会话,直接发消息就会开一个。")
     if text == "/stop":
-        pids = [p for p, o in RUNNING.items() if o == openid]
+        pids = [p for p, o in dict(RUNNING).items() if o == openid]  # 拷一份:别的线程在增删 RUNNING
         for p in pids:
             try:
                 os.killpg(p, signal.SIGINT)
             except OSError:
                 pass
-        return _reply_all(openid, msg_id, "已打断。" if pids else "现在没有在运行的回答。")
+        return reply("已打断。" if pids else "现在没有在运行的回答。")
     if text.startswith("/new"):
         cwd = text[4:].strip() or cfg.get("work_dir") or str(Path.home())
         cwd = str(Path(cwd).expanduser())
         if not os.path.isdir(cwd):
-            return _reply_all(openid, msg_id, f"目录不存在:{cwd}")
+            return reply(f"目录不存在:{cwd}")
 
         def f(st):
             u = st.setdefault(openid, {})
@@ -343,13 +404,13 @@ def handle_message(d):
                 u.setdefault("past", []).append(u["sid"])
             u.update(sid=None, cwd=cwd)
         update_state(f)
-        return _reply_all(openid, msg_id, f"好的,下一条消息开始新会话(目录 {cwd})。")
+        return reply(f"好的,下一条消息开始新会话(目录 {cwd})。")
     lock = _queues.setdefault(openid, threading.Lock())
     with lock:  # 前一条还没回完就排队
-        _run_cc(openid, msg_id, text, cfg)
+        _run_cc(openid, msg_id, text, cfg, reply)
 
 
-def _run_cc(openid, msg_id, text, cfg):
+def _run_cc(openid, msg_id, text, cfg, reply):
     user = load_state().get(openid, {})
     cwd = user.get("cwd") or cfg.get("work_dir") or str(Path.home())
     os.makedirs(cwd, exist_ok=True)
@@ -357,21 +418,20 @@ def _run_cc(openid, msg_id, text, cfg):
     if sid:
         owner = _hooks["owner"](sid)
         if owner:
-            return _reply_all(openid, msg_id, f"这个会话正在{owner}里打开着,为避免两边同时写同一会话,这条没有执行。"
-                                                f"先在那边退出,或发 /new 开新会话。")
+            return reply(f"这个会话正在{owner}里打开着,为避免两边同时写同一会话,这条没有执行。"
+                         f"先在那边退出,或发 /new 开新会话。")
         args = ["--resume", sid]
     else:
         sid = str(uuid.uuid4())
         args = ["--session-id", sid]
     cmd = [term.CC_BIN, "-p", "--output-format", "json", "--permission-mode", cfg.get("permission_mode") or "bypassPermissions",
-           "--append-system-prompt", QQ_PROMPT, *args, text]
+           "--append-system-prompt", QQ_PROMPT, *args, "--", text]  # --:以 - 开头的消息不会被当成 cc 的选项
     env = {**term.clean_env(os.environ), "CCNB_QQ": "1"}
-    t0 = time.time()
     try:
         p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, start_new_session=True)
     except OSError as e:
-        return _reply_all(openid, msg_id, f"启动 cc 失败:{e}")
+        return reply(f"启动 cc 失败:{e}")
     RUNNING[p.pid] = openid
     try:
         out, err = p.communicate()
@@ -388,18 +448,14 @@ def _run_cc(openid, msg_id, text, cfg):
         answer = answer or "(已打断)"
     elif res.get("is_error"):
         answer = "出错了:" + (answer or res.get("subtype") or "未知错误")
-    if time.time() - t0 > REPLY_WINDOW:
-        log("回答用时超过 QQ 回复窗口,无法发回:", new_sid)
-        return
-    seq = _reply_all(openid, msg_id, answer)
-    _note_last(openid, msg_id, seq)
+    reply(answer)  # 超过回复窗口时 _reply_all 只记日志
 
 
 def can_send(openid=None):
     """网页上"发送到 QQ"能不能用:QQ 只允许在用户最近一条消息后 60 分钟内回复,最多 5 次。返回 (openid, last) 或 None。"""
     st = load_state()
     cands = [(o, u["last"]) for o, u in st.items() if isinstance(u, dict) and u.get("last") and (openid in (None, o))]
-    cands = [(o, l) for o, l in cands if time.time() - l["ts"] < REPLY_WINDOW and l["seq"] <= REPLY_MAX]
+    cands = [(o, l) for o, l in cands if time.time() - l["ts"] < REPLY_WINDOW and _seqs_left(o, l["id"])]
     return max(cands, key=lambda x: x[1]["ts"]) if cands else None
 
 
@@ -411,8 +467,7 @@ def send_text(text):
     if not c:
         raise RuntimeError("QQ 只允许在你发消息后 60 分钟内回复:先在 QQ 里给机器人发一条消息,再点发送")
     openid, last = c
-    seq = _reply_all(openid, last["id"], text, last["seq"])
-    _note_last(openid, last["id"], seq)
+    _reply_all(openid, last["id"], text, last["ts"], strict=True)
 
 
 def info():

@@ -845,11 +845,6 @@ def session_summary(path):
 
 # ---------------------------------------------------------------- 整理版发回 QQ
 
-def note_file(path):
-    """整理稿文件(可能挂在接续前的旧 id 上)。"""
-    return next((note_path(q.stem) for q in [path, *predecessors(path)] if note_path(q.stem).exists()), None)
-
-
 def send_note(sid):
     """把整理版正文作为文字发回 QQ(QQ 私聊发不了 .md 文件)。只能在你最近一次给机器人发消息后 60 分钟内。"""
     p = find_session(sid)
@@ -883,7 +878,10 @@ def _local_day(ts):
 def summary_source(day_from, day_to):
     """[day_from, day_to](本地日期 YYYY-MM-DD,含两端)里提的问题及回答,按会话分组的 Markdown。返回 (文本, 会话数, 轮数)。"""
     picked = []
-    for p in all_session_files():
+    since = datetime.fromisoformat(day_from).astimezone().timestamp()  # day_from 当天 0 点(本地时间)
+    for p, mtime in session_index().files:
+        if mtime < since:  # 文件按 mtime 从新到旧;之后再没写过的会话不可能有这期间的提问
+            break
         if successor(p):  # 接续后的新会话带着完整历史,只取最新的那个
             continue
         meta, turns = cached_parse(p)
@@ -906,11 +904,17 @@ def summary_source(day_from, day_to):
     return text[:SUMMARY_SOURCE_LIMIT], len(picked), sum(len(x[1]) for x in picked)
 
 
+_summary_jobs = set()  # 这个服务器进程里正在生成的总结
+
+
 def _summary_meta(sid):
     try:
-        return json.loads((SUMMARIES / f"{sid}.json").read_text(encoding="utf-8"))
+        meta = json.loads((SUMMARIES / f"{sid}.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    if meta.get("status") == "running" and sid not in _summary_jobs:  # 生成到一半服务器重启了
+        meta.update(status="error", error="生成被中断(服务器重启了?),请重新生成")
+    return meta
 
 
 def _summary_save(meta):
@@ -947,6 +951,7 @@ def start_summary(topic, day_from, day_to):
     sid = time.strftime("%Y%m%d-%H%M%S-") + hashlib.blake2b(os.urandom(8), digest_size=3).hexdigest()
     meta = {"id": sid, "topic": topic, "from": day_from, "to": day_to, "status": "running", "error": None,
             "sessions": n_sess, "turns": n_turns, "created": time.time(), "finished": None}
+    _summary_jobs.add(sid)
     _summary_save(meta)
     span = day_from if day_from == day_to else f"{day_from} 至 {day_to}"
     prompt = SUMMARY_PROMPT.format(span=span, topic=topic)
@@ -958,18 +963,28 @@ def start_summary(topic, day_from, day_to):
                                env=term.clean_env(os.environ))
             if r.returncode or not r.stdout.strip():
                 raise RuntimeError((r.stderr or r.stdout).strip()[-500:] or f"退出码 {r.returncode}")
-            (SUMMARIES / f"{sid}.md").write_text(r.stdout.strip() + "\n", encoding="utf-8")
+            body = r.stdout.strip() + "\n"
             meta["status"] = "done"
         except Exception as e:  # noqa: BLE001
+            body = None
             meta.update(status="error", error=str(e))
-        meta["finished"] = time.time()
-        _summary_save(meta)
+        finally:
+            _summary_jobs.discard(sid)
+        if sid not in _summary_deleted:  # 生成期间被删掉了就不再写回
+            if body:
+                (SUMMARIES / f"{sid}.md").write_text(body, encoding="utf-8")
+            meta["finished"] = time.time()
+            _summary_save(meta)
 
     threading.Thread(target=run, daemon=True).start()
     return meta
 
 
+_summary_deleted = set()
+
+
 def delete_summary(sid):
+    _summary_deleted.add(sid)
     for ext in (".json", ".md"):
         (SUMMARIES / f"{sid}{ext}").unlink(missing_ok=True)
 
