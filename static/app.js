@@ -1080,6 +1080,15 @@ function setSumMode(m) {
   $('#sum-to-wrap').hidden = m === 'day';
 }
 
+// 纳入了哪些会话:可以勾选/取消后按勾选重新生成(跳过 cc 的挑选)
+function sumPicks(c) {
+  if (!c.candidates?.length) return '';
+  const rows = c.candidates.map(x => `<label class="sum-pick"><input type="checkbox" value="${esc(x.id)}"${x.picked ? ' checked' : ''}>
+      <span class="topic">${esc(x.title)}</span><span class="st">${esc(x.cwd.split('/').pop())} · ${x.picked ? x.picked + '/' : ''}${x.turns} 问</span></label>`).join('');
+  return `<details class="proc sum-picks"><summary>纳入 ${c.sessions}/${c.candidates.length} 个会话${c.manual ? '(手动勾选)' : '(cc 按要求挑选)'}</summary>
+      ${rows}<div class="sum-actions"><span>勾选后重新生成会用这些会话在这段时间里的全部提问</span><span class="sp"></span>
+      <button data-sum-redo="${c.id}">按勾选重新生成</button></div></details>`;
+}
 const sumSpan = x => x.from === x.to ? x.from : `${x.from} 至 ${x.to}`;
 function renderSumBody() {
   const st = x => x.status === 'running' ? '<span class="st">生成中…</span>'
@@ -1092,9 +1101,9 @@ function renderSumBody() {
     const head = `<div class="sum-actions"><b>${esc(c.topic)}</b><span>${esc(sumSpan(c))} · ${c.sessions} 个会话 · ${c.turns} 问</span><span class="sp"></span>
       ${c.status === 'done' && state.qq?.enabled ? `<button data-sum-send="${c.id}" ${state.qq.can_send ? '' : 'disabled title="QQ 只允许在你给机器人发消息后 60 分钟内回复"'}>发送到 QQ</button>` : ''}
       <button class="danger" data-sum-del="${c.id}">删除</button></div>`;
-    cur = head + (c.status === 'running' ? '<div class="hint">cc 正在阅读这段时间的问答并总结,通常要一两分钟…</div>'
-      : c.status === 'error' ? `<div class="hint">生成失败:${esc(c.error || '')}</div>`
-      : `<div class="md">${renderMD(c.body)}</div>`);
+    cur = head + (c.status === 'running' ? `<div class="hint">${c.stage === 'filter' ? 'cc 正在按要求挑出相关的会话…' : 'cc 正在阅读挑出的问答并总结,通常要一两分钟…'}</div>`
+      : c.status === 'error' ? `<div class="hint">生成失败:${esc(c.error || '')}</div>` : '')
+      + sumPicks(c) + (c.status === 'done' ? `<div class="md">${renderMD(c.body)}</div>` : '');
   }
   mdCwd = '';
   $('#sum-body').innerHTML = cur + (list ? `<div class="sum-actions"><span>历史总结</span></div>${list}` : '');
@@ -1102,8 +1111,17 @@ function renderSumBody() {
   renderMap([]);
 }
 $('#article').addEventListener('click', async e => {
-  const sd = e.target.closest('[data-sum-send]'), dl = e.target.closest('[data-sum-del]');
-  if (sd) {
+  const sd = e.target.closest('[data-sum-send]'), dl = e.target.closest('[data-sum-del]'), rd = e.target.closest('[data-sum-redo]');
+  if (rd) {
+    const c = sum.cur; if (!c) return;
+    const sessions = [...rd.closest('.sum-picks').querySelectorAll('input:checked')].map(x => x.value);
+    if (!sessions.length) return toast('至少勾选一个会话');
+    rd.disabled = true;
+    const r = await post('/api/summaries', { topic: c.topic, from: c.from, to: c.to, sessions }).catch(() => ({ error: '网络错误' }));
+    rd.disabled = false;
+    if (r.error) return toast(r.error, 4000);
+    location.hash = '#/summary/' + r.id;
+  } else if (sd) {
     sd.disabled = true;
     const r = await post(`/api/summaries/${sd.dataset.sumSend}/send`).catch(() => ({ error: '网络错误' }));
     sd.disabled = false;

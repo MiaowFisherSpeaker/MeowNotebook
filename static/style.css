@@ -292,3 +292,7 @@ a.fpath:hover { color: var(--accent); }
 .sum-item .st.err { color: #c0392b; }
 .sum-actions { display: flex; gap: 8px; margin: 18px 0 8px; align-items: center; color: var(--muted); font-size: 12.5px; }
 .sum-actions .sp { flex: 1; }
+.sum-picks { margin: 10px 0 16px; }
+.sum-pick { display: flex; align-items: center; gap: 8px; padding: 3px 4px; cursor: pointer; }
+.sum-pick .topic { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sum-pick .st { flex: none; font-size: 11.5px; color: var(--muted); }

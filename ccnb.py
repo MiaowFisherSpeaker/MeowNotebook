@@ -858,14 +858,22 @@ def send_note(sid):
 # ---------------------------------------------------------------- 总结:按主题 + 日期范围让 cc 总结问答
 
 SUMMARY_SOURCE_LIMIT = 400_000  # 交给 cc 的问答原文上限(字符);超出时逐步缩短每轮回答
-SUMMARY_PROMPT = """标准输入里是我在 {span} 和 cc(命令行 AI 编程助手)的问答记录,按会话分组,每轮是"问"和"答"。
-请按我的要求写一份总结。我的要求:{topic}
+SUMMARY_PROMPT = """下面是我在 {span} 和 cc(命令行 AI 编程助手)的问答记录,按会话分组,每轮是"问"和"答"。
+这些记录已经按我的要求挑过一遍,但仍可能夹带无关内容。请按我的要求写一份总结。我的要求:{topic}
 
 - 只总结和要求相关的会话与问题,无关的忽略;一条相关的都没有就直接说明。
 - 用中文 Markdown:开头 3-5 条要点,然后按主题分节(## 标题),每节末尾用"来源:"列出会话标题。
 - 公式用 LaTeX(行内 $...$,独立 $$...$$)。
 - 忠实于记录,不编造记录里没有的内容;记录里后来被纠正的结论以纠正后的为准。
 - 直接输出总结正文,不要寒暄,不要说"以下是总结"。"""
+SUMMARY_PROMPT_END = "(问答记录到此结束。)\n\n再说一遍我的要求:{topic}\n请严格按这个要求和上面的格式写总结,与要求无关的会话一律不写。"
+SUMMARY_FILTER_PROMPT = """下面是我在 {span} 和 cc(命令行 AI 编程助手)的问答目录:每个会话一行标题,下面每轮是"问"的开头,"→"后是"答"的开头。
+我要按这个要求写总结:{topic}
+
+请挑出和要求相关的轮次。追问、"继续"之类承接上文的轮次,跟着它所接的话题走;拿不准的宁可选上。
+只输出一个 JSON 对象,键是会话编号,值是相关轮次编号的数组,例如 {{"3": [1, 2, 5], "7": [4]}};没有相关的输出 {{}}。不要输出其他文字。"""
+SUMMARY_FILTER_END = "(目录到此结束。)\n\n要求:{topic}\n只输出 JSON。"
+SUMMARY_ALL_TOPIC = "全部内容"
 
 
 def _local_day(ts):
@@ -875,8 +883,8 @@ def _local_day(ts):
         return None
 
 
-def summary_source(day_from, day_to):
-    """[day_from, day_to](本地日期 YYYY-MM-DD,含两端)里提的问题及回答,按会话分组的 Markdown。返回 (文本, 会话数, 轮数)。"""
+def summary_candidates(day_from, day_to):
+    """[day_from, day_to](本地日期 YYYY-MM-DD,含两端)里提过问题的会话,[(meta, 这期间的提问轮次)],按时间排。"""
     picked = []
     since = datetime.fromisoformat(day_from).astimezone().timestamp()  # day_from 当天 0 点(本地时间)
     for p, mtime in session_index().files:
@@ -889,19 +897,72 @@ def summary_source(day_from, day_to):
         if sel:
             picked.append((meta, sel))
     picked.sort(key=lambda x: x[1][0]["ts"])
-    for cap in (4000, 1500, 600, 200, 0):
+    return picked
+
+
+def _clip(s, n):
+    s = re.sub(r"\s+", " ", s or "").strip()
+    return s if len(s) <= n else s[:n] + "…"
+
+
+def summary_catalog(cands):
+    """筛选用的目录:每轮只有问和答的开头,编号是 会话序号 / 轮次序号(都从 1 起)。"""
+    out = []
+    for i, (meta, sel) in enumerate(cands, 1):
+        out.append(f"[{i}] {meta['title']}(目录:{meta['cwd']})")
+        for j, t in enumerate(sel, 1):
+            out.append(f"  {j}. {_clip(t['q'], 160)} → {_clip(' '.join(t['texts']), 80)}")
+    return "\n".join(out)
+
+
+def summary_filter(cands, topic, span):
+    """让 cc 按要求从目录里挑出相关轮次,返回和 cands 对齐的 [(meta, 选中的轮次)](没选中的会话去掉)。"""
+    text = "\n\n".join([SUMMARY_FILTER_PROMPT.format(span=span, topic=topic), summary_catalog(cands),
+                        SUMMARY_FILTER_END.format(topic=topic)])
+    out = _cc_print(text, timeout=600)
+    m = re.search(r"\{.*\}", out, re.S)
+    try:
+        pick = json.loads(m.group(0)) if m else None
+    except ValueError:
+        pick = None
+    if not isinstance(pick, dict):
+        raise RuntimeError("筛选相关会话时 cc 没有返回可用的结果:" + _clip(out, 200))
+    res = []
+    for i, (meta, sel) in enumerate(cands, 1):
+        want = pick.get(str(i))
+        if not isinstance(want, list):
+            continue
+        idx = sorted({n for n in want if isinstance(n, int) and 1 <= n <= len(sel)})
+        if idx:
+            res.append((meta, [sel[n - 1] for n in idx]))
+    return res
+
+
+def summary_source(picked):
+    """把选中的问答拼成按会话分组的 Markdown;超过上限时逐步缩短每轮回答。"""
+    for cap in (None, 4000, 1500, 600, 200, 0):
         out = []
         for meta, sel in picked:
             out += [f"# 会话:{meta['title']}", f"目录:{meta['cwd']}", ""]
             for t in sel:
                 ans = "\n\n".join(t["texts"])
-                if len(ans) > cap:
+                if cap is not None and len(ans) > cap:
                     ans = ans[:cap] + "…(后略)"
                 out += [f"## 问({_local_day(t['ts'])})", t["q"] or "", "", "### 答", ans, ""]
         text = "\n".join(out)
         if len(text) <= SUMMARY_SOURCE_LIMIT:
             break
-    return text[:SUMMARY_SOURCE_LIMIT], len(picked), sum(len(x[1]) for x in picked)
+    return text[:SUMMARY_SOURCE_LIMIT]
+
+
+def _cc_print(text, timeout):
+    """`cc -p`(不带工具、不保存会话),提示词整段从标准输入给。"""
+    r = subprocess.run([term.CC_BIN, "-p", "--no-session-persistence", "--tools", ""], input=text,
+                       capture_output=True, text=True, timeout=timeout, cwd=str(SUMMARIES),
+                       env=term.clean_env(os.environ))
+    if r.returncode or not r.stdout.strip():
+        raise RuntimeError((r.stderr or r.stdout).strip()[-500:] or f"退出码 {r.returncode}")
+    return r.stdout.strip()
 
 
 _summary_jobs = set()  # 这个服务器进程里正在生成的总结
@@ -937,45 +998,66 @@ def read_summary(sid):
     return {**meta, "body": f.read_text(encoding="utf-8") if f.exists() else ""}
 
 
-def start_summary(topic, day_from, day_to):
-    """在后台用 `cc -p`(不带工具、不保存会话)生成总结,结果存到 data/summaries/<id>.md。"""
-    topic = (topic or "").strip()[:500] or "全部内容"
+def start_summary(topic, day_from, day_to, sessions=None):
+    """在后台生成总结,结果存到 data/summaries/<id>.md。先让 cc 按要求从问答目录里挑出相关轮次,再只拿这些写总结;
+    给了 sessions(会话 id 列表)就跳过挑选,直接用这些会话在这期间的全部提问。"""
+    topic = (topic or "").strip()[:500] or SUMMARY_ALL_TOPIC
     for d in (day_from, day_to):
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d or ""):
             raise ValueError("日期格式应为 YYYY-MM-DD")
     if day_from > day_to:
         day_from, day_to = day_to, day_from
-    src, n_sess, n_turns = summary_source(day_from, day_to)
-    if not n_turns:
+    cands = summary_candidates(day_from, day_to)
+    if not cands:
         raise ValueError("这段时间里没有提问记录")
+    manual = sessions is not None
+    if manual:
+        want = set(map(str, sessions))
+        if not want:
+            raise ValueError("至少勾选一个会话")
     sid = time.strftime("%Y%m%d-%H%M%S-") + hashlib.blake2b(os.urandom(8), digest_size=3).hexdigest()
     meta = {"id": sid, "topic": topic, "from": day_from, "to": day_to, "status": "running", "error": None,
-            "sessions": n_sess, "turns": n_turns, "created": time.time(), "finished": None}
-    _summary_jobs.add(sid)
-    _summary_save(meta)
+            "stage": None, "manual": manual, "sessions": 0, "turns": 0, "candidates": [],
+            "created": time.time(), "finished": None}
     span = day_from if day_from == day_to else f"{day_from} 至 {day_to}"
-    prompt = SUMMARY_PROMPT.format(span=span, topic=topic)
+
+    def save(**kw):
+        meta.update(kw)
+        if sid not in _summary_deleted:
+            _summary_save(meta)
 
     def run():
+        body = None
         try:
-            r = subprocess.run([term.CC_BIN, "-p", "--no-session-persistence", "--tools", "", prompt], input=src,
-                               capture_output=True, text=True, timeout=900, cwd=str(SUMMARIES),
-                               env=term.clean_env(os.environ))
-            if r.returncode or not r.stdout.strip():
-                raise RuntimeError((r.stderr or r.stdout).strip()[-500:] or f"退出码 {r.returncode}")
-            body = r.stdout.strip() + "\n"
+            if manual:
+                picked = [x for x in cands if x[0]["id"] in want]
+            elif topic == SUMMARY_ALL_TOPIC:
+                picked = cands
+            else:
+                save(stage="filter")
+                picked = summary_filter(cands, topic, span)
+            chosen = {m["id"]: len(sel) for m, sel in picked}
+            save(stage="write", sessions=len(picked), turns=sum(chosen.values()), candidates=[
+                {"id": m["id"], "title": m["title"], "cwd": m["cwd"], "turns": len(sel), "picked": chosen.get(m["id"], 0)}
+                for m, sel in cands])
+            if picked:
+                text = "\n\n".join([SUMMARY_PROMPT.format(span=span, topic=topic), summary_source(picked),
+                                    SUMMARY_PROMPT_END.format(topic=topic)])
+                body = _cc_print(text, timeout=900) + "\n"
+            else:
+                body = f"这段时间里没有和「{topic}」相关的问答。\n"
             meta["status"] = "done"
         except Exception as e:  # noqa: BLE001
-            body = None
             meta.update(status="error", error=str(e))
         finally:
             _summary_jobs.discard(sid)
         if sid not in _summary_deleted:  # 生成期间被删掉了就不再写回
             if body:
                 (SUMMARIES / f"{sid}.md").write_text(body, encoding="utf-8")
-            meta["finished"] = time.time()
-            _summary_save(meta)
+            save(stage=None, finished=time.time())
 
+    _summary_jobs.add(sid)
+    _summary_save(meta)
     threading.Thread(target=run, daemon=True).start()
     return meta
 
@@ -1277,7 +1359,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json({"ok": True, "qq": qqbot.info()})
             if u.path == "/api/summaries":
                 b = self._body()
-                return self._json(start_summary(b.get("topic"), b.get("from"), b.get("to")))
+                return self._json(start_summary(b.get("topic"), b.get("from"), b.get("to"), b.get("sessions")))
             m = re.fullmatch(r"/api/summaries/([\w-]+)/(send|delete)", u.path)
             if m:
                 if m.group(2) == "delete":
