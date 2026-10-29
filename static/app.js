@@ -753,7 +753,27 @@ async function attachTerm(name) {
   tv.term.loadAddon(tv.fit);
   tv.term.open($('#termbox'));
   Object.assign(tv, { cid: crypto.randomUUID?.() || String(Math.random()).slice(2) + Date.now(), seq: 0, unacked: [] });
-  tv.term.onData(sendInput);
+  // 输入法开着时(哪怕切在英文),按键的 keyCode 是 229,xterm 会改用"按键前后比对 textarea 内容"来猜输入了什么:
+  // 打字快时比对错位,会丢字,回车清空 textarea 时还会多发一个退格。所以 229 的按键不交给 xterm 比对。
+  // 但字符有时仍由 xterm 发出(keypress,或输入法在松键后才提交文字时的 input 处理),有时 xterm 一个都不发,
+  // 各家输入法不一样。这里不猜走哪条路:从上次按键 / 上次 input 起 xterm 一个字符都没发,才由这里补发 input 里的文字。
+  // 拼音组字(composition)仍由 xterm 处理,它的 input 是 insertCompositionText,不在下面的表里。
+  tv.dataN = tv.mark = 0;
+  tv.term.onData(d => { tv.dataN++; sendInput(d); });
+  const keylog = localGet('keylog', '') === '1';  // 排查用:localStorage 里设 ccnb.keylog = 1,控制台打印按键和输入事件
+  tv.term.attachCustomKeyEventHandler(e => {
+    if (keylog) console.log(e.type, e.key, e.keyCode, e.isComposing);
+    if (e.type !== 'keydown') return true;
+    tv.mark = tv.dataN;
+    return e.keyCode !== 229;
+  });
+  tv.term.textarea.addEventListener('input', e => {
+    if (keylog) console.log('input', e.inputType, JSON.stringify(e.data), e.isComposing, tv.dataN !== tv.mark ? 'xterm 已发' : '');
+    if (e.isComposing) return;
+    const d = { insertText: e.data, insertLineBreak: '\r', deleteContentBackward: '\x7f' }[e.inputType];
+    if (d && tv.dataN === tv.mark) tv.term.input(d);
+    tv.mark = tv.dataN;
+  });
   tv.ro = new ResizeObserver(() => fitTerm());
   tv.ro.observe($('#termbox'));
   connectTerm();
