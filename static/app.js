@@ -324,7 +324,7 @@ $('#sessions').addEventListener('click', async e => {
     nb.disabled = false;
     if (r.error) return toast(r.error);
     await loadTerms();
-    if (r.sid) location.hash = '#/s/' + r.sid;
+    if (r.sid) { location.hash = '#/s/' + r.sid; if (narrow.matches) showSide(false, false); }
     loadSessions();
     return;
   }
@@ -687,7 +687,11 @@ function onTerms(terms) {
   tv.terms = terms;
   tv.bySid = new Map();
   // 终端当前所在的会话:有记录后用 sid(/clear 后会变),还没提问时用启动时指定的 launch_sid
-  for (const t of terms) { const k = t.sid || t.launch_sid; if (k) tv.bySid.set(k, t); }
+  // 两个终端落在同一会话上时(如 agent 视图里 fork 前后),保留正连着的那个,免得底部终端来回换
+  for (const t of terms) {
+    const k = t.sid || t.launch_sid;
+    if (k && tv.bySid.get(k)?.name !== tv.name) tv.bySid.set(k, t);
+  }
   // 底部终端里 /clear 开了新会话 → 页面跟过去
   if (tv.name && state.sid) {
     const t = terms.find(t => t.name === tv.name);
@@ -1201,9 +1205,24 @@ document.querySelectorAll('[data-copy]').forEach(b => b.addEventListener('click'
   try { await navigator.clipboard.writeText(text); toast('已复制: ' + text); }
   catch { prompt('复制下面的命令', text); }
 }));
-$('#toggle-side').addEventListener('click', () => { document.body.classList.add('side-hidden'); localSet('side', '0'); setTimeout(fitTerm, 0); });
-document.querySelectorAll('.show-side').forEach(b => b.addEventListener('click', () => { document.body.classList.remove('side-hidden'); localSet('side', '1'); setTimeout(fitTerm, 0); }));
-if (localGet('side', '1') === '0') document.body.classList.add('side-hidden');
+// 窄屏(手机)上侧栏是盖在内容上的抽屉:默认收起,点遮罩或选了会话 / 文件后自动收起,开关状态不记到桌面端
+const narrow = matchMedia('(max-width: 900px)');
+function showSide(on, remember = !narrow.matches) {
+  document.body.classList.toggle('side-hidden', !on);
+  if (remember) localSet('side', on ? '1' : '0');
+  setTimeout(fitTerm, 0);
+}
+$('#toggle-side').addEventListener('click', () => showSide(false));
+document.querySelectorAll('.show-side').forEach(b => b.addEventListener('click', () => showSide(true)));
+$('#side-mask').addEventListener('click', () => showSide(false));
+$('#side').addEventListener('click', e => {
+  if (narrow.matches && e.target.closest('a[href^="#/"]')) showSide(false, false);
+});
+function initSide() {
+  showSide(narrow.matches ? !/^#\/(s|f|stars|summary)\b/.test(location.hash) : localGet('side', '1') !== '0', false);
+}
+narrow.addEventListener?.('change', initSide);
+initSide();
 
 function route() {
   const t = location.hash.match(/^#\/t\/([\w-]+)/);  // 旧链接:终端名 → 对应会话

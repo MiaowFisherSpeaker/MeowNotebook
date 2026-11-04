@@ -28,6 +28,7 @@ code, pre { font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace
 #side { width: 320px; flex: none; background: var(--panel); border-right: 1px solid var(--line);
   display: flex; flex-direction: column; height: 100vh; }
 body.side-hidden #side { display: none; }
+#side-mask { display: none; }
 .brand { padding: 14px 16px 8px; font-weight: 700; letter-spacing: .5px; display: flex; justify-content: space-between; }
 #search { margin: 0 12px 10px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px;
   background: var(--card); color: var(--text); font: inherit; font-size: 13px; }
@@ -139,7 +140,13 @@ details.proc .md { opacity: .85; }
 
 @media (max-width: 900px) {
   #toc { display: none; }
-  #side { position: fixed; z-index: 5; width: 86vw; }
+  /* 抽屉:最宽 260px、不超过屏宽 70%,盖在内容上,点遮罩收起;100dvh:手机浏览器地址栏收放时不被裁掉底部 */
+  #side { position: fixed; z-index: 6; left: 0; top: 0; width: min(260px, 70vw); height: 100dvh;
+    box-shadow: 4px 0 18px rgba(0,0,0,.18); }
+  #side-mask { position: fixed; inset: 0; z-index: 5; background: rgba(0,0,0,.35); }
+  body.side-hidden #side-mask { display: none; }
+  #main { height: 100dvh; }
+  .head { gap: 8px; }
   #content, .head, #tabs { padding-left: 16px; padding-right: 16px; }
 }
 

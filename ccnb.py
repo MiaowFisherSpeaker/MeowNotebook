@@ -414,14 +414,23 @@ def sid_by_title(cwd, title):
         return None
     prefix = title[:-1].rstrip() if title.endswith("…") else None
     d = project_dir_for(cwd)
-    for p, _ in session_index().files:  # 从新到旧,第一个匹配的就是最近更新的
-        if p.parent != d:
+    try:
+        cwd_r = str(Path(cwd).resolve())
+    except OSError:
+        cwd_r = cwd
+    idx = session_index()
+    loose = None
+    for p, _ in idx.files:  # 从新到旧,第一个匹配的就是最近更新的
+        meta = idx.meta[p]
+        # 从 agent 视图 fork 出的会话可能记在别的项目目录里(如 worktree 的目录),但记录里的 cwd 还是原目录
+        if p.parent != d and meta["cwd"] != cwd_r:
             continue
-        meta = cached_meta(p)
         names = {meta["title"], meta["ai_title"]} - {None}
-        if title in names or (prefix and any(n.startswith(prefix) for n in names)):
+        if title in names:  # 完全相同优先:fork 的标题是"原标题 ⑂ …",截断后的前缀也会匹配原会话
             return p.stem
-    return None
+        if loose is None and prefix and any(n.startswith(prefix) for n in names):
+            loose = p.stem
+    return loose
 
 
 def pane_record(pane):
@@ -510,24 +519,39 @@ def qq_owner(sid):
     return o["label"] if o and o.get("platform") != "qq" else None
 
 
+_title_memo = {}  # 终端名 → (最近一次从屏幕标题认出的会话, 当时的登记 / hook 状态)
+
+
 def link_terms(terms):
     """tmux 终端 → 它当前所在的 cc 会话。
     优先用启动时指定的会话(--session-id / --resume);若终端里用 /clear 开了新会话,则取同目录下满足以下条件的最新会话:
     在终端创建之后才开始、开始时原会话已不再写入问答、且没被其他终端占用。"""
     claimed = {t["launch_sid"] for t in terms if t["launch_sid"]}
     for t in terms:
+        reg = next((pr for pr in live_processes() or () if pr["pid"] == t.get("pid")), None)
+        hook = pane_record(t.get("pane"))
+        # 登记和 hook 都没变 → 终端没换过会话(没 /clear、/resume)
+        mark = (t.get("pid"), reg and reg["sid"], hook and hook.get("session_id"), hook and hook.get("ts"))
         # 1. 屏幕上 cc 输入框边框显示的会话标题 → 同目录下标题相同、最近更新的会话
         sid = sid_by_title(t["cwd"], term.screen_title(t["name"]))
+        if not sid:
+            # cc 正在输出、弹着菜单时读不到标题。agent 视图里 fork 后,登记和 hook 仍停在原会话上,
+            # 这时退回去会让网页在 fork 和原会话之间来回跳 → 沿用上次读到的标题对应的会话
+            memo = _title_memo.get(t["name"])
+            if memo and memo[1] == mark and find_session(memo[0]):
+                sid = memo[0]
         if sid:
+            _title_memo[t["name"]] = (sid, mark)
             t["sid"], t["source"] = sid, "title"
             continue
+        _title_memo.pop(t["name"], None)
         # 2. cc 自己登记的这个进程的当前会话(窗格里的进程就是 cc);还没写出记录的新 id 先不用,走下面的推测
-        rec = next((pr for pr in live_processes() or () if pr["pid"] == t.get("pid")), None)
+        rec = reg
         if rec and find_session(rec["sid"]) and cached_meta(find_session(rec["sid"]))["questions"]:
             t["sid"], t["source"] = rec["sid"], "registry"
             continue
         # 3. hook 报告的当前会话(启动、/resume、/clear;后台 worker 接管时可能不触发)
-        rec = pane_record(t.get("pane"))
+        rec = hook
         if rec and rec["ts"] >= t["created"] - 5:
             t["sid"] = rec["session_id"]
             t["source"] = rec.get("source") or rec.get("event")
