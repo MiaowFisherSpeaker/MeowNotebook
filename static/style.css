@@ -107,6 +107,11 @@ body.side-hidden .show-side { display: inline-block; }
 
 /* 问答 */
 .turn { margin-bottom: 30px; scroll-margin-top: calc(var(--top-h, 130px) + 10px); }
+/* 长会话:屏幕外的轮次跳过排版和绘制(滚动、改宽度时只算看得见的几轮)。
+   只在支持滚动锚定的浏览器上开:否则往上滚时估计高度换成真实高度,页面会跳 */
+@supports (content-visibility: auto) and (overflow-anchor: auto) {
+  #article > .turn { content-visibility: auto; contain-intrinsic-size: auto 600px; }
+}
 .q { background: var(--q-bg); border: 1px solid var(--q-line); border-radius: 10px; padding: 10px 16px; }
 .q .lab, .a .lab { font-size: 11.5px; color: var(--muted); display: flex; gap: 10px; }
 .q.command, .q.shell { background: var(--code-bg); border-color: var(--line); font-family: monospace; font-size: 13px; }
@@ -123,6 +128,16 @@ details.proc .md { opacity: .85; }
 .md h3 { font-size: 1.08em; } .md h1, .md h2, .md h3 { margin: 1.2em 0 .5em; line-height: 1.4; scroll-margin-top: calc(var(--top-h, 130px) + 10px); }
 .md p { margin: .55em 0; }
 .md pre { background: var(--code-bg); padding: 10px 14px; border-radius: 8px; overflow-x: auto; }
+/* 代码块复制按钮:按钮放在包住 pre 的盒子上,代码横向滚动时它不跟着跑;平时半透明,指针移到代码块上变清楚 */
+.code-box { position: relative; }
+.code-box > pre { margin: .6em 0; }
+.copy-code { position: absolute; top: 6px; right: 6px; z-index: 1; padding: 1px 8px; font-size: 12px; line-height: 1.6;
+  color: var(--muted); background: var(--card); opacity: .55; transition: opacity .15s; }
+.copy-code::before { content: "复制"; }
+.copy-code[data-lang]::before { content: attr(data-lang) " · 复制"; }
+.copy-code.done::before { content: "✓ 已复制"; }
+.code-box:hover .copy-code, .copy-code:focus-visible, .copy-code.done { opacity: 1; }
+.copy-code.done { color: var(--live); border-color: var(--live); }
 .md :not(pre) > code { background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
 .md table { border-collapse: collapse; margin: .8em 0; display: block; overflow-x: auto; font-size: 14px; }
 .md th, .md td { border: 1px solid var(--line); padding: 5px 10px; vertical-align: top; }
@@ -219,8 +234,21 @@ button.danger:hover { border-color: #c0392b; color: #c0392b; }
 /* overflow:hidden:xterm 的隐藏输入框按光标行绝对定位,终端调矮后它会留在原处撑高页面,滚到底时底部出现空白 */
 #termbox { height: var(--dock-h); position: relative; padding: 4px 0 0 8px; overflow: hidden; }
 #termbox .xterm { height: 100%; }
-#dock.max { --dock-h: 72vh; }
-#dock:not(.on) #termbox, #dock:not(.on) #dock-max, #dock:not(.on) #dock-kill { display: none; }
+#dock:not(.on) #termbox, #dock:not(.on) #dock-pos, #dock:not(.on) #dock-kill { display: none; }
+#dock-edge { display: none; }
+/* 终端放在右侧边栏:固定在视口右边、占满高度,正文区让出它的宽度(只在会话页、终端运行着时;窄屏总在底部) */
+@media (min-width: 901px) {
+  body.dock-right #view:not(.file):not(.stars) #dock.on { position: fixed; top: 0; right: 0; bottom: 0; width: var(--dock-w, 640px);
+    display: flex; flex-direction: column; border-top: 0; border-left: 1px solid var(--line); z-index: 4; }
+  body.dock-right #view:not(.file):not(.stars) #dock.on #termbox { flex: 1; height: auto; min-height: 0; }
+  body.dock-right #view:not(.file):not(.stars) #dock.on #dock-bar { cursor: default; }
+  body.dock-right #view:not(.file):not(.stars) #dock.on #dock-edge { display: block; position: absolute; left: -4px; top: 0; bottom: 0;
+    width: 8px; cursor: ew-resize; z-index: 5; }
+  body.dock-right #main:has(> #view:not([hidden]):not(.file):not(.stars) #dock.on) { margin-right: var(--dock-w, 640px); }
+}
+@media (max-width: 900px) { #dock-pos { display: none; } }
+body.dragging { cursor: ew-resize; user-select: none; }
+body.dragging #termbox { pointer-events: none; }
 #dock.on #dock-start { display: none; }
 #term-overlay { position: absolute; inset: 0; background: rgba(0,0,0,.55); color: #fff; display: flex; align-items: center;
   justify-content: center; font-size: 14px; z-index: 3; cursor: pointer; }

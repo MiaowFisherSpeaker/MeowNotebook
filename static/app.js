@@ -43,12 +43,16 @@ function fmtTime(ts) {
 // ---------- Markdown + 公式 ----------
 marked.setOptions({ gfm: true, breaks: true });
 
+// 行内 $…$:结尾的 $ 后面紧跟字母时(如 `$\alpha\cdot$KL`),只有内容明显是 TeX(含 \命令 或 ^)才算公式,
+// 免得把 `$HOME/$USER`、`--env $e > out_$e.log` 这类 shell 变量当成公式;后面紧跟数字的一律不算(`$5 和 $10`)
 const MATH_RE = [
   [/\$\$([\s\S]+?)\$\$/g, true],
   [/\\\[([\s\S]+?)\\\]/g, true],
   [/\\\(([\s\S]+?)\\\)/g, false],
-  [/(?<![\\$\w])\$(?!\s)([^$\n]+?)(?<!\s)\$(?![\w$])/g, false],
+  [/(?<![\\$\w])\$(?!\s)([^$\n]+?)(?<!\s)\$(?![\d$])/g, false, (tex, next) => !/\w/.test(next) || /\\[a-zA-Z]|\^/.test(tex)],
 ];
+// 不在 \begin{…} 环境里的裸 & 是笔误(如 `$^{[Ma&Wu]}$`),KaTeX 会当成列分隔符报错 → 按字面的 & 显示
+const fixTex = tex => /\\begin\{/.test(tex) ? tex : tex.replace(/(?<!\\)&/g, '\\&');
 
 let mdCwd = '';  // 解析 Markdown 中相对路径图片用的目录(当前会话的 cwd)
 function localImgs(html) {
@@ -79,6 +83,14 @@ function highlightCode(html) {
   });
 }
 
+// 代码块右上角的复制按钮(按钮文字由 CSS 画,选中正文复制时不会带上"复制"二字)
+function codeBoxes(html) {
+  return html.replace(/<pre><code([^>]*)>([\s\S]*?)<\/code><\/pre>/g, (m, attrs, body) => {
+    const lang = attrs.match(/language-([\w+#-]+)/)?.[1];
+    return `<div class="code-box"><button class="copy-code" type="button"${lang ? ` data-lang="${lang}"` : ''} title="复制代码" aria-label="复制代码"></button>${m}</div>`;
+  });
+}
+
 // 行内代码里像文件路径的(如 `00_索引.md:429`、`~/projects/x/a.py`)变成可点击,打开只读预览
 const FILE_EXT = /\.(md|markdown|txt|py|js|mjs|ts|tsx|jsx|json|jsonl|sh|bash|css|html|yaml|yml|toml|ini|conf|tex|bib|csv|tsv|xlsx|ipynb|pdf|png|jpe?g|gif|webp|svg|c|h|cpp|go|rs|java|rb|lua|sql|log|cfg)$/i;
 function pathHref(raw) {
@@ -99,22 +111,37 @@ function linkPaths(html) {
   });
 }
 
+// 渲染结果按(目录, 原文)缓存:切换整理版 / 原始问答、勾选"过程文字"、增量刷新时不必重新解析 Markdown、排版公式
+const mdCache = { map: new Map(), size: 0 };
 function renderMD(src) {
   if (!src) return '';
+  const key = mdCwd + '\0' + src;
+  let html = mdCache.map.get(key);
+  if (html !== undefined) return html;
+  html = mdToHTML(src);
+  if (mdCache.size > 40e6) { mdCache.map.clear(); mdCache.size = 0; }
+  mdCache.map.set(key, html);
+  mdCache.size += key.length + html.length;
+  return html;
+}
+
+function mdToHTML(src) {
   const code = [], math = [];
   // 1. 先把代码保护起来,避免其中的 $ 被当成公式
+  //    行内代码可以用多个反引号包住(``含 ` 的代码``)
   let s = src.replace(/(^|\n)(```|~~~)[^\n]*\n[\s\S]*?\n\2(?=\n|$)/g, m => `\x01C${code.push(m) - 1}\x01`)
-             .replace(/`[^`\n]+`/g, m => `\x01C${code.push(m) - 1}\x01`);
+             .replace(/(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)/g, m => `\x01C${code.push(m) - 1}\x01`);
   // 2. 抽出公式
-  for (const [re, display] of MATH_RE) {
-    s = s.replace(re, (_, tex) => `MATHPH${math.push({ tex, display }) - 1}XQ`);
+  for (const [re, display, ok] of MATH_RE) {
+    s = s.replace(re, (m, tex, off, str) => ok && !ok(tex, str[off + m.length] || '') ? m
+      : `MATHPH${math.push({ tex: fixTex(tex), display }) - 1}XQ`);
   }
   // 2.5 加粗:CommonMark 规定结尾 ** 前是标点、后面紧跟文字时不算加粗,
   //     中文里"**原因：**后文"非常常见,所以先自己转成 <strong>
   s = s.replace(/\*\*(?=\S)([^*\n]+?)(?<=\S)\*\*/g, '<strong>$1</strong>');
   // 3. 还原代码,交给 marked
   s = s.replace(/\x01C(\d+)\x01/g, (_, i) => code[i]);
-  let html = highlightCode(linkPaths(localImgs(DOMPurify.sanitize(marked.parse(s)))));
+  let html = codeBoxes(highlightCode(linkPaths(localImgs(DOMPurify.sanitize(marked.parse(s))))));
   // 4. 把占位符换成 KaTeX
   html = html.replace(/MATHPH(\d+)XQ/g, (_, i) => {
     const { tex, display } = math[i];
@@ -231,7 +258,19 @@ function copyData(data, label) {
   const ok = document.execCommand('copy');
   copyAs = null;
   toast(ok ? '已复制为 ' + label : '复制失败');
+  return ok;
 }
+document.addEventListener('click', e => {
+  const b = e.target.closest('.copy-code');
+  if (!b) return;
+  e.preventDefault();
+  const code = b.parentElement.querySelector('pre code')?.textContent.replace(/\n$/, '') ?? '';
+  copyAs = { 'text/plain': code };
+  const ok = document.execCommand('copy');
+  copyAs = null;
+  toast(ok ? `已复制代码(${code.split('\n').length} 行)` : '复制失败');
+  if (ok) { b.classList.add('done'); clearTimeout(b.timer); b.timer = setTimeout(() => b.classList.remove('done'), 1500); }
+});
 
 const cmenu = document.createElement('div');
 cmenu.id = 'cmenu'; cmenu.hidden = true;
@@ -466,6 +505,8 @@ function renderHead() {
 
 function renderSession() {
   const { turns, note } = state.data;
+  // 已在看原始问答时重画(勾选过程文字、整理版更新…):记住正在看的那一轮,重画后放回原处
+  const keep = state.jump == null && $('#article .turn[id^="t"]') ? readingTurn() : null;
   renderHead();
   const tab = note ? state.tab : 'raw';
   document.querySelectorAll('#tabs [data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
@@ -473,9 +514,24 @@ function renderSession() {
   if (state.data.pending) {
     $('#article').innerHTML = '<div class="hint">新会话,还没有提问。<br>在下方的输入框里开始对话,问答会实时显示在这里。</div>';
     $('#toc').innerHTML = '';
-  } else tab === 'note' ? renderNote(note) : renderRaw(turns);
+  } else if (tab === 'note') renderNote(note);
+  else {
+    renderRaw(turns, state.jump ?? keep?.n);
+    const el = keep && $('#article').querySelector('.turn');
+    if (keep) {
+      const t = document.getElementById('t' + keep.n) || el;
+      $('#main').scrollTop += t.getBoundingClientRect().top - readLine() - keep.off;
+    }
+  }
   markArticle();
   syncDock();
+}
+
+// 阅读线(吸顶标题栏下沿)所在的那一轮和它相对阅读线的位置
+function readingTurn() {
+  const line = readLine();
+  const t = [...$('#article').children].find(c => c.id && c.getBoundingClientRect().bottom > line);
+  return t && /^t\d+$/.test(t.id) ? { n: +t.id.slice(1), off: t.getBoundingClientRect().top - line } : null;
 }
 
 // 增量更新:只重画 redraw 里的轮次,其余 DOM 原样保留(长会话不必每 3 秒整页重排 Markdown / 公式)
@@ -489,6 +545,7 @@ function patchSession(redraw, oldCount) {
   for (const n of [...redraw].sort((a, b) => a - b)) {
     const t = turns[n - 1];
     const old = document.getElementById('t' + n);
+    if (!old && fillPending(n)) continue;  // 还没补画到的轮次:补画时会用最新的数据
     const html = t ? rawHTML([t], active, showProc, showMisc, meta.id, last) : '';
     if (!html) { old?.remove(); continue; }
     const tpl = document.createElement('template');
@@ -506,10 +563,11 @@ function patchSession(redraw, oldCount) {
     }
     markArticle(el);
   }
-  renderMap(turns.filter(t => t.kind === 'question' && document.getElementById('t' + t.n))
-    .map(t => ({ id: 't' + t.n, n: t.n, text: t.q.replace(/\s+/g, ' ').slice(0, 240), len: t.q.length })));
+  renderMap(mapItems(turns));
   syncDock();
 }
+const mapItems = turns => turns.filter(t => t.kind === 'question')
+  .map(t => ({ id: 't' + t.n, n: t.n, text: t.q.replace(/\s+/g, ' ').slice(0, 240), len: t.q.length }));
 
 // 打开会话时定位:指定的轮次,否则最新一问
 function jumpToTurn() {
@@ -558,12 +616,58 @@ function rawHTML(turns, active, showProc, showMisc, sid, last = turns[turns.leng
   }).join('');
 }
 
-function renderRaw(turns) {
-  const showMisc = $('#show-misc').checked;
-  $('#article').innerHTML = rawHTML(turns, state.data.active, $('#show-process').checked, showMisc, state.data.meta.id);
-  renderMap(turns.filter(t => t.kind === 'question' && document.getElementById('t' + t.n))
-    .map(t => ({ id: 't' + t.n, n: t.n, text: t.q.replace(/\s+/g, ' ').slice(0, 240), len: t.q.length })));
+// 长会话一次画完(Markdown + 公式 + 高亮,几 MB 的 HTML)会让页面卡住好几秒:
+// 先画要看的那几轮(指定的一轮 / 正在看的一轮 / 最新一问),其余在空闲时分小块补上;
+// 补在上方的内容会把正在看的位置往下推,补完一块就把滚动位置拉回来
+const fill = { job: null };
+function renderRaw(turns, focusN) {
+  fill.job && clearTimeout(fill.job.timer);
+  fill.job = null;
+  const showProc = $('#show-process').checked, showMisc = $('#show-misc').checked;
+  const { active, meta } = state.data, last = turns[turns.length - 1];
+  const items = turns.filter(t => showMisc || t.kind === 'question' || t.kind === 'summary');
+  focusN ??= turns.filter(t => t.kind === 'question').pop()?.n;
+  let fi = items.findIndex(t => t.n >= focusN);
+  if (fi < 0) fi = items.length - 1;
+  const lo = Math.max(0, fi - 2), hi = Math.min(items.length, fi + 6);
+  const html = ts => rawHTML(ts.map(t => state.data.turns[t.n - 1] || t), active, showProc, showMisc, meta.id, last);
+  $('#article').innerHTML = html(items.slice(lo, hi));
+  renderMap(mapItems(turns));
+  if (lo > 0 || hi < items.length) fill.job = { items, lo, hi, html, timer: setTimeout(fillStep, 0) };
 }
+function fillPending(n) {
+  const j = fill.job;
+  if (!j) return false;
+  return (j.lo > 0 && n < j.items[j.lo].n) || (j.hi < j.items.length && n > j.items[j.hi - 1].n && n <= j.items[j.items.length - 1].n);
+}
+function fillStep(budget = 12) {
+  const j = fill.job;
+  if (!j) return;
+  const below = document.getElementById('t' + j.items[j.hi - 1]?.n), above = document.getElementById('t' + j.items[j.lo]?.n);
+  if ((j.hi < j.items.length && !below) || (j.lo > 0 && !above)) { fill.job = null; return; }  // 正文已换成别的内容
+  const t0 = performance.now(), up = [], down = [];
+  const fresh = list => list.filter(t => !document.getElementById('t' + t.n));
+  while (performance.now() - t0 < budget && (j.lo > 0 || j.hi < j.items.length)) {
+    if (j.hi < j.items.length) { const b = Math.min(j.items.length, j.hi + 3); down.push(j.html(fresh(j.items.slice(j.hi, b)))); j.hi = b; }
+    if (j.lo > 0) { const a = Math.max(0, j.lo - 3); up.unshift(j.html(fresh(j.items.slice(a, j.lo)))); j.lo = a; }
+  }
+  const frag = h => {
+    const tpl = document.createElement('template');
+    tpl.innerHTML = h;
+    [...tpl.content.children].forEach(el => markArticle(el));
+    return tpl.content;
+  };
+  if (down.length) below.after(frag(down.join('')));
+  if (up.length) {
+    const before = above.getBoundingClientRect().top;
+    above.before(frag(up.join('')));
+    const d = above.getBoundingClientRect().top - before;  // 浏览器自己做了滚动锚定时 d 已是 0
+    if (d) { anchor.mute = Date.now() + 200; $('#main').scrollTop += d; }
+  }
+  if (j.lo > 0 || j.hi < j.items.length) j.timer = setTimeout(fillStep, 0);
+  else { fill.job = null; spy(); }
+}
+function flushFill() { while (fill.job) { clearTimeout(fill.job.timer); fillStep(1e9); } }
 
 // ---------- 问题地图(左侧横条)----------
 // 垂直居中,最多显示 MAP_MAX 根横条(以当前问题为中心的窗口,滚轮翻动);
@@ -601,7 +705,7 @@ function layoutMap() {
   const toc = $('#toc');
   const top = ($('#top')?.offsetHeight || 80) + 8;
   $('#main').style.setProperty('--top-h', (top - 8) + 'px');
-  const dockH = $('#view').classList.contains('file') || $('#view').classList.contains('stars') ? 0 : dock.offsetHeight;
+  const dockH = $('#view').classList.contains('file') || $('#view').classList.contains('stars') || dockAside() ? 0 : dock.offsetHeight;
   toc.style.setProperty('--toc-top', top + 'px');
   toc.style.setProperty('--toc-h', Math.max(160, window.innerHeight - top - dockH - 8) + 'px');
 }
@@ -643,6 +747,7 @@ function hidePop() {
   }, 200);
 }
 function goMap(i) {
+  if (!mapTarget(i)) flushFill();  // 要去的那一轮还没补画到
   mapTarget(i)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 $('#toc').addEventListener('mousemove', e => {
@@ -675,6 +780,48 @@ $('#main').addEventListener('scroll', () => {
   requestAnimationFrame(() => { spyQueued = false; spy(); });
 });
 window.addEventListener('resize', () => { layoutMap(); spy(); });
+
+// ---------- 正文宽度变化时保持阅读位置 ----------
+// 终端移到右侧 / 收起侧栏 / 改窗口大小后正文重新换行,同一个滚动距离对应的内容差很多:
+// 按比例滚会往前跳好几问,把当前问题顶到开头又会丢掉读到的那一段。
+// 所以滚动停下时记住"阅读线(吸顶标题栏下沿)上的那一小段(段落 / 列表项 / 表格行 / 公式块…)以及阅读线落在它的几分之几处",
+// 宽度变了就把同一处放回阅读线上
+const ANCHOR_SEL = 'li, tr, .md > *, summary, .lab, .imgs, .katex-display, .note-meta, .starcard .src, .sum-item, .code-wrap';
+const anchor = { el: null, ratio: 0, off: 0, w: 0, t: null, mute: 0 };
+function readLine() { return ($('#top')?.getBoundingClientRect().bottom || 0) + 8; }
+function pickAnchor() {
+  const art = $('#article');
+  if (art.clientWidth !== anchor.w || Date.now() < anchor.mute) return;  // 宽度刚变、还没放回原处
+  if ($('#view').hidden) { anchor.el = null; return; }
+  const line = readLine();
+  const block = [...art.children].find(c => c.getBoundingClientRect().bottom > line);
+  if (!block) { anchor.el = null; return; }
+  let el = null, r = null;
+  for (const b of block.querySelectorAll(ANCHOR_SEL)) {  // 跨过阅读线的最里层一段;都没跨过(落在空隙里)就取下面最近的一段
+    const br = b.getBoundingClientRect();
+    if (!br.height || br.bottom <= line) continue;
+    if (br.top <= line) { el = b; r = br; } else { if (!el) { el = b; r = br; } break; }
+  }
+  if (!el) { el = block; r = block.getBoundingClientRect(); }
+  const ratio = r.top <= line ? (line - r.top) / r.height : 0;
+  Object.assign(anchor, { el, ratio, off: line - (r.top + ratio * r.height) });
+}
+function restoreAnchor() {
+  const a = anchor;
+  if (!a.el?.isConnected) return;
+  const r = a.el.getBoundingClientRect();
+  const d = r.top + a.ratio * r.height + a.off - readLine();
+  if (Math.abs(d) >= 1) { a.mute = Date.now() + 200; $('#main').scrollTop += d; }
+}
+$('#main').addEventListener('scroll', () => { clearTimeout(anchor.t); anchor.t = setTimeout(pickAnchor, 150); });
+new ResizeObserver(() => {
+  const w = $('#article').clientWidth;
+  if (w === anchor.w) return;
+  const had = anchor.w;
+  anchor.w = w;
+  if (had && w) { restoreAnchor(); layoutMap(); spy(); }
+  clearTimeout(anchor.t); anchor.t = setTimeout(pickAnchor, 250);
+}).observe($('#article'));
 
 // ---------- 底部输入区(真实的 cc TUI)----------
 // 会话页底部嵌入运行这个会话的 tmux 终端;输入框、斜杠菜单、权限确认、Esc 打断等与终端完全一致。
@@ -861,7 +1008,33 @@ setInterval(() => {
   inputStatus();
 }, 1000);
 
-// 高度:拖动标题栏调整,记住;"放大"在常用高度与 72vh 之间切换
+// 位置:底部(默认)或右侧边栏,记住选择;窄屏上总在底部。底部时拖标题栏调高度,右侧时拖左边缘调宽度
+const dockPos = { right: localGet('dockPos', 'bottom') === 'right' };
+const dockAside = () => getComputedStyle(dock).position === 'fixed';
+function setDockPos(right) {
+  dockPos.right = right;
+  localSet('dockPos', right ? 'right' : 'bottom');
+  document.body.classList.toggle('dock-right', right);
+  $('#dock-pos').textContent = right ? '移到底部' : '移到右侧';
+  requestAnimationFrame(() => { layoutMap(); fitTerm(); tv.term?.focus(); });
+}
+function setDockW(px) {
+  px = Math.max(320, Math.min(window.innerWidth - 520, px));
+  document.body.style.setProperty('--dock-w', px + 'px');
+  localSet('dockW', String(px));
+}
+setDockW(+localGet('dockW', '640'));
+setDockPos(dockPos.right);
+$('#dock-pos').addEventListener('click', () => setDockPos(!dockPos.right));
+$('#dock-edge').addEventListener('mousedown', e => {
+  e.preventDefault();
+  document.body.classList.add('dragging');
+  const move = ev => setDockW(window.innerWidth - ev.clientX);
+  const up = () => { removeEventListener('mousemove', move); removeEventListener('mouseup', up);
+    document.body.classList.remove('dragging'); fitTerm(); };
+  addEventListener('mousemove', move); addEventListener('mouseup', up);
+});
+
 function setDockH(px) {
   px = Math.max(120, Math.min(window.innerHeight - 160, px));
   dock.style.setProperty('--dock-h', px + 'px');
@@ -870,17 +1043,11 @@ function setDockH(px) {
 }
 setDockH(+localGet('dockH', '300'));
 $('#dock-bar').addEventListener('mousedown', e => {
-  if (e.target.closest('button')) return;
+  if (e.target.closest('button') || dockAside()) return;
   e.preventDefault();
-  dock.classList.remove('max'); $('#dock-max').textContent = '放大';
   const move = ev => setDockH(window.innerHeight - ev.clientY - $('#dock-bar').offsetHeight);
   const up = () => { removeEventListener('mousemove', move); removeEventListener('mouseup', up); fitTerm(); };
   addEventListener('mousemove', move); addEventListener('mouseup', up);
-});
-$('#dock-max').addEventListener('click', () => {
-  const max = dock.classList.toggle('max');
-  $('#dock-max').textContent = max ? '还原' : '放大';
-  setTimeout(() => { fitTerm(); layoutMap(); tv.term?.focus(); }, 0);
 });
 $('#termbox').addEventListener('click', () => tv.term?.focus());
 $('#term-overlay').addEventListener('click', () => { clearTimeout(tv.retry); if (tv.name) connectTerm(); });
@@ -1253,7 +1420,15 @@ function route() {
   renderSessions();
   loadSession(true);
 }
-window.addEventListener('hashchange', route);
+window.addEventListener('hashchange', () => { route(); reportFocus(); });
+
+// 告诉服务器这个网页选中的是哪个会话:终端里 cca 不带参数时进入它(多个网页开着时以最近操作的为准)
+const pageId = crypto.randomUUID?.() || String(Math.random()).slice(2) + Date.now();
+function reportFocus() {
+  if (document.hidden) return;
+  post('/api/focus', { page: pageId, sid: state.sid }).catch(() => {});
+}
+window.addEventListener('focus', reportFocus);
 
 // 服务器推送变化(SSE):记录、整理版或终端变了才取数据。推送连着时不再每 3 秒轮询;
 // 断开时(网络差、代理不支持)EventSource 自己重连,其间退回轮询。会话列表 / 当前会话另有 15 秒的兜底刷新。
@@ -1271,13 +1446,13 @@ function onChanged(ids) {
 }
 function connectLive() {
   if (!window.EventSource) return;
-  const es = live.es = new EventSource('/api/events');
+  const es = live.es = new EventSource('/api/events?page=' + pageId);
   es.onmessage = e => {
     live.last = Date.now();
     let ev; try { ev = JSON.parse(e.data); } catch { return; }
     if (ev.hello) {  // 连上 / 重连:断开期间的变化不会补推,全量刷新一次
       live.ok = true; netState(true);
-      loadTerms(); loadSessions(); loadSession(false, true);
+      loadTerms(); loadSessions(); loadSession(false, true); reportFocus();  // 服务器可能刚重启过,不记得选中的会话
       return;
     }
     if (ev.terms) onTerms(ev.terms);
@@ -1291,6 +1466,7 @@ setInterval(() => {
   live.ok = false; live.es.close(); connectLive();
 }, 5000);
 document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) reportFocus();
   if (document.hidden || !live.missed) return;
   live.missed = false; loadSession(false, true); loadSessions();
 });
@@ -1299,4 +1475,4 @@ setInterval(() => { if (!document.hidden && !live.ok) loadTerms(); }, 3000);
 setInterval(() => { if (!document.hidden) { loadSessions(); if (state.data && (live.ok || !state.data.active)) loadSession(false, true); } }, 15000);
 connectLive();
 setSide(localGet('side-tab', 'sessions'));
-Promise.all([loadSessions(), loadStars()]).then(route);
+Promise.all([loadSessions(), loadStars()]).then(() => { route(); reportFocus(); });

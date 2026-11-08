@@ -7,7 +7,8 @@
 #   ccd [参数...]         同上,但只在后台启动,去网页上用
 #   ccweb                 只启动网页
 #   ccls                  列出 cc 启动的、仍在运行的会话
-#   cca [名字]            重新进入某个会话(不给名字则进入最近的一个)
+#   cca [名字]            进入 http://localhost:8765 网页上当前选中的会话(没在运行就 --resume 启动它);
+#                         网页没开着或没选会话时进入最近启动的一个;给了名字(ccls 里的)就进那个
 #
 # ⚠ 提醒
 #   1. cc 会在交互式 shell 里遮住 C 编译器 /usr/bin/cc(make 等构建不受影响);
@@ -25,8 +26,4 @@ ccr()   { python3 "$CCNB_HOME/ccnb.py" launch --resume "$@"; }
 ccd()   { python3 "$CCNB_HOME/ccnb.py" launch --detach "$@"; }
 ccweb() { python3 "$CCNB_HOME/ccnb.py" ensure-server; }
 ccls()  { tmux -L ccnb ls -F '#{session_name}	#{session_path}	#{?session_attached,已连接,后台}' 2>/dev/null || echo "没有运行中的 cc 会话"; }
-cca()   {
-  local name="${1:-$(tmux -L ccnb ls -F '#{session_created} #{session_name}' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2)}"
-  [ -n "$name" ] || { echo "没有运行中的 cc 会话"; return 1; }
-  python3 "$CCNB_HOME/ccnb.py" attach "$name"
-}
+cca()   { python3 "$CCNB_HOME/ccnb.py" enter "$@"; }

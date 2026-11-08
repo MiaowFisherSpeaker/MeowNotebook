@@ -13,13 +13,16 @@
   pending [--days N]       列出最近 N 天(默认 1 = 今天)更新过、整理版还没覆盖全部轮次的会话
   qq setup                 QQ 机器人:输入 AppID / AppSecret(不回显),写 data/qqbot.json 并验证
   qq probe                 QQ 机器人:只连接并打印收到的所有事件(排查"收不到消息")
+  enter [名字]             cca:进入网页上选中的会话;没在运行就 --resume 启动。给名字则进那个终端
   launch [--detach] [cc 参数...]
                            在当前目录以 bypass 模式启动 cc(tmux 会话),
                            并确保网站运行;本地终端与网页终端共享同一会话
 """
 import argparse
 import base64
+import gzip
 import hashlib
+import html
 import json
 import os
 import re
@@ -35,6 +38,7 @@ from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from urllib.request import ProxyHandler, build_opener
 
 import qqbot
 import term
@@ -65,7 +69,20 @@ TAG_RE = {
     "out": re.compile(r"<(local-command-stdout|local-command-stderr|bash-stdout|bash-stderr)>(.*?)</\1>", re.S),
     "pasted": re.compile(r"<pasted_content[^>]*>(.*?)</pasted_content[^>]*>", re.S),
     "caveat": re.compile(r"<local-command-caveat>.*?</local-command-caveat>", re.S),
+    "task": re.compile(r"<task-notification>(.*?)</task-notification>", re.S),
 }
+
+
+def _task_notification(body):
+    """后台任务(子 agent 等)完成的通知 → 一行标题 + 结果正文。
+    通知把结果按 XML 转义过(< → &lt;),原样显示时公式里的 $s&gt;0$ 会被 KaTeX 当成 TeX 原样画出来甚至整条失败,
+    所以结果要先还原;task-id、输出文件路径、给 cc 的说明和用量这些对读者没用的部分不显示。"""
+    def tag(name):
+        m = re.search(rf"<{name}>(.*?)</{name}>", body, re.S)
+        return html.unescape(m.group(1).strip()) if m else ""
+    head = tag("summary") or f"后台任务 {tag('status') or ''}".strip()
+    result = tag("result")
+    return f"**⚙ {head}**" + (f"\n\n{result}" if result else "")
 INTERRUPT_RE = re.compile(r"^\[Request interrupted by user.*?\]$", re.S)
 
 
@@ -93,6 +110,10 @@ def _clean_user_text(text):
     m = TAG_RE["out"].search(text)
     if m and not TAG_RE["out"].sub("", text).strip():
         return "output", m.group(2).strip()
+    m = TAG_RE["task"].search(text)
+    if m:
+        rest = TAG_RE["task"].sub("", text).strip()
+        return "question", (_task_notification(m.group(1)) + (f"\n\n{rest}" if rest else "")).strip()
     text = TAG_RE["pasted"].sub(lambda mm: "\n> " + mm.group(1).strip().replace("\n", "\n> ") + "\n", text)
     text = TAG_RE["cmd_msg"].sub("", text)
     return "question", text.strip()
@@ -1113,6 +1134,39 @@ class _Sub:
 _subs = set()
 _subs_lock = threading.Lock()
 
+# 每个打开着的网页当前选中的会话:页面 ID → {"sid", "ts", "subs": 推送连接数, "gone": 断开时刻}。
+# cca 不带参数时进入"最近操作过的、仍开着的网页"选中的会话;推送连接断开 60 秒内(网络抖动、重连)仍算开着
+_pages = {}
+PAGE_GRACE = 60
+
+
+def set_focus(page, sid):
+    with _subs_lock:
+        p = _pages.setdefault(page, {"subs": 0, "gone": time.time()})
+        p["sid"], p["ts"] = sid, time.time()
+        if len(_pages) > 50:  # 早已关掉的页面
+            for k in [k for k, v in _pages.items() if not v["subs"] and time.time() - v["gone"] > PAGE_GRACE]:
+                _pages.pop(k, None)
+
+
+def _page_conn(page, delta):
+    if not page:
+        return
+    with _subs_lock:
+        p = _pages.setdefault(page, {"sid": None, "ts": 0, "subs": 0})
+        p["subs"] = max(0, p["subs"] + delta)
+        if not p["subs"]:
+            p["gone"] = time.time()
+
+
+def focused_session():
+    """最近操作过的、仍开着的网页上选中的会话 ID;没有网页开着或它没选会话时返回 None。"""
+    now = time.time()
+    with _subs_lock:
+        live = [v for v in _pages.values() if v.get("ts") and (v["subs"] or now - v.get("gone", 0) < PAGE_GRACE)]
+    best = max(live, key=lambda v: v["ts"], default=None)
+    return best and best["sid"]
+
 
 def _notes_key():
     try:
@@ -1259,6 +1313,11 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        # 长会话的完整数据有几百 KB,经 SSH / VS Code 端口转发在差网络下要传好几秒;JSON 压缩后通常只剩 1/5
+        if len(body) > 4096 and "gzip" in (self.headers.get("Accept-Encoding") or ""):
+            body = gzip.compress(body, 5)
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1292,7 +1351,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _events(self):
+    def _events(self, page=None):
         """SSE:推送 {"changed": [会话 ID…], "terms": [...]};没事时每 15 秒发一次 {"ping": 1}。"""
         self.close_connection = True
         self.send_response(200)
@@ -1303,6 +1362,7 @@ class Handler(SimpleHTTPRequestHandler):
         sub = _Sub()
         with _subs_lock:
             _subs.add(sub)
+        _page_conn(page, 1)
         try:
             self.wfile.write(b"retry: 3000\ndata: {\"hello\": true}\n\n")
             self.wfile.flush()
@@ -1319,6 +1379,7 @@ class Handler(SimpleHTTPRequestHandler):
         finally:
             with _subs_lock:
                 _subs.discard(sub)
+            _page_conn(page, -1)
 
     def _local_image(self, path, cwd):
         """Markdown 里引用的本地图片(绝对路径、~ 或相对会话目录)。只放行位图格式,不放 SVG(可含脚本)。"""
@@ -1354,6 +1415,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         if not self._host_ok() or not self._same_origin():
+            self.close_connection = True  # 没读请求体:留在连接里的字节会被当成下一个请求
             return
         u = urlparse(self.path)
         try:
@@ -1361,6 +1423,13 @@ class Handler(SimpleHTTPRequestHandler):
             if m:
                 name = continue_session(m.group(1))
                 return self._json({"term": name})
+            if u.path == "/api/focus":  # 网页切换会话时报告,cca 不带参数时进入它
+                b = self._body()
+                page, sid = str(b.get("page") or ""), b.get("sid")
+                if not re.fullmatch(r"[\w-]{8,64}", page) or (sid is not None and not re.fullmatch(r"[\w-]{1,64}", str(sid))):
+                    raise ValueError("bad focus")
+                set_focus(page, sid)
+                return self._json({"ok": True})
             if u.path == "/api/stars":
                 b = self._body()
                 return self._json({"stars": toggle_star(b["sid"], b["ts"], bool(b.get("on", True)))})
@@ -1410,7 +1479,8 @@ class Handler(SimpleHTTPRequestHandler):
                 term.bridge(self, m.group(1), cid if re.fullmatch(r"[\w-]{8,64}", cid) else None)
             return
         if u.path == "/api/events":
-            return self._events()
+            page = q.get("page", [""])[0]
+            return self._events(page if re.fullmatch(r"[\w-]{8,64}", page) else None)
         try:
             if u.path == "/api/stars":
                 return self._json({"stars": migrate_stars()})
@@ -1435,6 +1505,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json(search(q.get("q", [""])[0], q.get("scope", ["all"])[0]))
             if u.path == "/api/terms":
                 return self._json({"terms": link_terms(term.list_sessions())})
+            if u.path == "/api/focus":  # cca 用:网页上选中的会话
+                return self._json({"sid": focused_session()})
             if u.path == "/api/summaries":
                 return self._json({"summaries": list_summaries()})
             m = re.fullmatch(r"/api/summaries/([\w-]+)", u.path)
@@ -1574,6 +1646,38 @@ FIRST_RUN_NOTICE = """
 """
 
 
+def cmd_enter(args):
+    """cca 的实现:给了名字就进那个终端;否则进网页上选中的会话(没在运行就 --resume 启动),
+    网页没开着 / 没选会话时进最近启动的终端。"""
+    name = args.name
+    if not name:
+        sid = None
+        if port_open():
+            try:
+                # 不走 http_proxy:设了代理的机器上,访问本机也会被转给代理
+                with build_opener(ProxyHandler({})).open(f"http://127.0.0.1:{PORT}/api/focus", timeout=3) as r:
+                    sid = json.load(r).get("sid")
+            except (OSError, ValueError):
+                pass
+        if sid:
+            p = find_session(sid)
+            title = cached_meta(p)["title"] if p else "新会话"
+            try:
+                name = continue_session(sid)
+            except ValueError as e:
+                sys.exit(f"网页上选中的会话「{title}」: {e}")
+            print(f"进入网页上选中的会话「{title}」({name})")
+        else:
+            terms = term.list_sessions()
+            if not terms:
+                sys.exit("没有运行中的 cc 会话(网页上也没有选中会话)")
+            name = terms[0]["name"]
+            print(f"网页上没有选中会话,进入最近启动的 {name}")
+    if not term.session_exists(name):
+        sys.exit(f"没有名为 {name} 的会话,用 ccls 查看")
+    sys.exit(term.attach(name))
+
+
 def resolve(args):
     if getattr(args, "session", None):
         p = find_session(args.session)
@@ -1710,6 +1814,9 @@ def main():
     at = sub.add_parser("attach")
     at.add_argument("name")
     at.set_defaults(fn=lambda a: sys.exit(term.attach(a.name)))
+    en = sub.add_parser("enter", help="cca:进入网页上选中的会话(或指定名字的终端)")
+    en.add_argument("name", nargs="?")
+    en.set_defaults(fn=cmd_enter)
     ls = sub.add_parser("list")
     ls.add_argument("--project")
     ls.set_defaults(fn=cmd_list)
