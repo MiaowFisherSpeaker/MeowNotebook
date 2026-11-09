@@ -13,7 +13,7 @@
   pending [--days N]       列出最近 N 天(默认 1 = 今天)更新过、整理版还没覆盖全部轮次的会话
   qq setup                 QQ 机器人:输入 AppID / AppSecret(不回显),写 data/qqbot.json 并验证
   qq probe                 QQ 机器人:只连接并打印收到的所有事件(排查"收不到消息")
-  enter [名字]             cca:进入网页上选中的会话;没在运行就 --resume 启动。给名字则进那个终端
+  enter [名字]             cca:列出运行中的会话选择进入(↑↓ 回车,x 结束);给名字则直接进那个终端
   launch [--detach] [cc 参数...]
                            在当前目录以 bypass 模式启动 cc(tmux 会话),
                            并确保网站运行;本地终端与网页终端共享同一会话
@@ -33,6 +33,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from collections import OrderedDict
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -1646,33 +1647,187 @@ FIRST_RUN_NOTICE = """
 """
 
 
+def _web_focus():
+    """网页上选中的会话 ID(网站没开或网页没选会话时 None)。"""
+    if not port_open():
+        return None
+    try:
+        # 不走 http_proxy:设了代理的机器上,访问本机也会被转给代理
+        with build_opener(ProxyHandler({})).open(f"http://127.0.0.1:{PORT}/api/focus", timeout=3) as r:
+            return json.load(r).get("sid")
+    except (OSError, ValueError):
+        return None
+
+
+def _session_title(sid):
+    p = sid and find_session(sid)
+    return cached_meta(p)["title"] if p and cached_meta(p)["questions"] else "新会话(尚未提问)"
+
+
+def enter_choices(focus):
+    """cca 列表:运行中的终端(最近启动的在前);网页选中的会话没在运行时,放一条"继续它"在最前面。"""
+    rows = []
+    for t in link_terms(term.list_sessions()):
+        sid = t["sid"] or t["launch_sid"]
+        rows.append({"name": t["name"], "sid": sid, "title": _session_title(sid), "cwd": t["cwd"],
+                     "clients": t["clients"], "created": t["created"], "focus": bool(focus) and sid == focus})
+    if focus and not any(r["focus"] for r in rows) and find_session(focus):
+        meta = cached_meta(find_session(focus))
+        rows.insert(0, {"name": None, "sid": focus, "title": meta["title"], "cwd": meta["cwd"] or "",
+                        "clients": 0, "created": None, "focus": True})
+    return rows
+
+
+def _dw(s):
+    """终端里的显示宽度(中文等全角字符占两格)。"""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 0 if unicodedata.combining(c) else 1 for c in s)
+
+
+def _clip(s, width):
+    out, w = [], 0
+    for c in s:
+        cw = _dw(c)
+        if w + cw > width:
+            return "".join(out[:-1] if out and w + 1 > width else out) + "…" if width > 0 else ""
+        out.append(c)
+        w += cw
+    return "".join(out)
+
+
+def pick_terminal(focus):
+    """全屏列表:↑↓ 选择,回车进入,x 结束会话(←→ 选"取消 / 结束",回车确认),q / Esc 退出。
+    返回选中的行,退出时返回 None。"""
+    import curses
+
+    def run(scr):
+        curses.curs_set(0)
+        curses.use_default_colors()
+        for i, fg in enumerate((curses.COLOR_GREEN, curses.COLOR_YELLOW, curses.COLOR_RED), 1):
+            curses.init_pair(i, fg, -1)
+        scr.keypad(True)
+        rows = enter_choices(focus)
+        cur = next((i for i, r in enumerate(rows) if r["focus"]), 0)
+        top, confirm, msg = 0, None, ""
+        home = str(Path.home())
+        while True:
+            if not rows:
+                return None
+            cur = max(0, min(cur, len(rows) - 1))
+            H, W = scr.getmaxyx()
+            scr.erase()
+
+            def put(y, x, text, attr=0):
+                if 0 <= y < H and x < W - 1:
+                    try:
+                        scr.addstr(y, x, _clip(text, W - 1 - x), attr)
+                    except curses.error:
+                        pass
+
+            put(0, 1, "cca · 选择要进入的 cc 会话", curses.A_BOLD)
+            put(1, 1, "↑↓ 选择   回车 进入   x 结束会话   q 退出", curses.A_DIM)
+            body = max(1, H - 5)
+            top = min(max(top, cur - body + 1), cur)
+            tw = min(max(_dw(r["title"]) for r in rows), max(10, (W - 8) // 2))  # 标题列宽:各行信息对齐
+            for k, r in enumerate(rows[top:top + body]):
+                i, y = top + k, 3 + k
+                sel = i == cur
+                attr = curses.A_REVERSE if sel else 0
+                put(y, 0, " " * (W - 1), attr)
+                put(y, 1, ("▸ " if sel else "  ") + _clip(r["title"], tw), attr | curses.A_BOLD)
+                cwd = r["cwd"].replace(home, "~", 1) if r["cwd"].startswith(home) else r["cwd"]
+                if r["name"]:
+                    state = "已连接" if r["clients"] else "后台"
+                    when = datetime.fromtimestamp(r["created"]).strftime("%m-%d %H:%M") if r["created"] else ""
+                    info = f"{r['name']} · {cwd} · {state} · {when}"
+                else:
+                    info = f"{cwd} · 未运行,回车以 --resume 启动"
+                if r["focus"]:
+                    info += " · 网页选中"
+                x = 1 + 2 + tw + 3
+                put(y, x, info, attr | (0 if sel else curses.A_DIM))
+            if confirm is not None:
+                r = rows[cur]
+                put(H - 2, 1, f"结束 {r['name']}「{r['title']}」?其中的 cc 会被关闭,记录保留。", curses.color_pair(3) | curses.A_BOLD)
+                opts = ["取消", "结束"]
+                x = 3
+                for j, o in enumerate(opts):
+                    label = f" {o} "
+                    put(H - 1, x, label, curses.A_REVERSE if j == confirm else 0)
+                    x += _dw(label) + 2
+                put(H - 1, x + 2, "←→ 选择  回车 确认", curses.A_DIM)
+            elif msg:
+                put(H - 1, 1, msg, curses.color_pair(2))
+            scr.refresh()
+            k = scr.getch()
+            if confirm is not None:
+                if k in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("h"), ord("l"), 9):
+                    confirm = 1 - confirm
+                elif k in (10, 13, curses.KEY_ENTER):
+                    if confirm == 1:
+                        r = rows[cur]
+                        term.kill_session(r["name"])
+                        msg = f"已结束 {r['name']}"
+                        rows = enter_choices(focus)
+                        if not rows:
+                            return "empty"
+                    confirm = None
+                elif k in (27, ord("q"), ord("n")):
+                    confirm = None
+                continue
+            msg = ""
+            if k in (curses.KEY_UP, ord("k")):
+                cur -= 1
+            elif k in (curses.KEY_DOWN, ord("j")):
+                cur += 1
+            elif k in (curses.KEY_HOME, curses.KEY_PPAGE):
+                cur = 0 if k == curses.KEY_HOME else cur - body
+            elif k in (curses.KEY_END, curses.KEY_NPAGE):
+                cur = len(rows) - 1 if k == curses.KEY_END else cur + body
+            elif k in (10, 13, curses.KEY_ENTER):
+                return rows[cur]
+            elif k in (ord("x"), ord("X"), curses.KEY_DC):
+                if rows[cur]["name"]:
+                    confirm = 0  # 默认停在"取消",误按 x 再按回车也不会结束会话
+                else:
+                    msg = "这一条还没在运行,不需要结束"
+            elif k in (27, ord("q")):
+                return None
+            elif k == curses.KEY_RESIZE:
+                pass
+
+    os.environ.setdefault("ESCDELAY", "25")  # 按 Esc 立即退出,不等 1 秒
+    try:
+        return curses.wrapper(run)
+    except KeyboardInterrupt:
+        return None
+
+
 def cmd_enter(args):
-    """cca 的实现:给了名字就进那个终端;否则进网页上选中的会话(没在运行就 --resume 启动),
-    网页没开着 / 没选会话时进最近启动的终端。"""
+    """cca 的实现:给了名字就进那个终端;否则列出运行中的终端让你选(网页上选中的会话排在默认位置),
+    没在运行的网页选中会话也列出来,选它就 --resume 启动。不在交互终端里时直接进网页选中的 / 最近的一个。"""
     name = args.name
     if not name:
-        sid = None
-        if port_open():
-            try:
-                # 不走 http_proxy:设了代理的机器上,访问本机也会被转给代理
-                with build_opener(ProxyHandler({})).open(f"http://127.0.0.1:{PORT}/api/focus", timeout=3) as r:
-                    sid = json.load(r).get("sid")
-            except (OSError, ValueError):
-                pass
-        if sid:
-            p = find_session(sid)
-            title = cached_meta(p)["title"] if p else "新会话"
-            try:
-                name = continue_session(sid)
-            except ValueError as e:
-                sys.exit(f"网页上选中的会话「{title}」: {e}")
-            print(f"进入网页上选中的会话「{title}」({name})")
-        else:
-            terms = term.list_sessions()
-            if not terms:
+        focus = _web_focus()
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            if not enter_choices(focus):
                 sys.exit("没有运行中的 cc 会话(网页上也没有选中会话)")
-            name = terms[0]["name"]
-            print(f"网页上没有选中会话,进入最近启动的 {name}")
+            r = pick_terminal(focus)
+            if r == "empty":
+                sys.exit("已没有运行中的 cc 会话")
+            if not r:
+                return
+        else:
+            rows = enter_choices(focus)
+            r = next((x for x in rows if x["focus"]), rows[0] if rows else None)
+            if not r:
+                sys.exit("没有运行中的 cc 会话(网页上也没有选中会话)")
+        name = r["name"]
+        if not name:
+            try:
+                name = continue_session(r["sid"])
+            except ValueError as e:
+                sys.exit(f"「{r['title']}」: {e}")
+        print(f"进入「{r['title']}」({name})")
     if not term.session_exists(name):
         sys.exit(f"没有名为 {name} 的会话,用 ccls 查看")
     sys.exit(term.attach(name))
@@ -1814,7 +1969,7 @@ def main():
     at = sub.add_parser("attach")
     at.add_argument("name")
     at.set_defaults(fn=lambda a: sys.exit(term.attach(a.name)))
-    en = sub.add_parser("enter", help="cca:进入网页上选中的会话(或指定名字的终端)")
+    en = sub.add_parser("enter", help="cca:选择要进入的会话(或直接进指定名字的终端)")
     en.add_argument("name", nargs="?")
     en.set_defaults(fn=cmd_enter)
     ls = sub.add_parser("list")
