@@ -858,7 +858,8 @@ function syncDock() {
   const t = tv.bySid.get(state.data.meta.id);
   if (t) {
     dock.classList.add('on');
-    $('#dock-status').innerHTML = `<span class="badge run">运行中</span> ${esc(t.name)} · ${t.clients} 个连接 · 点击终端后直接输入<span class="warn" id="input-wait"></span>`;
+    $('#dock-status').innerHTML = `<span class="badge run">${t.attach ? '后台会话' : '运行中'}</span> ${esc(t.name)} · ${t.clients} 个连接 · 点击终端后直接输入<span class="warn" id="input-wait"></span>`;
+    $('#dock-kill').textContent = t.attach ? '关闭终端' : '结束会话';
     inputStatus();
     if (tv.name !== t.name) attachTerm(t.name);
   } else {
@@ -866,7 +867,8 @@ function syncDock() {
     dock.classList.remove('on');
     // 服务器按 cc 登记的运行中进程判断(正在回答 QQ 消息的也认得出),不再看记录最近有没有写
     const owner = !state.data.pending && state.data.owner;
-    $('#dock-go').disabled = !!owner;
+    $('#dock-go').disabled = !!owner && !owner.job;  // cc 后台会话(fork 出的会话)可以接入
+    $('#dock-go').textContent = owner?.job ? '▶ 接入后台会话' : '▶ 在此继续对话';
     $('#dock-status').textContent = owner ? `在${owner.label}里运行中` : '未运行';
     if (owner) $('#dock-tip').textContent = owner.message;
     else $('#dock-tip').innerHTML = '将以 <code>--resume</code> 在后台启动(bypass 模式),底部出现与终端完全相同的输入框。';
@@ -1057,13 +1059,15 @@ $('#dock-go').addEventListener('click', async () => {
   const b = $('#dock-go');
   b.disabled = true; b.textContent = '启动中…';
   const r = await post(`/api/sessions/${state.data.meta.id}/continue`).catch(() => ({ error: '网络错误' }));
-  b.disabled = false; b.textContent = '▶ 在此继续对话';
+  b.disabled = false; syncDock();
   if (r.error) return alert(r.error);
   await loadTerms();
   setTimeout(() => tv.term?.focus(), 300);
 });
 $('#dock-kill').addEventListener('click', async () => {
-  if (!tv.name || !confirm(`结束 ${tv.name}?其中的 cc 会被关闭(对话记录保留,可随时"在此继续")。`)) return;
+  const t = tv.terms?.find(x => x.name === tv.name);
+  if (!tv.name || !confirm(t?.attach ? `关闭 ${tv.name}?只关掉这个接入终端,cc 后台会话照常运行。`
+    : `结束 ${tv.name}?其中的 cc 会被关闭(对话记录保留,可随时"在此继续")。`)) return;
   await post(`/api/terms/${tv.name}/kill`).catch(() => null);
   detachTerm();
   await loadSessions();

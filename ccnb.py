@@ -490,7 +490,9 @@ def live_processes():
             start = _proc_start(pid)
             if start is None or ("procStart" in rec and str(rec["procStart"]) != start):
                 continue
-            out.append({"pid": pid, "sid": sid, "cwd": rec.get("cwd"), "platform": "qq" if pid in qqbot.RUNNING else None})
+            # kind=bg:cc 的后台会话(agent 视图里 fork 出的会话也是),job 是 `claude attach` 用的 id
+            out.append({"pid": pid, "sid": sid, "cwd": rec.get("cwd"), "platform": "qq" if pid in qqbot.RUNNING else None,
+                        "job": rec.get("jobId") if rec.get("kind") == "bg" else None})
     _procs = (time.monotonic(), out)
     return out
 
@@ -509,7 +511,8 @@ def session_owner(path, terms=None):
     for pr in procs:
         q = find_session(pr["sid"])
         if pr["pid"] not in ours and (pr["sid"] == path.stem or (q and latest_continuation(q) == head)):
-            owner = {"pid": pr["pid"], "label": "QQ" if pr["platform"] else "别的终端", "platform": pr["platform"]}
+            owner = {"pid": pr["pid"], "label": "QQ" if pr["platform"] else "cc 后台" if pr["job"] else "别的终端",
+                     "platform": pr["platform"], "job": None if pr["platform"] else pr["job"]}
             return {**owner, "message": owner_message(owner)}
     return None
 
@@ -518,6 +521,9 @@ def owner_message(owner):
     who = f"pid {owner['pid']}" if owner.get("pid") else "不是用 cc 启动的"
     if owner.get("platform") == "qq":
         return f"cc 正在回答 QQ 发来的消息({who})。为避免两个进程同时写同一会话,等它回复完再从网页继续。"
+    if owner.get("job"):
+        return (f"这个会话在 cc 的后台进程里运行({who},agent 视图里 fork 出的会话都是这样)。"
+                f"点上面的按钮会在下方以 claude attach {owner['job']} 接入它,关掉终端后台会话照常运行。")
     return (f"这个会话正在别的终端里运行({who})。为避免两个进程同时写同一会话,"
             "请在原终端里继续,或先退出它再从网页继续。")
 
@@ -567,6 +573,9 @@ def link_terms(terms):
             t["sid"], t["source"] = sid, "title"
             continue
         _title_memo.pop(t["name"], None)
+        if t.get("attach"):  # 接入后台会话的终端:没有自己的登记和 hook,读不到标题时就是接入时的那个会话
+            t["sid"] = t["launch_sid"] if t["launch_sid"] and find_session(t["launch_sid"]) else None
+            continue
         # 2. cc 自己登记的这个进程的当前会话(窗格里的进程就是 cc);还没写出记录的新 id 先不用,走下面的推测
         rec = reg
         if rec and find_session(rec["sid"]) and cached_meta(find_session(rec["sid"]))["questions"]:
@@ -842,10 +851,13 @@ def continue_session(sid):
     if not p:
         raise ValueError("会话不存在")
     owner = session_owner(p, terms)
+    meta = cached_meta(p)
+    cwd = meta["cwd"] if meta["cwd"] and os.path.isdir(meta["cwd"]) else str(Path.home())
+    if owner and owner.get("job"):  # cc 后台会话:接入它,而不是另起一个进程写同一会话
+        return term.new_session(cwd, attach=owner["job"], sid=sid)
     if owner:
         raise ValueError(owner_message(owner))
-    meta = cached_meta(p)
-    return term.new_session(meta["cwd"] or str(Path.home()), ["--resume", sid])
+    return term.new_session(cwd, ["--resume", sid])
 
 
 # 每个会话最近几个版本里各轮的签名,用来算出"客户端手里的版本 → 当前版本"之间变了哪些轮

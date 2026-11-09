@@ -76,14 +76,16 @@ def list_sessions():
     """ccnb socket 上跑着 cc 的 tmux 会话。别的程序(比如在这里开着的 cc-connect)不算,
     否则网页会把它们当成 cc 终端,猜一个会话挂上去,底部的输入就打进了那个程序。"""
     r = tmux("list-sessions", "-F", "#{session_name}\t#{session_path}\t#{session_created}\t#{session_attached}"
-             "\t#{@ccnb_sid}\t#{pane_id}\t#{pane_pid}\t#{pane_start_command}")
+             "\t#{@ccnb_sid}\t#{@ccnb_attach}\t#{pane_id}\t#{pane_pid}\t#{pane_start_command}")
     out = []
     for line in r.stdout.splitlines():
-        name, path, created, attached, sid, pane, pid, cmd = (line.split("\t", 7) + [""] * 8)[:8]
-        if shlex.join(CC_CMD) not in cmd:
+        name, path, created, attached, sid, job, pane, pid, cmd = (line.split("\t", 8) + [""] * 9)[:9]
+        # attach:接入 cc 后台会话的终端(`claude attach <id>`),关掉它后台会话照常运行
+        if shlex.join(CC_CMD) not in cmd and not (job and shlex.join([CC_BIN, "attach", job]) in cmd):
             continue
         out.append({"name": name, "cwd": path, "created": int(created or 0), "clients": int(attached or 0),
-                    "launch_sid": sid or None, "pane": pane.lstrip("%"), "pid": int(pid) if pid.isdigit() else None})
+                    "launch_sid": sid or None, "attach": job or None,
+                    "pane": pane.lstrip("%"), "pid": int(pid) if pid.isdigit() else None})
     return sorted(out, key=lambda s: -s["created"])
 
 
@@ -129,7 +131,9 @@ def plan_session_id(args, latest_sid=None):
     return ["--session-id", sid, *args], sid
 
 
-def new_session(cwd, cc_args=(), cols=200, rows=50, latest_sid=None):
+def new_session(cwd, cc_args=(), cols=200, rows=50, latest_sid=None, attach=None, sid=None):
+    """新开一个 tmux 终端运行 cc。attach=<后台会话 id>:改为运行 `claude attach <id>` 接入 cc 后台会话
+    (agent 视图里 fork 出的会话都在 cc 的后台进程里跑,不能再 --resume),sid 是它的会话 ID。"""
     cwd = str(Path(cwd).expanduser().resolve())
     if not os.path.isdir(cwd):
         raise ValueError(f"目录不存在: {cwd}")
@@ -142,16 +146,21 @@ def new_session(cwd, cc_args=(), cols=200, rows=50, latest_sid=None):
     for k, v in os.environ.items():
         if k not in ENV_SKIP and k not in CC_RUNTIME_ENV and "\n" not in v:
             envs += ["-e", f"{k}={v}"]
-    cc_args, sid = plan_session_id(cc_args, latest_sid)
     # tmux 服务器的全局环境可能带着这些变量,用 env -u 在 pane 里显式清掉
     unset = [x for k in CC_RUNTIME_ENV for x in ("-u", k)]
-    hook = ["--settings", HOOK_SETTINGS] if CC_CMD[0] == CC_BIN else []
-    cmd = shlex.join(["env", *unset, *CC_CMD, *hook, *cc_args])
+    if attach:
+        cmd = shlex.join(["env", *unset, CC_BIN, "attach", attach])
+    else:
+        cc_args, sid = plan_session_id(cc_args, latest_sid)
+        hook = ["--settings", HOOK_SETTINGS] if CC_CMD[0] == CC_BIN else []
+        cmd = shlex.join(["env", *unset, *CC_CMD, *hook, *cc_args])
     r = tmux("new-session", "-d", "-s", name, "-c", cwd, "-x", str(cols), "-y", str(rows), *envs, cmd)
     if r.returncode:
         raise RuntimeError(r.stderr.strip() or "tmux new-session 失败")
     if sid:
         tmux("set-option", "-t", f"={name}:", "@ccnb_sid", sid)
+    if attach:
+        tmux("set-option", "-t", f"={name}:", "@ccnb_attach", attach)
     return name
 
 
