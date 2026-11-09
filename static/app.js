@@ -506,7 +506,11 @@ function renderHead() {
 function renderSession() {
   const { turns, note } = state.data;
   // 已在看原始问答时重画(勾选过程文字、整理版更新…):记住正在看的那一轮,重画后放回原处
-  const keep = state.jump == null && $('#article .turn[id^="t"]') ? readingTurn() : null;
+  // 只认同一个会话:切换会话时正文里还是上一个会话的轮次,滚动又刚清零,读出来的会是它的第 1 轮,
+  // 新会话就会被定位到开头,而不是最新一问
+  const same = $('#article').dataset.sid === state.data.meta.id;
+  const keep = same && state.jump == null && $('#article .turn[id^="t"]') ? readingTurn() : null;
+  $('#article').dataset.sid = state.data.meta.id;
   renderHead();
   const tab = note ? state.tab : 'raw';
   document.querySelectorAll('#tabs [data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
