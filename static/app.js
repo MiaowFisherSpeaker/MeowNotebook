@@ -2,9 +2,11 @@
 const $ = (s, el = document) => el.querySelector(s);
 const state = {
   sessions: [], sid: null, data: null, version: null, jump: null, stars: [], starKeys: new Set(),
-  tab: localGet('tab', 'note'), collapsed: new Set(JSON.parse(localGet('collapsed', '[]'))),
+  tab: localGet('tab', 'note'), eco: localGet('eco', '1') === '1', collapsed: new Set(JSON.parse(localGet('collapsed', '[]'))),
 };
 
+// 节能模式(默认开):光标不闪、后台标签页断开终端数据流、降低刷新频率。看不出区别的优化不受它控制,始终开着
+const eco = () => state.eco;
 function localGet(k, d) { try { return localStorage.getItem('ccnb.' + k) ?? d; } catch { return d; } }
 function localSet(k, v) { try { localStorage.setItem('ccnb.' + k, v); } catch {} }
 function esc(s) { return (s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
@@ -302,6 +304,10 @@ $('#main').addEventListener('scroll', () => { cmenu.hidden = true; });
 async function loadSessions() {
   const r = await api('/api/sessions').catch(() => null);
   if (!r) return;
+  // 每 5~15 秒刷新一次,数据没变就不重建整个侧栏(几百个会话的 DOM)
+  const key = JSON.stringify([r.sessions, r.terms, r.qq]);
+  if (key === state.listKey) return;
+  state.listKey = key;
   state.sessions = r.sessions;
   renderQQ(r.qq || {});
   onTerms(r.terms);
@@ -492,11 +498,11 @@ function renderHead() {
   fs.lastCwd = meta.cwd;
   $('#title').textContent = meta.title;
   document.title = meta.title + ' · MeowNotebook';
-  $('#sub').innerHTML = [
+  setHTML($('#sub'), [
     active ? '<span><span class="dot live"></span> 记录更新中 · 自动刷新</span>' : '',
     `<span>${esc(meta.cwd || '')}</span>`, `<span>${fmtTime(meta.started)} → ${fmtTime(meta.updated)}</span>`,
     `<span>${meta.questions} 问</span>`, `<span><code>${meta.id}</code></span>`,
-  ].join('');
+  ].join(''));
   const noteBtn = $('#tabs [data-tab=note]');
   noteBtn.disabled = !note;
   renderSendNote();
@@ -567,7 +573,8 @@ function patchSession(redraw, oldCount) {
     }
     markArticle(el);
   }
-  renderMap(mapItems(turns));
+  const items = mapItems(turns);
+  if (mapKey(items) !== qmap.key) renderMap(items);  // 只是回答在变时问题地图不用重画
   syncDock();
 }
 const mapItems = turns => turns.filter(t => t.kind === 'question')
@@ -678,7 +685,9 @@ function flushFill() { while (fill.job) { clearTimeout(fill.job.timer); fillStep
 // 平时横条一样长,指针移上去才按问题长短展开,并浮出附近几问的文字
 const MAP_MAX = 15;
 const qmap = { items: [], els: [], start: 0, cur: 0, hover: false, hideT: null };
+const mapKey = items => items.map(it => it.id + ':' + it.len).join();
 function renderMap(items) {
+  qmap.key = mapKey(items);
   qmap.items = items;
   qmap.els = items.map(() => null);
   qmap.start = Math.max(0, items.length - MAP_MAX);
@@ -705,13 +714,20 @@ function shiftMap(d) {
 function mapTarget(i) {
   return qmap.els[i] ||= document.getElementById(qmap.items[i].id);
 }
+// 值没变就不写:#main 上的 CSS 变量会被正文所有元素继承,改一次就要重算整页样式
+function setVar(el, k, v) { if (el.style.getPropertyValue(k) !== v) el.style.setProperty(k, v); }
+// 内容没变就不重写;别处直接改过 innerHTML 时(文件 / 收藏页)第一个子节点会变,照常重写
+function setHTML(el, h) {
+  if (el._h === h && el.firstChild === el._first) return;
+  el.innerHTML = h; el._h = h; el._first = el.firstChild;
+}
 function layoutMap() {
   const toc = $('#toc');
   const top = ($('#top')?.offsetHeight || 80) + 8;
-  $('#main').style.setProperty('--top-h', (top - 8) + 'px');
+  setVar($('#main'), '--top-h', (top - 8) + 'px');
   const dockH = $('#view').classList.contains('file') || $('#view').classList.contains('stars') || dockAside() ? 0 : dock.offsetHeight;
-  toc.style.setProperty('--toc-top', top + 'px');
-  toc.style.setProperty('--toc-h', Math.max(160, window.innerHeight - top - dockH - 8) + 'px');
+  setVar(toc, '--toc-top', top + 'px');
+  setVar(toc, '--toc-h', Math.max(160, window.innerHeight - top - dockH - 8) + 'px');
 }
 function spy() {
   if (!qmap.items.length) return;
@@ -891,7 +907,7 @@ function detachTerm() {
   tv.ro?.disconnect();
   tv.term?.dispose();
   $('#termbox').querySelectorAll('.xterm').forEach(x => x.remove());
-  Object.assign(tv, { name: null, term: null, ws: null, ro: null, unacked: [] });
+  Object.assign(tv, { name: null, term: null, ws: null, ro: null, unacked: [], paused: false });
 }
 
 // 先等内置等宽字体加载完再建终端,否则 xterm 会按后备字体测量字宽,导致字间距错乱
@@ -904,7 +920,8 @@ async function attachTerm(name) {
   if (tv.name !== name || tv.term) return;
   tv.term = new Terminal({
     fontFamily: '"CCNB Mono", Menlo, Consolas, "DejaVu Sans Mono", "Noto Sans Mono CJK SC", "Sarasa Mono SC", monospace',
-    fontSize: 14, cursorBlink: true, allowProposedApi: true, scrollback: 1000, theme: { background: '#1e1e1e' },
+    // 光标闪烁是无限循环的 CSS 动画,终端有焦点时浏览器每帧都要处理,节能模式下关掉
+    fontSize: 14, cursorBlink: !eco(), allowProposedApi: true, scrollback: 1000, theme: { background: '#1e1e1e' },
   });
   tv.fit = new FitAddon.FitAddon();
   tv.term.loadAddon(tv.fit);
@@ -996,6 +1013,22 @@ function connectTerm() {
     tv.retry = setTimeout(connectTerm, 2000);
   };
 }
+
+// 节能模式:标签页在后台超过 20 秒就断开终端的数据流(cc 干活时每秒都在重画界面),切回来再连,tmux 会重画整屏
+let termPauseT = null;
+document.addEventListener('visibilitychange', () => {
+  clearTimeout(termPauseT);
+  if (document.hidden) {
+    if (!eco()) return;
+    termPauseT = setTimeout(() => {
+      if (!document.hidden || !tv.ws || tv.unacked.length) return;
+      clearTimeout(tv.retry); retireWS(tv.ws); tv.ws = null; tv.paused = true;
+    }, 20000);
+  } else if (tv.paused) {
+    tv.paused = false;
+    if (tv.name && tv.term) connectTerm();
+  }
+});
 
 // 输入迟迟没有确认:连接多半已经死了(浏览器要很久才发现),换一条;断开太久的输入不再补发,明确告诉用户
 setInterval(() => {
@@ -1441,10 +1474,10 @@ window.addEventListener('focus', reportFocus);
 // 服务器推送变化(SSE):记录、整理版或终端变了才取数据。推送连着时不再每 3 秒轮询;
 // 断开时(网络差、代理不支持)EventSource 自己重连,其间退回轮询。会话列表 / 当前会话另有 15 秒的兜底刷新。
 const live = { ok: false, es: null, last: 0, listT: 0, listTimer: null };
-function refreshList() {  // 记录在写时每秒都有变化,列表最多 5 秒刷新一次
+function refreshList() {  // 记录在写时每秒都有变化,列表最多 5 秒(节能模式 15 秒)刷新一次
   if (live.listTimer) return;
   live.listTimer = setTimeout(() => { live.listTimer = null; live.listT = Date.now(); loadSessions(); },
-    Math.max(0, 5000 - (Date.now() - live.listT)));
+    Math.max(0, (eco() ? 15000 : 5000) - (Date.now() - live.listT)));
 }
 function onChanged(ids) {
   if (document.hidden) { live.missed = true; return; }
@@ -1478,9 +1511,28 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden || !live.missed) return;
   live.missed = false; loadSession(false, true); loadSessions();
 });
-setInterval(() => { if (!document.hidden && !live.ok && (state.data?.active || tv.name)) loadSession(false, true); }, 3000);
-setInterval(() => { if (!document.hidden && !live.ok) loadTerms(); }, 3000);
-setInterval(() => { if (!document.hidden) { loadSessions(); if (state.data && (live.ok || !state.data.active)) loadSession(false, true); } }, 15000);
+// 推送断开时的轮询:3 秒(节能模式 6 秒);兜底的全量刷新:15 秒(节能模式 60 秒)
+const tick = { n: 0, full: Date.now() };
+setInterval(() => {
+  if (document.hidden || (eco() && ++tick.n % 2)) return;
+  if (!live.ok && (state.data?.active || tv.name)) loadSession(false, true);
+  if (!live.ok) loadTerms();
+}, 3000);
+setInterval(() => {
+  if (document.hidden || Date.now() - tick.full < (eco() ? 60000 : 15000) - 1000) return;
+  tick.full = Date.now();
+  loadSessions(); if (state.data && (live.ok || !state.data.active)) loadSession(false, true);
+}, 5000);
+function setEco(on) {
+  state.eco = on; localSet('eco', on ? '1' : '0');
+  const b = $('#eco');
+  b.classList.toggle('on', on);
+  b.title = on ? '节能模式已开:光标不闪,后台标签页 20 秒后断开终端(切回自动重连),降低刷新频率。点击关闭'
+    : '节能模式已关:实时刷新,光标闪烁,后台也保持终端连接。点击开启';
+  if (tv.term) tv.term.options.cursorBlink = !on;
+}
+$('#eco').addEventListener('click', () => { setEco(!state.eco); toast(state.eco ? '节能模式已开' : '节能模式已关'); });
+setEco(state.eco);
 connectLive();
 setSide(localGet('side-tab', 'sessions'));
 Promise.all([loadSessions(), loadStars()]).then(() => { route(); reportFocus(); });

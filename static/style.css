@@ -197,6 +197,8 @@ mark { background: color-mix(in srgb, var(--accent) 30%, transparent); color: in
 .brand-r { display: flex; align-items: center; gap: 8px; font-weight: 400; }
 #qq-status { font-size: 12px; color: var(--muted); display: inline-flex; align-items: center; gap: 4px; cursor: default; }
 #qq-status[hidden] { display: none; }
+#eco { font-size: 11.5px; padding: 0 7px; line-height: 20px; color: var(--muted); }
+#eco.on { color: var(--live); border-color: var(--live); }
 #qq-status .dot.off { background: #c0392b; }
 #qq-pending { margin: 0 12px 8px; padding: 6px 10px; font-size: 12.5px; line-height: 1.5; border: 1px solid var(--accent);
   border-radius: 8px; background: var(--accent-soft); }
