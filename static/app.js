@@ -312,6 +312,7 @@ async function loadSessions() {
   renderQQ(r.qq || {});
   onTerms(r.terms);
   renderSessions();
+  renderTabbar();
   if (state.data) renderSendNote();
 }
 
@@ -448,6 +449,155 @@ $('#search-mode').addEventListener('change', () => {
 $('#search-mode').value = localGet('search-mode', 'title');
 $('#search').placeholder = PH[searchMode()];
 
+// ---------- 顶部标签栏 ----------
+// 打开过的会话排在顶部,像浏览器标签一样切换。切走时把正文 DOM(已排好的 Markdown / 公式 / 展开状态)
+// 连同数据、滚动位置原样收起来,切回来直接放回去,再按版本号取增量;没打开过的不渲染。
+// 只缓存最近 CACHE_MAX 个的 DOM,更早的标签切回去时照常重新加载。
+const TAB_MAX = 20, CACHE_MAX = 6;
+const tabset = { list: [], cache: new Map(), drag: null };
+try { tabset.list = JSON.parse(localGet('tabs', '[]')).filter(t => t?.id); } catch {}
+const saveTabs = () => localSet('tabs', JSON.stringify(tabset.list.map(({ id, title }) => ({ id, title }))));
+const tabIdx = id => tabset.list.findIndex(t => t.id === id);
+
+function openTab(sid) {
+  let t = tabset.list[tabIdx(sid)];
+  if (!t) {
+    tabset.list.push(t = { id: sid, title: state.sessions.find(s => s.id === sid)?.title || sid.slice(0, 8) });
+    while (tabset.list.length > TAB_MAX) {  // 太多了:关掉最久没看的那个
+      const old = tabset.list.filter(x => x.id !== sid).sort((a, b) => (a.used || 0) - (b.used || 0))[0];
+      tabset.list.splice(tabIdx(old.id), 1); tabset.cache.delete(old.id);
+    }
+    saveTabs();
+  }
+  t.used = Date.now();
+  renderTabbar();
+}
+function closeTab(id) {
+  const i = tabIdx(id);
+  if (i < 0) return;
+  tabset.list.splice(i, 1); tabset.cache.delete(id); saveTabs();
+  if (id === state.sid) {  // 关掉的是当前标签:去右边那个,没有就左边那个
+    const n = tabset.list[i] || tabset.list[i - 1];
+    location.hash = n ? '#/s/' + n.id : '#';
+  }
+  renderTabbar();
+}
+// 同一个标签换了会话(cc 换了新 id / 底部终端里 /clear)
+function renameTab(from, to) {
+  const i = tabIdx(from);
+  if (i < 0 || from === to) return;
+  tabset.cache.delete(from);
+  if (tabIdx(to) >= 0) tabset.list.splice(i, 1); else tabset.list[i].id = to;
+  saveTabs();
+}
+function renderTabbar() {
+  const bar = $('#tabbar'), info = new Map(state.sessions.map(s => [s.id, s]));
+  let dirty = false;
+  bar.hidden = !tabset.list.length;
+  setHTML(bar, tabset.list.map(t => {
+    const s = info.get(t.id);
+    if (s?.title && s.title !== t.title) { t.title = s.title; dirty = true; }
+    return `<a class="tb${t.id === state.sid ? ' on' : ''}" href="#/s/${t.id}" data-sid="${t.id}" draggable="true" title="${esc(t.title)}">` +
+      `${s?.running || s?.active ? '<span class="dot live"></span>' : ''}<span class="tt">${esc(t.title)}</span>` +
+      `<button class="tx" data-close="${t.id}" title="关闭标签(也可以中键点标签)">×</button></a>`;
+  }).join(''));
+  if (dirty) saveTabs();
+  const on = bar.querySelector('.tb.on');  // 当前标签滚进可见范围(不用 scrollIntoView,免得带着页面一起滚)
+  if (on) {
+    const l = on.offsetLeft, r = l + on.offsetWidth;
+    if (l < bar.scrollLeft) bar.scrollLeft = l - 12;
+    else if (r > bar.scrollLeft + bar.clientWidth) bar.scrollLeft = r - bar.clientWidth + 12;
+  }
+  requestAnimationFrame(layoutMap);
+}
+{
+  const bar = $('#tabbar');
+  bar.addEventListener('click', e => {
+    const x = e.target.closest('[data-close]');
+    if (x) { e.preventDefault(); e.stopPropagation(); closeTab(x.dataset.close); }
+  });
+  bar.addEventListener('mousedown', e => { if (e.button === 1) e.preventDefault(); });  // 中键:不进入自动滚动
+  bar.addEventListener('auxclick', e => {
+    const a = e.target.closest('.tb');
+    if (a && e.button === 1) { e.preventDefault(); closeTab(a.dataset.sid); }
+  });
+  bar.addEventListener('wheel', e => {  // 竖着滚轮也能横向翻标签
+    if (bar.scrollWidth <= bar.clientWidth || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
+    e.preventDefault(); bar.scrollLeft += e.deltaY;
+  }, { passive: false });
+  // 拖动排序:拖的过程中只挪 DOM 节点(重画会把正被拖的元素删掉,dragend 就收不到了),松手后按 DOM 顺序存
+  bar.addEventListener('dragstart', e => {
+    const a = e.target.closest('.tb'); if (!a) return;
+    tabset.drag = a; a.classList.add('drag'); e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', location.origin + location.pathname + a.getAttribute('href'));
+  });
+  bar.addEventListener('dragover', e => {
+    const src = tabset.drag; if (!src) return;
+    e.preventDefault();
+    const a = e.target.closest('.tb');
+    if (!a || a === src) return;
+    const r = a.getBoundingClientRect();
+    e.clientX > r.left + r.width / 2 ? a.after(src) : a.before(src);
+  });
+  bar.addEventListener('drop', e => { if (tabset.drag) e.preventDefault(); });
+  bar.addEventListener('dragend', () => {
+    const src = tabset.drag; if (!src) return;
+    src.classList.remove('drag'); tabset.drag = null;
+    const order = [...bar.querySelectorAll('.tb')].map(a => a.dataset.sid);
+    tabset.list.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
+    saveTabs(); bar._h = null; renderTabbar();
+  });
+}
+
+// 当前显示的是哪个标签页(整理版 / 原始问答)、哪些显示选项:放回去时选项变了就得重画
+const shownTab = () => state.data?.note ? state.tab : 'raw';
+const viewKey = tab => (tab === 'raw' ? [$('#show-process').checked, $('#show-misc').checked] : []).concat(searchWords()).join('\0');
+
+// 切走前:把当前会话的正文收进缓存
+function stash() {
+  const sid = state.sid, art = $('#article');
+  if (!sid || !state.data || state.data.meta.id !== sid || art.dataset.sid !== sid || tabIdx(sid) < 0
+    || $('#view').hidden || $('#view').matches('.file, .stars')) return;
+  if (fill.job) clearTimeout(fill.job.timer);
+  const tab = shownTab();
+  const c = { data: state.data, version: state.version, tab, key: viewKey(tab), scroll: $('#main').scrollTop,
+    reading: readingTurn(), fill: fill.job, map: qmap.items, nodes: document.createDocumentFragment() };
+  c.nodes.append(...art.childNodes);
+  fill.job = null; art.dataset.sid = '';
+  tabset.cache.delete(sid); tabset.cache.set(sid, c);  // Map 按插入顺序:最前面的是最久没看的
+  while (tabset.cache.size > CACHE_MAX) tabset.cache.delete(tabset.cache.keys().next().value);
+}
+// 切回来:原样放回,回到上次看的位置;之后由 loadSession 取增量
+function restore(c) {
+  const sid = state.sid;
+  tabset.cache.delete(sid);
+  state.data = c.data; state.version = c.version; state.tab = state.jump ? 'raw' : c.tab;
+  const art = $('#article');
+  renderHead();
+  art.replaceChildren(c.nodes); art.dataset.sid = state.sid;
+  const main = $('#main');
+  main.scrollTop = c.scroll;
+  // 按上次读到的那一轮对齐(正文宽度可能变了:终端在 / 不在右侧)。节点离开过页面,content-visibility 记住的高度没了,
+  // 放回时每轮先按估计的 600px 排,视口附近的几轮下一帧才换成真实高度,所以等它们排好再对一次(期间用户滚了就不动)
+  const align = () => {
+    const t = c.reading && document.getElementById('t' + c.reading.n);
+    const d = t ? t.getBoundingClientRect().top - readLine() - c.reading.off : 0;
+    if (Math.abs(d) >= 1) { anchor.mute = Date.now() + 200; main.scrollTop += d; }
+    return main.scrollTop;
+  };
+  let at = align();
+  const again = () => { if (state.sid === sid && main.scrollTop === at) at = align(); };
+  requestAnimationFrame(() => { again(); setTimeout(again, 60); });
+  if (shownTab() !== c.tab || viewKey(c.tab) !== c.key) renderSession();
+  else {
+    tabBtns(c.tab);
+    renderMap(c.map);
+    if (c.fill) { fill.job = c.fill; c.fill.timer = setTimeout(fillStep, 0); }
+    syncDock();
+  }
+  if (state.jump) { if (!document.getElementById('t' + state.jump)) flushFill(); jumpToTurn(); }
+}
+
 // ---------- 单个会话 ----------
 // 网络差时请求会重叠、乱序返回:晚到的旧回复若合并到新数据上,刚出现的轮次会消失、增量对不上。
 // 所以每个请求编号,只应用比已应用的更新的回复;增量回复的基础版本不是手里的版本就重新要。
@@ -467,7 +617,7 @@ async function loadSession(force = false, poll = false) {
   if (r.unchanged) return;
   if (r.delta && v !== (state.version || '')) return loadSession();
   // 这个会话已在新会话里继续(从 agent 视图重新进入时 cc 会换新 id)→ 跳到最新的那个
-  if (r.moved) { location.replace('#/s/' + r.moved + (state.jump ? '/' + state.jump : '')); return; }
+  if (r.moved) { renameTab(sid, r.moved); location.replace('#/s/' + r.moved + (state.jump ? '/' + state.jump : '')); return; }
   if (r.error) { $('#article').innerHTML = `<div class="hint">${esc(r.error)}</div>`; return; }
   const atBottom = $('#main').scrollTop + $('#main').clientHeight > $('#main').scrollHeight - 80;
   const first = !state.data || state.data.meta.id !== r.meta.id;
@@ -498,6 +648,8 @@ function renderHead() {
   fs.lastCwd = meta.cwd;
   $('#title').textContent = meta.title;
   document.title = meta.title + ' · MeowNotebook';
+  const tab = tabset.list[tabIdx(meta.id)];
+  if (tab && meta.title && tab.title !== meta.title) { tab.title = meta.title; saveTabs(); renderTabbar(); }
   setHTML($('#sub'), [
     active ? '<span><span class="dot live"></span> 记录更新中 · 自动刷新</span>' : '',
     `<span>${esc(meta.cwd || '')}</span>`, `<span>${fmtTime(meta.started)} → ${fmtTime(meta.updated)}</span>`,
@@ -519,8 +671,7 @@ function renderSession() {
   $('#article').dataset.sid = state.data.meta.id;
   renderHead();
   const tab = note ? state.tab : 'raw';
-  document.querySelectorAll('#tabs [data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
-  $('#show-process').parentElement.hidden = $('#show-misc').parentElement.hidden = tab !== 'raw';
+  tabBtns(tab);
   if (state.data.pending) {
     $('#article').innerHTML = '<div class="hint">新会话,还没有提问。<br>在下方的输入框里开始对话,问答会实时显示在这里。</div>';
     $('#toc').innerHTML = '';
@@ -535,6 +686,11 @@ function renderSession() {
   }
   markArticle();
   syncDock();
+}
+
+function tabBtns(tab) {
+  document.querySelectorAll('#tabs [data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
+  $('#show-process').parentElement.hidden = $('#show-misc').parentElement.hidden = tab !== 'raw';
 }
 
 // 阅读线(吸顶标题栏下沿)所在的那一轮和它相对阅读线的位置
@@ -862,7 +1018,7 @@ function onTerms(terms) {
   // 底部终端里 /clear 开了新会话 → 页面跟过去
   if (tv.name && state.sid) {
     const t = terms.find(t => t.name === tv.name);
-    if (t?.sid && t.sid !== state.sid) location.replace('#/s/' + t.sid);
+    if (t?.sid && t.sid !== state.sid) { renameTab(state.sid, t.sid); location.replace('#/s/' + t.sid); }
   }
   syncDock();
 }
@@ -1493,23 +1649,26 @@ function route() {
   if (f) {
     let path;
     try { path = decodeURIComponent(f[1]); } catch { location.replace('#'); return; }
-    openFile(path, f[2] ? +f[2] : null); return;
+    stash(); openFile(path, f[2] ? +f[2] : null); renderTabbar(); return;
   }
   if (location.hash === '#/stars') {
-    state.sid = null; state.data = null; renderSessions(); loadStars().then(renderStars); return;
+    stash(); state.sid = null; state.data = null; renderSessions(); renderTabbar(); loadStars().then(renderStars); return;
   }
   const sm = location.hash.match(/^#\/summary(?:\/([\w-]+))?$/);
-  if (sm) { state.sid = null; state.data = null; renderSessions(); openSummary(sm[1] || null); return; }
+  if (sm) { stash(); state.sid = null; state.data = null; renderSessions(); renderTabbar(); openSummary(sm[1] || null); return; }
   const m = location.hash.match(/^#\/s\/([\w-]+)(?:\/(\d+))?/);
   const sid = m ? m[1] : null;
   if (m?.[2]) state.jump = +m[2];
   if (sid && sid === state.sid && state.data && state.jump) { state.tab = 'raw'; renderSession(); jumpToTurn(); return; }
   if (sid === state.sid && (sid || !$('#empty').hidden) && !$('#view').classList.contains('file')) return;
+  stash();
   state.sid = sid; state.data = null; state.version = null;
   if (!sid) { $('#view').hidden = true; $('#empty').hidden = false; detachTerm(); }
-  $('#main').scrollTop = 0;
+  const c = sid && tabset.cache.get(sid);
+  if (sid) openTab(sid); else renderTabbar();
   renderSessions();
-  loadSession(true);
+  if (c) { restore(c); loadSession(false); }  // 缓存过:原样放回,只取增量
+  else { $('#main').scrollTop = 0; loadSession(true); }
 }
 window.addEventListener('hashchange', () => { route(); reportFocus(); });
 
