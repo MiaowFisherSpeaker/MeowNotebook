@@ -1063,7 +1063,7 @@ function detachTerm() {
   tv.ro?.disconnect();
   tv.term?.dispose();
   $('#termbox').querySelectorAll('.xterm').forEach(x => x.remove());
-  Object.assign(tv, { name: null, term: null, ws: null, ro: null, unacked: [], paused: false });
+  Object.assign(tv, { name: null, term: null, ws: null, ro: null, unacked: [], paused: false, gl: null });
 }
 
 // 先等内置等宽字体加载完再建终端,否则 xterm 会按后备字体测量字宽,导致字间距错乱
@@ -1082,6 +1082,7 @@ async function attachTerm(name) {
   tv.fit = new FitAddon.FitAddon();
   tv.term.loadAddon(tv.fit);
   tv.term.open($('#termbox'));
+  setRenderer();
   Object.assign(tv, { cid: crypto.randomUUID?.() || String(Math.random()).slice(2) + Date.now(), seq: 0, unacked: [] });
   // 输入法开着时(哪怕切在英文),按键的 keyCode 是 229,xterm 会改用"按键前后比对 textarea 内容"来猜输入了什么:
   // 打字快时比对错位,会丢字,回车清空 textarea 时还会多发一个退格。所以 229 的按键不交给 xterm 比对。
@@ -1732,13 +1733,27 @@ setInterval(() => {
   tick.full = Date.now();
   loadSessions(); if (state.data && (live.ok || !state.data.active)) loadSession(false, true);
 }, 5000);
+// 节能模式下终端用 WebGL 渲染(GPU 拼贴字形,cc 干活时主线程几乎不忙);关闭节能就用 xterm 默认的 DOM 渲染。
+// 浏览器不支持、或 WebGL 上下文丢失(如电脑休眠后)时自动退回 DOM
+function setRenderer() {
+  if (!tv.term) return;
+  const want = eco() && window.WebglAddon;
+  if (want && !tv.gl) {
+    try {
+      const gl = new WebglAddon.WebglAddon();
+      gl.onContextLoss(() => { gl.dispose(); if (tv.gl === gl) tv.gl = null; });
+      tv.term.loadAddon(gl);
+      tv.gl = gl;
+    } catch { tv.gl = null; }
+  } else if (!want && tv.gl) { tv.gl.dispose(); tv.gl = null; }
+}
 function setEco(on) {
   state.eco = on; localSet('eco', on ? '1' : '0');
   const b = $('#eco');
   b.classList.toggle('on', on);
   b.title = on ? '节能模式已开:光标不闪,后台标签页 20 秒后断开终端(切回自动重连),降低刷新频率。点击关闭'
     : '节能模式已关:实时刷新,光标闪烁,后台也保持终端连接。点击开启';
-  if (tv.term) tv.term.options.cursorBlink = !on;
+  if (tv.term) { tv.term.options.cursorBlink = !on; setRenderer(); }
 }
 $('#eco').addEventListener('click', () => { setEco(!state.eco); toast(state.eco ? '节能模式已开' : '节能模式已关'); });
 setEco(state.eco);
