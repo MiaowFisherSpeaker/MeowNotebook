@@ -333,3 +333,15 @@ a.fpath:hover { color: var(--accent); }
 .sum-pick { display: flex; align-items: center; gap: 8px; padding: 3px 4px; cursor: pointer; }
 .sum-pick .topic { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sum-pick .st { flex: none; font-size: 11.5px; color: var(--muted); }
+
+/* 图片查看层:盖在页面上,下面的会话原样保留 */
+#imgview { position: fixed; inset: 0; z-index: 900; display: flex; flex-direction: column; background: rgba(0,0,0,.86); }
+#imgview[hidden] { display: none; }
+body.iv-open { overflow: hidden; }
+.iv-bar { display: flex; align-items: center; gap: 8px; padding: 10px 16px; color: #ddd; font-size: 13px; }
+.iv-bar .sp { flex: 1; }
+#iv-stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; gap: 8px; padding: 0 8px 16px; }
+#iv-img { max-width: 100%; max-height: calc(100vh - 80px); max-height: calc(100dvh - 80px); min-width: 0; object-fit: contain; border-radius: 6px; background: #fff; }
+#iv-prev, #iv-next { flex: none; font-size: 28px; line-height: 1; padding: 6px 12px; background: rgba(255,255,255,.12);
+  border-color: transparent; color: #fff; }
+#iv-prev[hidden], #iv-next[hidden] { visibility: hidden; display: block; }

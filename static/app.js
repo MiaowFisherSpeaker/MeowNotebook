@@ -66,7 +66,7 @@ function localImgs(html) {
 }
 
 function imgGrid(sid, ids) {
-  return `<div class="imgs">${ids.map(k => `<a href="/api/image/${sid}/${k}" target="_blank" title="点击查看原图"><img loading="lazy" src="/api/image/${sid}/${k}" alt="图片 ${k + 1}"></a>`).join('')}</div>`;
+  return `<div class="imgs">${ids.map(k => `<a href="#/i/${sid}/${k}" title="点击查看大图"><img loading="lazy" src="/api/image/${sid}/${k}" alt="图片 ${k + 1}"></a>`).join('')}</div>`;
 }
 
 const unesc = t => t.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
@@ -1432,7 +1432,57 @@ function initSide() {
 narrow.addEventListener?.('change', initSide);
 initSide();
 
+// ---------- 图片查看:盖在当前页面上,有自己的网址 #/i/<会话>/<编号>,返回就回到原来的位置 ----------
+const imgv = { open: false, under: null, fromApp: false, sid: null, k: null };
+let curHash = null;  // 最近一次路由到的非图片网址:图片层下面那一页
+function sessionImages(sid) {
+  if (state.data?.meta.id !== sid) return [];
+  return [...new Set(state.data.turns.flatMap(t => [...(t.q_images || []), ...(t.images || [])]))].sort((a, b) => a - b);
+}
+function showImage(sid, k) {
+  if (!imgv.open) { imgv.under = curHash; imgv.fromApp = curHash !== null; }
+  Object.assign(imgv, { open: true, sid, k });
+  const src = `/api/image/${sid}/${k}`, list = sessionImages(sid), i = list.indexOf(k);
+  $('#iv-img').src = src;
+  $('#iv-raw').href = src; $('#iv-dl').href = src;
+  $('#iv-n').textContent = i >= 0 ? `${i + 1} / ${list.length}` : '';
+  $('#iv-prev').hidden = !(i > 0); $('#iv-next').hidden = !(i >= 0 && i < list.length - 1);
+  $('#imgview').hidden = false;
+  document.body.classList.add('iv-open');
+}
+function hideImage() {
+  imgv.open = false;
+  $('#imgview').hidden = true; $('#iv-img').removeAttribute('src');
+  document.body.classList.remove('iv-open');
+}
+function closeImage() {  // 从页面里点开的:浏览器返回;直接打开的图片链接:回到它所在的会话
+  if (imgv.fromApp) history.back(); else location.replace('#/s/' + imgv.sid);
+}
+function stepImage(d) {
+  const list = sessionImages(imgv.sid), i = list.indexOf(imgv.k);
+  if (i >= 0 && list[i + d] != null) location.replace(`#/i/${imgv.sid}/${list[i + d]}`);
+}
+$('#iv-close').addEventListener('click', closeImage);
+$('#iv-prev').addEventListener('click', () => stepImage(-1));
+$('#iv-next').addEventListener('click', () => stepImage(1));
+$('#imgview').addEventListener('click', e => { if (e.target.id === 'imgview' || e.target.id === 'iv-stage') closeImage(); });
+document.addEventListener('keydown', e => {
+  if (!imgv.open) return;
+  if (e.key === 'Escape') closeImage();
+  else if (e.key === 'ArrowLeft') stepImage(-1);
+  else if (e.key === 'ArrowRight') stepImage(1);
+  else return;
+  e.preventDefault(); e.stopPropagation();
+}, true);
+
 function route() {
+  const im = location.hash.match(/^#\/i\/([\w-]+)\/(\d+)$/);
+  if (im) { showImage(im[1], +im[2]); return; }  // 下面那一页原样保留
+  if (imgv.open) {
+    hideImage();
+    if (location.hash === imgv.under) return;  // 关掉图片回到原页:不重新加载,阅读位置不变
+  }
+  curHash = location.hash;
   const t = location.hash.match(/^#\/t\/([\w-]+)/);  // 旧链接:终端名 → 对应会话
   if (t) {
     const term = tv.terms.find(x => x.name === t[1]);
