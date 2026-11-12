@@ -721,6 +721,9 @@ function patchSession(redraw, oldCount) {
       // 保留用户展开过的"过程文字 / 图片"
       const opened = [...old.querySelectorAll('details')].map(d => d.open);
       el.querySelectorAll('details').forEach((d, i) => { if (opened[i]) d.open = true; });
+      // 新元素还没画过,content-visibility 会先按 600px 占位:很长的回答一下子变矮,
+      // 滚动位置被压回前面几问(阅读位置和左侧问题地图都跳走)。先按旧元素的高度占位,画出来后自动换成真实高度
+      el.style.containIntrinsicSize = `auto ${Math.round(old.getBoundingClientRect().height)}px`;
       old.replaceWith(el);
     } else {
       // 插到编号比它小的最后一个已显示轮次后面(新轮次一般就是追加到末尾)
