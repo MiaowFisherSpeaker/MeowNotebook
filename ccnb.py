@@ -1596,17 +1596,95 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json({"error": repr(e)}, 500)
         if u.path.startswith("/api/"):
             return self._json({"error": "not found"}, 404)
-        if u.path != "/" and not (STATIC / u.path.lstrip("/")).exists():
-            self.path = "/"
-        self._static = True
-        return super().do_GET()
+        return self._static_file(u.path, q)
 
-    def end_headers(self):
-        # 前端文件每次都向服务器确认(没变时 304,很便宜);否则浏览器可能一直用旧的 app.js,更新后看不到新功能
-        if getattr(self, "_static", False):
-            self.send_header("Cache-Control", "no-cache")
-            self._static = False
-        super().end_headers()
+    def _static_file(self, path, q):
+        """前端文件。经 VS Code / SSH 转发访问时每个请求都要一个来回、每 KB 都慢,所以:
+        - 文本类文件 gzip 压缩(930 KB → 260 KB);
+        - index.html 里引用的文件网址带上版本号(?v=文件修改时间),这些网址长期缓存:
+          再次打开页面时脚本、样式一个请求都不发,更新后版本号变了才重新下载;
+        - index.html 本身每次都向服务器确认(没变时 304)。"""
+        rel = path.lstrip("/") or "index.html"
+        f = (STATIC / rel).resolve()
+        try:
+            f.relative_to(STATIC.resolve())
+        except ValueError:
+            f = STATIC / "index.html"
+        if not f.is_file():
+            f = STATIC / "index.html"  # 前端路由的网址都回到首页
+        body, etag = _static_body(f)
+        if f.name == "index.html":
+            cache = "no-cache"
+        elif q.get("v"):
+            cache = "public, max-age=31536000, immutable"
+        elif rel.startswith("vendor/"):
+            cache = "public, max-age=604800"  # 第三方库和字体(KaTeX 的字体由它的 CSS 引用,网址不带版本号)
+        else:
+            cache = "no-cache"
+        headers = {"Cache-Control": cache, "ETag": etag, "X-Content-Type-Options": "nosniff", "Vary": "Accept-Encoding"}
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            for k, v in headers.items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        ctype = self.guess_type(str(f))
+        if ctype.startswith("text/") or ctype in ("application/javascript", "image/svg+xml", "application/json"):
+            ctype += "; charset=utf-8" if "charset" not in ctype else ""
+        gz = f.suffix in GZIP_TYPES and "gzip" in (self.headers.get("Accept-Encoding") or "")
+        if gz:
+            body = _static_gzip(f, body)
+            headers["Content-Encoding"] = "gzip"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        for k, v in headers.items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+GZIP_TYPES = {".js", ".mjs", ".css", ".html", ".svg", ".json", ".txt", ".map", ".ttf"}
+_static_cache = {}  # 路径 → (修改时间, 内容, ETag, gzip 后的内容)
+_ASSET_RE = re.compile(r'((?:src|href)=")((?!https?:|//|#|data:)[^"?#]+\.(?:js|css|png|svg|ico|woff2?))(")')
+
+
+def _asset_version(name):
+    try:
+        return format((STATIC / name).stat().st_mtime_ns // 1_000_000, "x")
+    except OSError:
+        return "0"
+
+
+def _static_body(f):
+    """文件内容和 ETag(按修改时间缓存在内存里)。index.html 里的资源网址加上 ?v=版本号。"""
+    st = f.stat()
+    key = str(f)
+    hit = _static_cache.get(key)
+    if hit and hit[0] == st.st_mtime_ns:
+        if f.name != "index.html":
+            return hit[1], hit[2]
+    body = f.read_bytes()
+    if f.name == "index.html":
+        html_text = _ASSET_RE.sub(lambda m: f"{m[1]}{m[2]}?v={_asset_version(m[2])}{m[3]}", body.decode("utf-8"))
+        body = html_text.encode("utf-8")
+        etag = '"' + hashlib.sha1(body).hexdigest()[:16] + '"'  # 引用的文件变了,首页的版本号也跟着变
+    else:
+        etag = f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
+    _static_cache[key] = (st.st_mtime_ns, body, etag, None)
+    return body, etag
+
+
+def _static_gzip(f, body):
+    key = str(f)
+    hit = _static_cache.get(key)
+    if hit and hit[1] is body and hit[3] is not None:
+        return hit[3]
+    z = gzip.compress(body, 6)
+    if hit and hit[1] is body:
+        _static_cache[key] = (*hit[:3], z)
+    return z
 
 
 def port_open():

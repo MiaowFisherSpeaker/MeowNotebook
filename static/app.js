@@ -1074,9 +1074,21 @@ function detachTerm() {
 // 先等内置等宽字体加载完再建终端,否则 xterm 会按后备字体测量字宽,导致字间距错乱
 const monoReady = Promise.race([document.fonts.load('14px "CCNB Mono"'), new Promise(r => setTimeout(r, 1500))]).catch(() => {});
 
+// 终端库只在第一次打开终端时加载:大多数时候只是看问答,不用为它多下 290 KB
+let xtermReady = null;
+function loadXterm() {
+  if (window.Terminal && window.FitAddon) return Promise.resolve();
+  return xtermReady ||= [...$('#lazy-xterm').content.querySelectorAll('script')].reduce((p, s) => p.then(() => new Promise((ok, bad) => {
+    const el = document.createElement('script'); el.src = s.getAttribute('src'); el.onload = ok;
+    el.onerror = () => { xtermReady = null; bad(new Error('终端加载失败')); };
+    document.head.appendChild(el);
+  })), Promise.resolve());
+}
+
 async function attachTerm(name) {
   detachTerm();
   tv.name = name;
+  try { await loadXterm(); } catch { if (tv.name === name) tv.name = null; toast('终端加载失败,网络不好?稍后会自动重试', 3000); return; }
   await monoReady;
   if (tv.name !== name || tv.term) return;
   tv.term = new Terminal({
@@ -2050,8 +2062,8 @@ $('#set-channel').addEventListener('click', async e => {
   $('#set-check').click();
 });
 $('#set-auto').addEventListener('change', async e => onUpdate(await post('/api/update/settings', { auto: e.target.checked }).catch(() => null)));
-api('/api/version').then(r => r.version && onServerVersion(r.version)).catch(() => {});
-api('/api/update').then(onUpdate).catch(() => {});
+// 版本号由推送连接的 hello 带来;更新状态不急,等首屏加载完再查,不和会话列表抢连接
+setTimeout(() => (window.requestIdleCallback || (f => f()))(() => api('/api/update').then(onUpdate).catch(() => {})), 4000);
 setEco(state.eco);
 connectLive();
 initSide();

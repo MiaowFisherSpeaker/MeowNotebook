@@ -161,8 +161,8 @@
 <script src="vendor/marked.min.js"></script>
 <script src="vendor/purify.min.js"></script>
 <script src="vendor/katex/katex.min.js"></script>
-<script src="vendor/xterm/xterm.js"></script>
-<script src="vendor/xterm/addon-fit.js"></script>
+<!-- 终端库(290 KB)等打开终端时再加载 -->
+<template id="lazy-xterm"><script src="vendor/xterm/xterm.js"></script><script src="vendor/xterm/addon-fit.js"></script></template>
 <script src="vendor/hljs/highlight.min.js"></script>
 <script src="app.js"></script>
 </body>
