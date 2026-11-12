@@ -1,9 +1,11 @@
-//! SSH 本地端口转发:127.0.0.1:<local_port> → (SSH) → 远端 127.0.0.1:<remote_port>。
+//! SSH 本地端口转发,相当于 `ssh -L 本地端口:远端主机:远端端口 user@host`,可以同时转发多个端口。
 //! 只用 russh(纯 Rust),不依赖系统里的 ssh 命令,所以密码登录也能用。
 //! 服务器指纹:第一次连接时交给界面让用户确认,之后不一致就拒绝(防中间人)。
 use russh::client::{self, Handle};
 use russh::keys::{self, HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -13,6 +15,7 @@ use tokio::sync::Mutex;
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Auth {
     Password { password: String },
+    /// path 为空:依次试 ~/.ssh/id_ed25519、id_ecdsa、id_rsa(和 ssh 命令的默认行为一样)
     Key { path: String, passphrase: Option<String> },
 }
 
@@ -22,9 +25,16 @@ pub struct Target {
     pub port: u16,
     pub user: String,
     pub auth: Auth,
-    pub remote_port: u16,
     /// 已确认过的服务器指纹(SHA256:…);None = 第一次连接
     pub fingerprint: Option<String>,
+}
+
+/// 一条转发规则:本机 127.0.0.1:local → (经服务器)remote_host:remote_port
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Forward {
+    pub local: u16,
+    pub remote_host: String,
+    pub remote: u16,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,11 +81,37 @@ impl client::Handler for Client {
     }
 }
 
+pub fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
+}
+
+pub fn expand_home(p: &str) -> String {
+    match p.strip_prefix('~') {
+        Some(rest) => home().map(|h| format!("{}{rest}", h.display())).unwrap_or_else(|| p.to_string()),
+        None => p.to_string(),
+    }
+}
+
+/// 私钥文件:填了就用它;没填就找 ssh 默认的那几个
+fn key_candidates(path: &str) -> Vec<String> {
+    if !path.trim().is_empty() {
+        return vec![expand_home(path.trim())];
+    }
+    ["id_ed25519", "id_ecdsa", "id_rsa"]
+        .iter()
+        .filter_map(|n| home().map(|h| h.join(".ssh").join(n)))
+        .filter(|p| p.is_file())
+        .map(|p| p.display().to_string())
+        .collect()
+}
+
 async fn open(t: &Target) -> Result<Handle<Client>, TunnelError> {
     let config = Arc::new(client::Config {
         inactivity_timeout: None,
         keepalive_interval: Some(Duration::from_secs(20)),
         keepalive_max: 3,
+        // 关掉 Nagle:终端按键、网页小请求都是小包,不关的话每个包可能多等几十毫秒
+        nodelay: true,
         ..Default::default()
     });
     let seen = Arc::new(StdMutex::new(None));
@@ -94,94 +130,176 @@ async fn open(t: &Target) -> Result<Handle<Client>, TunnelError> {
         }
     };
     let auth_err = |e: russh::Error| TunnelError::Auth { message: format!("登录失败:{e}") };
-    let ok = match &t.auth {
-        Auth::Password { password } => h.authenticate_password(&t.user, password).await.map_err(auth_err)?,
-        Auth::Key { path, passphrase } => {
-            let path = expand_home(path);
-            let key = keys::load_secret_key(&path, passphrase.as_deref().filter(|p| !p.is_empty()))
-                .map_err(|e| TunnelError::Auth { message: format!("读取私钥 {path} 失败:{e}") })?;
-            let hash = h.best_supported_rsa_hash().await.map_err(auth_err)?.flatten();
-            h.authenticate_publickey(&t.user, PrivateKeyWithHashAlg::new(Arc::new(key), hash)).await.map_err(auth_err)?
+    match &t.auth {
+        Auth::Password { password } => {
+            if h.authenticate_password(&t.user, password).await.map_err(auth_err)?.success() {
+                return Ok(h);
+            }
+            Err(TunnelError::Auth { message: "用户名或密码不对".into() })
         }
-    };
-    if !ok.success() {
-        return Err(TunnelError::Auth { message: "用户名或密码 / 私钥不对".into() });
+        Auth::Key { path, passphrase } => {
+            let cands = key_candidates(path);
+            if cands.is_empty() {
+                return Err(TunnelError::Auth { message: "没找到私钥:~/.ssh 下没有 id_ed25519 / id_ecdsa / id_rsa,请填私钥文件路径".into() });
+            }
+            let mut last = String::new();
+            for p in &cands {
+                let key = match keys::load_secret_key(p, passphrase.as_deref().filter(|s| !s.is_empty())) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        last = format!("读取私钥 {p} 失败:{e}");
+                        continue;
+                    }
+                };
+                let hash = h.best_supported_rsa_hash().await.map_err(auth_err)?.flatten();
+                if h.authenticate_publickey(&t.user, PrivateKeyWithHashAlg::new(Arc::new(key), hash)).await.map_err(auth_err)?.success() {
+                    return Ok(h);
+                }
+                last = format!("服务器不接受私钥 {p}");
+            }
+            Err(TunnelError::Auth { message: last })
+        }
     }
-    Ok(h)
 }
 
-pub fn expand_home(p: &str) -> String {
-    match p.strip_prefix("~") {
-        Some(rest) => dirs_home().map(|h| format!("{h}{rest}")).unwrap_or_else(|| p.to_string()),
-        None => p.to_string(),
+/// SSH 连接:多个转发共用一条;断了(睡眠唤醒、换网络)由下一个本地连接触发重连
+struct Session {
+    target: Target,
+    cur: StdMutex<Option<Arc<Handle<Client>>>>,
+    reconnect: Mutex<()>,
+}
+
+impl Session {
+    async fn handle(&self) -> Option<Arc<Handle<Client>>> {
+        if let Some(h) = self.cur.lock().unwrap().clone().filter(|h| !h.is_closed()) {
+            return Some(h);
+        }
+        let _g = self.reconnect.lock().await; // 同一时间只重连一次
+        if let Some(h) = self.cur.lock().unwrap().clone().filter(|h| !h.is_closed()) {
+            return Some(h);
+        }
+        let h = Arc::new(open(&self.target).await.ok()?);
+        *self.cur.lock().unwrap() = Some(h.clone());
+        Some(h)
+    }
+
+    fn drop_if(&self, h: &Arc<Handle<Client>>) {
+        let mut g = self.cur.lock().unwrap();
+        if g.as_ref().is_some_and(|c| Arc::ptr_eq(c, h)) {
+            *g = None;
+        }
     }
 }
 
-fn dirs_home() -> Option<String> {
-    std::env::var("HOME").ok().or_else(|| std::env::var("USERPROFILE").ok())
+#[derive(Clone, Debug, Serialize)]
+pub struct ForwardStatus {
+    pub local: u16,
+    pub remote_host: String,
+    pub remote: u16,
+    /// 本地端口没监听成功时的原因
+    pub error: Option<String>,
+    /// 当前经这条转发的连接数
+    pub active: usize,
 }
 
-/// 一条运行中的隧道。drop 或 close() 后本地端口释放、SSH 断开。
+struct Listening {
+    rule: Forward,
+    error: Option<String>,
+    active: Arc<AtomicUsize>,
+}
+
+/// 运行中的隧道。close() 或 drop 后本地端口释放、SSH 断开。
 pub struct Tunnel {
-    pub local_port: u16,
-    task: tokio::task::JoinHandle<()>,
-    handle: Arc<Mutex<Option<Handle<Client>>>>,
+    session: Arc<Session>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    forwards: Vec<Listening>,
 }
 
 impl Tunnel {
-    pub async fn close(self) {
-        self.task.abort();
-        if let Some(h) = self.handle.lock().await.take() {
-            let _ = h.disconnect(russh::Disconnect::ByApplication, "", "zh").await;
+    pub fn status(&self) -> Vec<ForwardStatus> {
+        self.forwards
+            .iter()
+            .map(|f| ForwardStatus {
+                local: f.rule.local,
+                remote_host: f.rule.remote_host.clone(),
+                remote: f.rule.remote,
+                error: f.error.clone(),
+                active: f.active.load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+
+    pub async fn close(mut self) {
+        for t in self.tasks.drain(..) {
+            t.abort();
+        }
+        let h = self.session.cur.lock().unwrap().take();
+        if let Some(h) = h {
+            let _ = tokio::time::timeout(Duration::from_secs(2), h.disconnect(russh::Disconnect::ByApplication, "", "zh")).await;
         }
     }
 }
 
 impl Drop for Tunnel {
     fn drop(&mut self) {
-        self.task.abort();
+        for t in &self.tasks {
+            t.abort();
+        }
     }
 }
 
-/// 登录并开始转发。local_port = 0 时随便挑一个空闲端口。
-/// 断线后(睡眠唤醒、换网络)下一个本地连接进来时自动重新登录。
-pub async fn start(t: Target, local_port: u16) -> Result<Tunnel, TunnelError> {
+/// 登录并开始转发。required = 必须监听成功的那条(网页),它的端口被占用就整体失败;其余的失败只记在状态里。
+pub async fn start(t: Target, rules: Vec<Forward>, required: usize) -> Result<Tunnel, TunnelError> {
     let first = open(&t).await?;
-    let listener = TcpListener::bind(("127.0.0.1", local_port))
-        .await
-        .map_err(|e| TunnelError::LocalPort { message: format!("本地端口 {local_port} 被占用:{e}") })?;
-    let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(local_port);
-    let handle = Arc::new(Mutex::new(Some(first)));
-    let shared = handle.clone();
-    let task = tokio::spawn(async move {
-        loop {
-            let Ok((sock, peer)) = listener.accept().await else { continue };
-            let _ = sock.set_nodelay(true);
-            let shared = shared.clone();
-            let t = t.clone();
-            tokio::spawn(async move {
-                let ch = {
-                    let mut g = shared.lock().await;
-                    let mut ch = None;
-                    for _ in 0..2 {
-                        if g.as_ref().map_or(true, |h| h.is_closed()) {
-                            *g = open(&t).await.ok();
-                        }
-                        let Some(h) = g.as_ref() else { break };
-                        match h.channel_open_direct_tcpip("127.0.0.1", t.remote_port as u32, peer.ip().to_string(), peer.port() as u32).await {
-                            Ok(c) => { ch = Some(c); break; }
-                            Err(_) => *g = None, // 连接多半已断,重连一次
-                        }
+    let session = Arc::new(Session { target: t, cur: StdMutex::new(Some(Arc::new(first))), reconnect: Mutex::new(()) });
+    let mut tasks = vec![];
+    let mut forwards = vec![];
+    for (i, rule) in rules.into_iter().enumerate() {
+        let active = Arc::new(AtomicUsize::new(0));
+        match TcpListener::bind(("127.0.0.1", rule.local)).await {
+            Ok(l) => {
+                tasks.push(tokio::spawn(serve(l, rule.clone(), session.clone(), active.clone())));
+                forwards.push(Listening { rule, error: None, active });
+            }
+            Err(e) => {
+                let msg = format!("本机端口 {} 被占用(或没有权限):{e}", rule.local);
+                if i == required {
+                    for t in &tasks {
+                        t.abort();
                     }
-                    ch
-                };
-                if let Some(ch) = ch {
-                    let mut stream = ch.into_stream();
-                    let mut sock = sock;
-                    let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+                    return Err(TunnelError::LocalPort { message: msg });
                 }
-            });
+                forwards.push(Listening { rule, error: Some(msg), active });
+            }
         }
-    });
-    Ok(Tunnel { local_port, task, handle })
+    }
+    Ok(Tunnel { session, tasks, forwards })
+}
+
+async fn serve(listener: TcpListener, rule: Forward, session: Arc<Session>, active: Arc<AtomicUsize>) {
+    loop {
+        let Ok((mut sock, peer)) = listener.accept().await else { continue };
+        let _ = sock.set_nodelay(true);
+        let (session, rule, active) = (session.clone(), rule.clone(), active.clone());
+        // 每个本地连接各开一个 SSH 通道,互不等待(浏览器会同时发很多请求)
+        tokio::spawn(async move {
+            let mut ch = None;
+            for _ in 0..2 {
+                let Some(h) = session.handle().await else { break };
+                match h.channel_open_direct_tcpip(rule.remote_host.clone(), rule.remote as u32, peer.ip().to_string(), peer.port() as u32).await {
+                    Ok(c) => {
+                        ch = Some(c);
+                        break;
+                    }
+                    Err(_) if h.is_closed() => session.drop_if(&h), // 连接断了:重连再试一次
+                    Err(_) => break,                               // 服务器那边这个端口没人监听
+                }
+            }
+            let Some(ch) = ch else { return };
+            active.fetch_add(1, Ordering::Relaxed);
+            let mut stream = ch.into_stream();
+            let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+            active.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
 }

@@ -505,3 +505,18 @@ body.iv-open { overflow: hidden; }
 #banner b { color: var(--accent); }
 #banner button { font-size: 12.5px; padding: 2px 12px; }
 #banner .x { border: 0; background: none; color: var(--muted); padding: 2px 6px; }
+
+/* 桌面客户端:当前连接的服务器和端口转发 */
+#conn-btn[hidden] { display: none; }
+#conn-btn .cdot { position: absolute; right: 7px; top: 8px; width: 7px; height: 7px; border-radius: 50%; background: var(--live); }
+#conn-pop { position: fixed; z-index: 960; left: 60px; bottom: 60px; width: 340px; padding: 12px 14px; background: var(--card);
+  border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); font-size: 13px; }
+#conn-pop[hidden] { display: none; }
+#conn-pop .t { font-weight: 700; display: flex; align-items: center; gap: 8px; }
+#conn-pop .t .dot { flex: none; }
+#conn-pop .sub2 { color: var(--muted); font-size: 12px; margin: 2px 0 8px; }
+#conn-pop ul { list-style: none; margin: 0 0 10px; padding: 8px 10px; background: var(--panel); border-radius: 8px; }
+#conn-pop li { display: flex; gap: 8px; align-items: baseline; font-family: "CCNB Mono", Menlo, Consolas, monospace; font-size: 12px; padding: 1px 0; }
+#conn-pop li .k { color: var(--muted); font-family: inherit; font-size: 11px; flex: none; width: 30px; }
+#conn-pop li a { margin-left: auto; color: var(--accent); font-family: -apple-system, system-ui, sans-serif; font-size: 11.5px; text-decoration: none; }
+#conn-pop .go { width: 100%; }

@@ -1938,10 +1938,29 @@ function setEco(on) {
 }
 $('#eco').addEventListener('click', () => { setEco(!state.eco); toast(state.eco ? '节能模式已开' : '节能模式已关'); });
 // ---------- 设置:主题、节能、布局、版本与更新 ----------
-const shell = (() => {  // 桌面客户端打开时网址带 ?shell=desktop&v=<版本>&ch=<通道>
+// 桌面客户端打开时网址带 ?shell=desktop&v=<版本>&ch=<通道>&srv=<服务器>&fw=<本机端口:远端主机:远端端口,…>&home=<登录页>
+const shell = (() => {
   const q = new URLSearchParams(location.search);
-  return q.get('shell') === 'desktop' ? { v: q.get('v') || '?', ch: q.get('ch') === 'dev' ? '开发版' : '正式版' } : null;
+  if (q.get('shell') !== 'desktop') return null;
+  const fw = (q.get('fw') || '').split(',').filter(Boolean).map(x => {
+    const m = x.match(/^(\d+):(.*):(\d+)$/); return m && { local: +m[1], host: m[2], remote: +m[3] };
+  }).filter(Boolean);
+  return { v: q.get('v') || '?', ch: q.get('ch') === 'dev' ? '开发版' : '正式版', srv: q.get('srv') || '', fw, home: q.get('home') || '' };
 })();
+// 左下角"连接"按钮:连的是哪台服务器、转发了哪些端口;切换服务器 / 管理转发回到客户端的登录页
+if (shell) {
+  const b = $('#conn-btn'), pop = $('#conn-pop');
+  b.hidden = false;
+  const lines = shell.fw.length ? shell.fw.map((f, i) => `localhost:${f.local} → ${f.host}:${f.remote}${i ? '' : '(网页)'}`) : [location.host + '(直接打开)'];
+  b.title = `已连接 ${shell.srv}\n` + lines.join('\n');
+  pop.innerHTML = `<div class="t"><span class="dot live"></span>${esc(shell.srv || location.host)}</div>
+    <div class="sub2">桌面客户端 ${esc(shell.v)} · ${esc(shell.ch)} · ${shell.fw.length ? 'SSH 端口转发(ssh -L)' : '直接打开网址'}</div>
+    ${shell.fw.length ? `<ul>${shell.fw.map((f, i) => `<li><span class="k">${i ? '转发' : '网页'}</span><span>${f.local} → ${esc(f.host)}:${f.remote}</span>${i ? `<a href="http://localhost:${f.local}/" target="_blank">打开</a>` : ''}</li>`).join('')}</ul>` : ''}
+    ${shell.home ? '<button class="go btn-primary" id="conn-home">切换服务器 / 管理转发</button>' : ''}`;
+  b.addEventListener('click', () => { pop.hidden = !pop.hidden; });
+  document.addEventListener('pointerdown', e => { if (!e.target.closest('#conn-pop, #conn-btn')) pop.hidden = true; });
+  $('#conn-home')?.addEventListener('click', () => { location.href = shell.home; });
+}
 function setTheme(t) {
   localSet('theme', t);
   if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;

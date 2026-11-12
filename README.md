@@ -118,19 +118,40 @@ cd ~/projects/MeowNotebook && ./install.sh     # 卸载: ./install.sh --uninstal
 ## 三、桌面客户端(Windows / macOS)
 
 网站跑在服务器上(Linux / macOS,装好本项目)。桌面客户端只是一个很薄的壳:**登录界面填服务器的 SSH 信息,
-它把服务器的 8765 端口转发到本机,然后直接打开网站**。网页由服务器提供,网站更新不需要更新客户端。
+它按你列出的规则做端口转发(和 `ssh -L` 一样),然后打开转发过来的网站**。网页由服务器提供,
+所以只改网页(`static/`、`ccnb.py` 等)不需要重新安装客户端,网站更新后客户端重新加载(Ctrl/⌘+R)就是新界面。
 
-- 下载:[Releases](https://github.com/MiaowFisherSpeaker/MeowNotebook/releases) 里的 `*-setup.exe`(Windows)或 `.dmg`(macOS,Intel 和 Apple 芯片通用)。
-  macOS 包没有苹果开发者签名:第一次打开在"访达"里**右键 → 打开**;提示"已损坏"时运行 `xattr -cr "/Applications/MeowNotebook.app"`。
-- 登录:主机 / IP、SSH 端口、用户名,用**密码**或**私钥**(如 `~/.ssh/id_ed25519`)。SSH 是客户端自己实现的,不需要系统里装 ssh。
+- **下载**:[Releases](https://github.com/MiaowFisherSpeaker/MeowNotebook/releases) 里的 `*-setup.exe`(Windows)或 `.dmg`(macOS,Intel 和 Apple 芯片通用)。
+  目前只有开发版(预发布 `app-dev`)。
+- **登录**:主机 / IP、SSH 端口、用户名,用**密码**或**私钥**(私钥留空 = 用 `~/.ssh` 下默认的 id_ed25519 / id_ecdsa / id_rsa)。
+  SSH 是客户端自己实现的,不需要系统里装 ssh。
   - 第一次连接会显示服务器指纹请你确认,以后指纹变了会拒绝连接并提醒(防止有人冒充服务器)。
   - 勾选"记住"时,密码 / 私钥口令存进系统钥匙串(macOS 钥匙串、Windows 凭据管理器),不写进配置文件。
-  - "高级"里可以改服务器上的网站端口(默认 8765)和本机端口(默认 18765,被占用时自动换)。
-  - 网站就在本机(mac 上直接 `ccweb`)或已经用别的方式转发好时,选"直接打开网址"。
-- 菜单"切换服务器"(Ctrl/⌘+Shift+L)回到登录界面;断网、睡眠唤醒后隧道会自动重连。
-- 很省电:用系统自带的浏览器内核(WebView2 / WKWebView),没有常驻的后台进程;网页本身的"节能模式"照常生效。
+- **端口转发**:每个连接有一张转发表,默认一条 `本机 8765 → 服务器 127.0.0.1:8765`(网页)。
+  可以再加别的(比如 Jupyter 8888、TensorBoard 6006),表下面实时显示等价的 `ssh -N -L … user@host` 命令。
+  连上后登录界面顶部列出每条转发的状态(转发中 / 本机端口被占用)和连接数;网页左下角的 🔌 按钮也能看到。
+  本机端口被占用时直接报错,不会悄悄换端口。
+- **从 VS Code 导入**:"从 VS Code / SSH 配置导入"读取 `~/.ssh/config`(VS Code 的 Remote - SSH 用的就是它),
+  以及 VS Code / Cursor 设置里 `remote.SSH.configFile` 指定的文件:HostName、User、Port、IdentityFile、LocalForward 都会带过来。
+  用了跳板机(ProxyJump)的主机暂不支持,会标出来。
+- **切换服务器**:菜单 / 托盘"切换服务器 / 端口转发"(Ctrl/⌘+Shift+L),或网页左下角 🔌 → "切换服务器 / 管理转发"。
+  回到登录界面时连接保持着,可以"回到网页"或"断开"。
+- **隐藏到托盘**:菜单"隐藏到托盘"(Ctrl/⌘+H)后窗口收进系统托盘(macOS 是菜单栏),单击托盘图标找回;
+  再次打开应用也会把原来的窗口显示出来。关闭窗口 = 退出(转发随之断开)。
+- 网页里"新标签页打开"的链接用系统浏览器打开(转发在本机,浏览器也能访问);下载保存到"下载"文件夹。
 - 客户端自己的更新:启动时检查,有新版本**询问**你是否更新;菜单里"自动更新应用"打开后才会自动装(默认关)。
-- 正式版和开发版是两个独立的应用("MeowNotebook" / "MeowNotebook Dev"),可以同时安装,各自跟各自的更新。
+- 正式版和开发版是两个独立的应用("MeowNotebook" / "MeowNotebook Dev"),可以同时安装。
+
+**下载时提示"危险" / "不常下载"**:安装包没有代码签名证书(要花钱向证书机构买,并验证身份),
+Windows SmartScreen 和浏览器对没签名、下载量少的新文件一律这样提示,并不是检测到了病毒。
+在浏览器里选"保留",运行时点"更多信息 → 仍要运行"。想确认文件确实是本仓库构建的、没被改过:
+
+```bash
+gh attestation verify MeowNotebook.Dev_xxx_x64-setup.exe -R MiaowFisherSpeaker/MeowNotebook   # GitHub 签发的构建来源证明
+certutil -hashfile MeowNotebook.Dev_xxx_x64-setup.exe SHA256                                     # 和 Release 里 SHA256SUMS-Windows.txt 对照
+```
+
+macOS 包同样没有苹果开发者签名:第一次打开在"访达"里**右键 → 打开**;提示"已损坏"时运行 `xattr -cr "/Applications/MeowNotebook.app"`。
 
 自己构建:装好 Rust 和 Node.js,`cd app && npm ci && npm run build`(开发版 `npm run build:dev`)。
 Windows 只能在 Windows 上打包,macOS 只能在 macOS 上打包;平时由 GitHub Actions 自动构建(见下一节)。

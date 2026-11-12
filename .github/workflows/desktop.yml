@@ -11,6 +11,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write      # 构建来源证明(attestation)要用
+  attestations: write
 
 concurrency:
   group: desktop-${{ github.ref }}
@@ -102,7 +104,8 @@ jobs:
           releaseBody: |
             ${{ env.STABLE == 'true' && '正式版。' || '开发版:跟随 main 分支,可能不稳定。和正式版可以同时安装。' }}
 
-            - Windows:下载 `*-setup.exe` 安装。
+            - Windows:下载 `*-setup.exe` 安装。没有代码签名证书,浏览器 / SmartScreen 会提示"不常下载"或"可能有害":选"保留",运行时点"更多信息 → 仍要运行"。
+              想确认文件没被改过:核对 `SHA256SUMS-Windows.txt`,或运行 `gh attestation verify 文件名 -R MiaowFisherSpeaker/MeowNotebook`(证明它是本仓库 GitHub Actions 从源码构建的)。
             - macOS:下载 `.dmg`。没有苹果开发者签名,第一次打开时在"访达"里**右键 → 打开**;提示"已损坏"时在终端运行 `xattr -cr "/Applications/MeowNotebook.app"`。
 
             服务器端(网站)的更新在网页"设置 → 版本与更新"里,和这里的客户端安装包分开。
@@ -110,3 +113,24 @@ jobs:
           prerelease: ${{ env.STABLE != 'true' }}
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
+      # 没有代码签名证书时,让下载的人能自己核实:文件的 SHA-256,以及 GitHub 签发的"由本仓库的这次构建产出"的证明
+      - name: 构建来源证明
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            app/src-tauri/target/*/release/bundle/dmg/*.dmg
+            app/src-tauri/target/release/bundle/nsis/*-setup.exe
+      - name: 上传 SHA-256 校验和
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ env.STABLE == 'true' && github.ref_name || 'app-dev' }}
+        run: |
+          out="SHA256SUMS-${RUNNER_OS}.txt"
+          for f in app/src-tauri/target/*/release/bundle/dmg/*.dmg app/src-tauri/target/release/bundle/nsis/*-setup.exe; do
+            [ -f "$f" ] || continue
+            if command -v sha256sum >/dev/null; then sum=$(sha256sum "$f" | cut -d' ' -f1); else sum=$(shasum -a 256 "$f" | cut -d' ' -f1); fi
+            echo "$sum  $(basename "$f")" >> "$out"
+          done
+          cat "$out"
+          gh release upload "$TAG" "$out" --clobber -R "$GITHUB_REPOSITORY"
