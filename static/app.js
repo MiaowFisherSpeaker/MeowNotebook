@@ -867,8 +867,10 @@ function shiftMap(d) {
   const s = Math.max(0, Math.min(qmap.items.length - MAP_MAX, qmap.start + d));
   if (s !== qmap.start) { qmap.start = s; drawMap(); }
 }
+// 缓存的元素可能已被增量刷新换掉(离开页面的元素 top 恒为 0,会被当成"已经读过",地图就停在最后一问),失效了重新找
 function mapTarget(i) {
-  return qmap.els[i] ||= document.getElementById(qmap.items[i].id);
+  const el = qmap.els[i];
+  return el?.isConnected ? el : (qmap.els[i] = document.getElementById(qmap.items[i].id));
 }
 // 值没变就不写:#main 上的 CSS 变量会被正文所有元素继承,改一次就要重算整页样式
 function setVar(el, k, v) { if (el.style.getPropertyValue(k) !== v) el.style.setProperty(k, v); }
@@ -887,7 +889,8 @@ function layoutMap() {
 }
 function spy() {
   if (!qmap.items.length) return;
-  const line = ($('#top')?.getBoundingClientRect().bottom || 0) + 60;
+  // 某一问的开头到了吸顶栏下沿才算进入这一问;留 20px 余量:点地图跳转时开头停在下沿往下 10px(scroll-margin)
+  const line = readLine() + 12;
   let cur = 0;
   for (let i = 0; i < qmap.items.length; i++) {
     const el = mapTarget(i);
