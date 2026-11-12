@@ -1,5 +1,9 @@
 # 更新记录
 
+## v1.1.2 · 2026-11-12
+
+- Strip whitespace from the updater signing key in CI
+
 ## v1.1.1 · 2026-11-12
 
 - Fix desktop build: pass bundle args to tauri, not cargo
