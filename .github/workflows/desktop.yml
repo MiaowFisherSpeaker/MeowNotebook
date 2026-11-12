@@ -79,10 +79,19 @@ jobs:
           c["version"] = sys.argv[1]
           json.dump(c, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
           PY
+      # 网页上粘贴 Secret 时常带上换行,base64 解码会失败:去掉空白再交给 Tauri
+      - name: 读取更新包签名私钥
+        shell: bash
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          k=$(printf %s "$KEY" | tr -d ' \r\n')
+          [ -n "$k" ] || { echo "缺少 Secret TAURI_SIGNING_PRIVATE_KEY"; exit 1; }
+          echo "::add-mask::$k"
+          echo "TAURI_SIGNING_PRIVATE_KEY=$k" >> "$GITHUB_ENV"
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: app
