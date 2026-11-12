@@ -1,5 +1,9 @@
 # 更新记录
 
+## v1.1.1 · 2026-11-12
+
+- Fix desktop build: pass bundle args to tauri, not cargo
+
 ## v1.1.0 · 2026-11-12
 
 - Desktop client, dockable panel layout, versioning and in-page updates

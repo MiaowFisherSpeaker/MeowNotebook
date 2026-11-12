@@ -1,6 +1,6 @@
 [package]
 name = "meownotebook"
-version = "1.1.0"
+version = "1.1.1"
 description = "MeowNotebook 桌面客户端:SSH 登录服务器,把 8765 转发到本机后打开网页"
 edition = "2021"
 publish = false
