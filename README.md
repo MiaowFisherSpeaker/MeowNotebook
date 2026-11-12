@@ -122,7 +122,7 @@ cd ~/projects/MeowNotebook && ./install.sh     # 卸载: ./install.sh --uninstal
 所以只改网页(`static/`、`ccnb.py` 等)不需要重新安装客户端,网站更新后客户端重新加载(Ctrl/⌘+R)就是新界面。
 
 - **下载**:[Releases](https://github.com/MiaowFisherSpeaker/MeowNotebook/releases) 里的 `*-setup.exe`(Windows)或 `.dmg`(macOS,Intel 和 Apple 芯片通用)。
-  目前只有开发版(预发布 `app-dev`)。
+  正式版在最新的 `vX.Y.Z` Release 里;开发版在预发布 `app-dev` 里(应用名 "MeowNotebook Dev",可与正式版同时安装)。
 - **登录**:主机 / IP、SSH 端口、用户名,用**密码**或**私钥**(私钥留空 = 用 `~/.ssh` 下默认的 id_ed25519 / id_ecdsa / id_rsa)。
   SSH 是客户端自己实现的,不需要系统里装 ssh。
   - 第一次连接会显示服务器指纹请你确认,以后指纹变了会拒绝连接并提醒(防止有人冒充服务器)。
@@ -147,8 +147,8 @@ Windows SmartScreen 和浏览器对没签名、下载量少的新文件一律这
 在浏览器里选"保留",运行时点"更多信息 → 仍要运行"。想确认文件确实是本仓库构建的、没被改过:
 
 ```bash
-gh attestation verify MeowNotebook.Dev_xxx_x64-setup.exe -R MiaowFisherSpeaker/MeowNotebook   # GitHub 签发的构建来源证明
-certutil -hashfile MeowNotebook.Dev_xxx_x64-setup.exe SHA256                                     # 和 Release 里 SHA256SUMS-Windows.txt 对照
+gh attestation verify MeowNotebook_1.0.0_x64-setup.exe -R MiaowFisherSpeaker/MeowNotebook   # GitHub 签发的构建来源证明
+certutil -hashfile MeowNotebook_1.0.0_x64-setup.exe SHA256                                     # 和 Release 里 SHA256SUMS-Windows.txt 对照
 ```
 
 macOS 包同样没有苹果开发者签名:第一次打开在"访达"里**右键 → 打开**;提示"已损坏"时运行 `xattr -cr "/Applications/MeowNotebook.app"`。
