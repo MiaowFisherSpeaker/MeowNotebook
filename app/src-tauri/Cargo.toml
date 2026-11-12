@@ -1,0 +1,33 @@
+[package]
+name = "meownotebook"
+version = "1.1.0"
+description = "MeowNotebook 桌面客户端:SSH 登录服务器,把 8765 转发到本机后打开网页"
+edition = "2021"
+publish = false
+
+[lib]
+name = "meownotebook_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-updater = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-window-state = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-opener = "2"
+russh = { version = "0.65", default-features = false, features = ["ring", "rsa", "flate2"] }
+tokio = { version = "1", features = ["net", "io-util", "time", "sync", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

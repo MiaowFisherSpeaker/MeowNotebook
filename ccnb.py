@@ -43,6 +43,7 @@ from urllib.request import ProxyHandler, build_opener
 
 import qqbot
 import term
+import updater
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
@@ -57,6 +58,8 @@ IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                ".webp": "image/webp", ".bmp": "image/bmp", ".avif": "image/avif"}
 ACTIVE_SECONDS = 180  # 文件在这么多秒内被写过 → 视为进行中
 # 只接受这些主机名的请求(防 DNS rebinding);端口不限,方便 VS Code / SSH 转发到别的本地端口
+# 网站进程启动时的版本(serve 时填):更新后网页据此提示刷新
+VERSION_INFO = {"version": None}
 ALLOWED_HOSTS = {"localhost", "127.0.0.1", "[::1]", *filter(None, os.environ.get("CCNB_ALLOWED_HOSTS", "").split(","))}
 
 # ---------------------------------------------------------------- 解析
@@ -1377,7 +1380,8 @@ class Handler(SimpleHTTPRequestHandler):
             _subs.add(sub)
         _page_conn(page, 1)
         try:
-            self.wfile.write(b"retry: 3000\ndata: {\"hello\": true}\n\n")
+            hello = json.dumps({"hello": True, "version": VERSION_INFO["version"]})
+            self.wfile.write(f"retry: 3000\ndata: {hello}\n\n".encode())
             self.wfile.flush()
             while True:
                 if sub.ev.wait(15):
@@ -1460,6 +1464,14 @@ class Handler(SimpleHTTPRequestHandler):
             m = re.fullmatch(r"/api/sessions/([\w-]+)/send-note", u.path)
             if m:
                 return self._json({"ok": True, "to": send_note(m.group(1))})
+            if u.path == "/api/update/check":
+                return self._json(updater.check())
+            if u.path == "/api/update/settings":
+                b = self._body()
+                updater.save_settings(b.get("channel"), b.get("auto"))
+                return self._json(updater.check(fetch=False))
+            if u.path == "/api/update/apply":
+                return self._json({"ok": True, "target": updater.apply()})
             if u.path == "/api/qq/allow":  # 网页上"允许"第一次给机器人发消息的 QQ 用户
                 qqbot.allow(str(self._body().get("openid") or ""))
                 return self._json({"ok": True, "qq": qqbot.info()})
@@ -1497,6 +1509,10 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             if u.path == "/api/stars":
                 return self._json({"stars": migrate_stars()})
+            if u.path == "/api/version":
+                return self._json(VERSION_INFO)
+            if u.path == "/api/update":
+                return self._json(updater.status() or updater.check(fetch=False))
             m = re.fullmatch(r"/api/image/([\w-]+)/(\d+)", u.path)
             if m:
                 p = find_session(m.group(1))
@@ -1608,6 +1624,9 @@ def cmd_serve(_):
     ThreadingHTTPServer.daemon_threads = True
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     threading.Thread(target=watcher, daemon=True).start()
+    VERSION_INFO.update(updater.current())
+    updater.on_change(lambda st: _publish({"update": st}))
+    threading.Thread(target=updater.loop, daemon=True).start()
     qqbot.start(owner=qq_owner, link=lambda sid: url(sid))  # 有 data/qqbot.json 才会连 QQ
     print(f"MeowNotebook: {url()}  (读取 {PROJECTS})", flush=True)
     srv.serve_forever()

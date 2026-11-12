@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MeowNotebook</title>
+<style>
+:root {
+  --bg: #f6f4ef; --card: #ffffff; --panel: #efece5; --line: #e3dfd6; --text: #24221e; --muted: #7a736b;
+  --accent: #b4532a; --accent-2: #d06d41; --accent-soft: #f6e6dc; --ok: #2f9e5b; --err: #c0392b; --warn: #b45309;
+  --shadow: 0 20px 50px -20px rgba(60, 40, 20, .25), 0 2px 6px rgba(0,0,0,.04);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #171614; --card: #22211e; --panel: #1d1c1a; --line: #36342f; --text: #ebe7df; --muted: #9b948a;
+    --accent: #e08a5f; --accent-2: #e9a07a; --accent-soft: #3a291f; --ok: #4cc47e; --err: #ef6b5b; --warn: #f0a24b;
+    --shadow: 0 20px 50px -20px rgba(0,0,0,.6), 0 2px 6px rgba(0,0,0,.3);
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--text); display: flex; align-items: center; justify-content: center;
+  font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
+  background-image: radial-gradient(circle at 15% 10%, color-mix(in srgb, var(--accent) 10%, transparent), transparent 40%),
+                    radial-gradient(circle at 90% 95%, color-mix(in srgb, var(--accent) 8%, transparent), transparent 45%); }
+button, input, select { font: inherit; color: inherit; }
+.shell { width: min(880px, calc(100vw - 32px)); height: min(620px, calc(100vh - 32px)); display: flex; background: var(--card);
+  border: 1px solid var(--line); border-radius: 18px; box-shadow: var(--shadow); overflow: hidden; }
+/* 左:保存的服务器 */
+.list { width: 260px; flex: none; background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; }
+.brand { display: flex; align-items: center; gap: 10px; padding: 20px 18px 14px; }
+.brand img { width: 34px; height: 34px; }
+.brand b { font-size: 16px; letter-spacing: .3px; display: block; line-height: 1.2; }
+.brand small { color: var(--muted); font-size: 11.5px; }
+.profiles { flex: 1; overflow-y: auto; padding: 4px 10px; }
+.pf { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 9px 10px; margin-bottom: 2px;
+  border: 1px solid transparent; border-radius: 10px; background: none; cursor: pointer; }
+.pf:hover { background: color-mix(in srgb, var(--card) 70%, transparent); }
+.pf.on { background: var(--card); border-color: var(--line); box-shadow: 0 1px 3px rgba(0,0,0,.05); }
+.pf .av { width: 30px; height: 30px; flex: none; border-radius: 8px; display: grid; place-items: center; font-weight: 700; font-size: 13px;
+  background: var(--accent-soft); color: var(--accent); }
+.pf .tx { min-width: 0; flex: 1; }
+.pf .nm { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pf .ad { color: var(--muted); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.add { margin: 8px 10px 4px; padding: 8px; border: 1px dashed var(--line); border-radius: 10px; background: none; color: var(--muted); cursor: pointer; }
+.add:hover { color: var(--accent); border-color: var(--accent); }
+.foot { padding: 10px 16px 14px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); display: grid; gap: 6px; }
+.foot label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.foot .ver { font-variant-numeric: tabular-nums; }
+/* 右:表单 */
+.form { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 22px 28px 20px; overflow-y: auto; }
+.form h2 { margin: 0 0 2px; font-size: 18px; }
+.form .hint { color: var(--muted); font-size: 12.5px; margin: 0 0 16px; }
+.seg { display: inline-flex; padding: 3px; background: var(--panel); border: 1px solid var(--line); border-radius: 9px; gap: 2px; }
+.seg button { border: 0; background: none; padding: 4px 14px; border-radius: 7px; cursor: pointer; color: var(--muted); font-size: 13px; }
+.seg button.on { background: var(--card); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.08); font-weight: 600; }
+.grid { display: grid; grid-template-columns: 1fr 110px; gap: 10px 12px; margin-top: 12px; }
+.full { grid-column: 1 / -1; }
+.f label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.f input[type=text], .f input[type=password], .f input[type=number], .f input:not([type]) {
+  width: 100%; padding: 7px 11px; border: 1px solid var(--line); border-radius: 9px; background: var(--bg); outline: none; transition: border-color .15s, box-shadow .15s; }
+.f input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+.chk { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); margin-top: 6px; cursor: pointer; }
+details { grid-column: 1 / -1; font-size: 12.5px; color: var(--muted); }
+details summary { cursor: pointer; user-select: none; }
+details .grid { margin-top: 10px; grid-template-columns: 1fr 1fr; }
+.sp { flex: 1; min-height: 14px; }
+.msg { min-height: 20px; font-size: 12.5px; margin: 10px 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg.err { color: var(--err); } .msg.ok { color: var(--ok); } .msg.busy { color: var(--muted); }
+.acts { display: flex; gap: 10px; align-items: center; }
+.btn { padding: 8px 16px; border-radius: 9px; border: 1px solid var(--line); background: var(--card); cursor: pointer; }
+.btn:hover { border-color: var(--accent); color: var(--accent); }
+.btn.primary { background: linear-gradient(180deg, var(--accent-2), var(--accent)); color: #fff; border-color: var(--accent); padding: 8px 22px; font-weight: 600; }
+.btn.primary:hover { filter: brightness(1.06); color: #fff; }
+.btn:disabled { opacity: .55; cursor: default; filter: none; }
+.btn.ghost { border-color: transparent; background: none; color: var(--muted); }
+.btn.ghost:hover { color: var(--err); }
+.spin { display: inline-block; width: 12px; height: 12px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+  animation: r .7s linear infinite; vertical-align: -2px; margin-right: 6px; }
+@keyframes r { to { transform: rotate(360deg); } }
+/* 指纹确认 */
+.modal { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: grid; place-items: center; z-index: 9; }
+.modal[hidden] { display: none; }
+.modal .box { width: min(460px, calc(100vw - 32px)); background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px 22px; box-shadow: var(--shadow); }
+.modal h3 { margin: 0 0 8px; font-size: 16px; }
+.modal p { margin: 6px 0; font-size: 13px; color: var(--muted); }
+.modal code { display: block; padding: 8px 10px; margin: 8px 0; background: var(--panel); border-radius: 8px; font-size: 12.5px; word-break: break-all; color: var(--text); }
+.modal .warn { color: var(--err); font-weight: 600; }
+.modal .acts { justify-content: flex-end; margin-top: 14px; }
+@media (max-width: 640px) { .list { display: none; } }
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside class="list">
+    <div class="brand"><img src="icon.png" alt=""><div><b>MeowNotebook</b><small id="chan">桌面客户端</small></div></div>
+    <div class="profiles" id="profiles"></div>
+    <button class="add" id="add">+ 新建连接</button>
+    <div class="foot">
+      <label><input type="checkbox" id="auto-connect"> 启动时自动连接上次的服务器</label>
+      <label><input type="checkbox" id="auto-update"> 自动更新应用</label>
+      <span class="ver" id="ver"></span>
+    </div>
+  </aside>
+  <form class="form" id="form" autocomplete="off">
+    <h2 id="f-title">新建连接</h2>
+    <p class="hint">用 SSH 登录运行着 MeowNotebook 的服务器,把它的网站端口转发到本机后直接打开。</p>
+    <div class="seg" id="kind">
+      <button type="button" data-v="ssh" class="on">SSH 服务器</button>
+      <button type="button" data-v="direct">直接打开网址</button>
+    </div>
+    <div class="grid" id="ssh-fields">
+      <div class="f full"><label>名称</label><input id="name" placeholder="比如:实验室服务器"></div>
+      <div class="f"><label>主机 / IP</label><input id="host" placeholder="192.168.1.10 或 example.com" spellcheck="false"></div>
+      <div class="f"><label>SSH 端口</label><input id="port" type="number" value="22" min="1" max="65535"></div>
+      <div class="f full"><label>用户名</label><input id="user" placeholder="登录服务器的用户名" spellcheck="false"></div>
+      <div class="f full">
+        <div class="seg" id="auth">
+          <button type="button" data-v="password" class="on">密码</button>
+          <button type="button" data-v="key">私钥</button>
+        </div>
+      </div>
+      <div class="f full" id="key-row" hidden><label>私钥文件</label><input id="key-path" placeholder="~/.ssh/id_ed25519" spellcheck="false"></div>
+      <div class="f full">
+        <label id="secret-label">密码</label>
+        <input id="secret" type="password" placeholder="">
+        <label class="chk"><input type="checkbox" id="remember"> 记住(存进系统钥匙串,不写进配置文件)</label>
+      </div>
+      <details>
+        <summary>高级</summary>
+        <div class="grid">
+          <div class="f"><label>服务器上的网站端口</label><input id="remote-port" type="number" value="8765"></div>
+          <div class="f"><label>本机端口(被占用时自动换)</label><input id="local-port" type="number" value="18765"></div>
+          <div class="f full" id="fp-row" hidden><label>已信任的服务器指纹</label><input id="fp" readonly></div>
+        </div>
+      </details>
+    </div>
+    <div class="grid" id="direct-fields" hidden>
+      <div class="f full"><label>名称</label><input id="d-name" placeholder="比如:本机"></div>
+      <div class="f full"><label>网址</label><input id="url" value="http://localhost:8765/" spellcheck="false"></div>
+      <p class="hint full" style="margin:0">网站在本机运行(mac 上 <code>ccweb</code>),或者已经用别的方式转发好了端口时用。</p>
+    </div>
+    <div class="sp"></div>
+    <div class="msg" id="msg"></div>
+    <div class="acts">
+      <button class="btn primary" id="go" type="submit">连接</button>
+      <button class="btn" id="save" type="button">只保存</button>
+      <span class="sp"></span>
+      <button class="btn ghost" id="del" type="button" hidden>删除</button>
+    </div>
+  </form>
+</div>
+<div class="modal" id="trust" hidden>
+  <div class="box">
+    <h3 id="t-title">第一次连接这台服务器</h3>
+    <p id="t-text">请确认服务器的指纹。可以在服务器上运行 <b>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</b> 对照。</p>
+    <code id="t-fp"></code>
+    <div class="acts"><button class="btn" id="t-no" type="button">取消</button><button class="btn primary" id="t-yes" type="button">信任并连接</button></div>
+  </div>
+</div>
+<script>
+const $ = s => document.querySelector(s);
+const invoke = (cmd, args) => window.__TAURI__.core.invoke(cmd, args);
+const st = { profiles: [], cur: null, kind: 'ssh', auth: 'password', hasSecret: new Set(), busy: false };
+const manual = new URLSearchParams(location.search).has('manual');
+
+function seg(el, v) { el.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.v === v)); }
+function setKind(v) { st.kind = v; seg($('#kind'), v); $('#ssh-fields').hidden = v !== 'ssh'; $('#direct-fields').hidden = v !== 'direct'; }
+function setAuth(v) {
+  st.auth = v; seg($('#auth'), v); $('#key-row').hidden = v !== 'key';
+  $('#secret-label').textContent = v === 'key' ? '私钥口令(没有就留空)' : '密码';
+  secretHint();
+}
+function secretHint() {
+  const saved = st.cur && st.hasSecret.has(st.cur.id);
+  $('#secret').placeholder = saved ? '已保存在钥匙串,留空即可' : '';
+}
+function msg(text, cls = '') { const m = $('#msg'); m.className = 'msg ' + cls; m.innerHTML = text; }
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+function renderList() {
+  $('#profiles').innerHTML = st.profiles.map(p => {
+    const addr = p.kind === 'direct' ? p.url : `${p.user}@${p.host}${p.port && p.port !== 22 ? ':' + p.port : ''}`;
+    return `<button type="button" class="pf ${st.cur?.id === p.id ? 'on' : ''}" data-id="${esc(p.id)}">
+      <span class="av">${esc((p.name || p.host || '?').trim().slice(0, 1).toUpperCase())}</span>
+      <span class="tx"><div class="nm">${esc(p.name || p.host || p.url)}</div><div class="ad">${esc(addr)}</div></span></button>`;
+  }).join('') || '<p style="color:var(--muted);font-size:12.5px;padding:6px 10px">还没有保存的连接</p>';
+}
+function fill(p) {
+  st.cur = p || null;
+  p = p || { kind: 'ssh', port: 22, auth: 'password', remote_port: 8765, local_port: 18765, url: 'http://localhost:8765/', remember: true };
+  $('#f-title').textContent = st.cur ? (p.name || p.host || '连接') : '新建连接';
+  setKind(p.kind || 'ssh'); setAuth(p.auth || 'password');
+  $('#name').value = p.name || ''; $('#d-name').value = p.name || '';
+  $('#host').value = p.host || ''; $('#port').value = p.port || 22; $('#user').value = p.user || '';
+  $('#key-path').value = p.key_path || '~/.ssh/id_ed25519'; $('#secret').value = '';
+  $('#remember').checked = !!p.remember;
+  $('#remote-port').value = p.remote_port || 8765; $('#local-port').value = p.local_port || 18765;
+  $('#url').value = p.url || 'http://localhost:8765/';
+  $('#fp-row').hidden = !p.fingerprint; $('#fp').value = p.fingerprint || '';
+  $('#del').hidden = !st.cur;
+  secretHint(); msg(''); renderList();
+}
+function collect() {
+  const direct = st.kind === 'direct';
+  return {
+    ...(st.cur || {}), id: st.cur?.id || '', kind: st.kind,
+    name: (direct ? $('#d-name') : $('#name')).value.trim(),
+    host: $('#host').value.trim(), port: +$('#port').value || 22, user: $('#user').value.trim(),
+    auth: st.auth, key_path: $('#key-path').value.trim(), remember: $('#remember').checked,
+    remote_port: +$('#remote-port').value || 8765, local_port: +$('#local-port').value || 18765,
+    url: $('#url').value.trim(), fingerprint: st.cur?.fingerprint ?? null,
+  };
+}
+function validate(p) {
+  if (p.kind === 'direct') return /^https?:\/\//.test(p.url) ? '' : '网址要以 http:// 或 https:// 开头';
+  if (!p.host) return '请填主机 / IP';
+  if (!p.user) return '请填用户名';
+  if (p.auth === 'key' && !p.key_path) return '请填私钥文件路径';
+  return '';
+}
+async function save() {
+  const p = collect(), bad = validate(p);
+  if (bad) { msg(bad, 'err'); return null; }
+  const saved = await invoke('save_profile', { profile: p });
+  const i = st.profiles.findIndex(x => x.id === saved.id);
+  if (i >= 0) st.profiles[i] = saved; else st.profiles.push(saved);
+  st.cur = saved; renderList(); $('#del').hidden = false; $('#f-title').textContent = saved.name || saved.host || '连接';
+  return saved;
+}
+async function connect(p, secret, trust) {
+  st.busy = true; $('#go').disabled = true;
+  msg(`<span class="spin"></span>正在连接 ${esc(p.kind === 'direct' ? p.url : p.host)}…`, 'busy');
+  try {
+    const url = await invoke('connect', { id: p.id, secret: secret || null, trust: trust || null });
+    msg('已连接,正在打开…', 'ok');
+    if (p.kind === 'direct') {  // 直连:先确认网站在运行,免得打开一个连不上的空白页
+      try { await fetch(url, { mode: 'no-cors', cache: 'no-store' }); }
+      catch { throw { code: 'connect', message: '打不开这个网址:网站没在运行?(在服务器 / 本机上运行 ccweb)' }; }
+    }
+    location.replace(url);
+  } catch (e) {
+    st.busy = false; $('#go').disabled = false;
+    const code = e?.code, text = e?.message || String(e);
+    if (code === 'unknown_host' || code === 'host_key_changed') return askTrust(p, secret, e);
+    if (code === 'need_secret') { msg('请输入密码', 'err'); $('#secret').focus(); return; }
+    if (code === 'auth') { $('#secret').value = ''; }
+    msg(esc(text), 'err');
+  }
+}
+function askTrust(p, secret, e) {
+  const changed = e.code === 'host_key_changed';
+  $('#t-title').textContent = changed ? '⚠ 服务器指纹变了' : '第一次连接这台服务器';
+  $('#t-text').innerHTML = changed
+    ? `<span class="warn">和上次信任的指纹不一样。</span>如果服务器重装过系统,这是正常的;否则可能有人在冒充服务器,请不要继续。<br>之前:<b>${esc(e.expected)}</b>`
+    : '请确认服务器的指纹。可以在服务器上运行 <b>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</b> 对照。';
+  $('#t-fp').textContent = changed ? e.got : e.fingerprint;
+  $('#trust').hidden = false;
+  $('#t-yes').onclick = () => { $('#trust').hidden = true; connect(p, secret, changed ? e.got : e.fingerprint); };
+  $('#t-no').onclick = () => { $('#trust').hidden = true; msg('已取消', ''); };
+  msg('');
+}
+
+$('#kind').addEventListener('click', e => { const b = e.target.closest('button'); if (b) setKind(b.dataset.v); });
+$('#auth').addEventListener('click', e => { const b = e.target.closest('button'); if (b) setAuth(b.dataset.v); });
+$('#profiles').addEventListener('click', e => {
+  const b = e.target.closest('.pf'); if (!b || st.busy) return;
+  fill(st.profiles.find(p => p.id === b.dataset.id));
+});
+$('#add').addEventListener('click', () => !st.busy && fill(null));
+$('#save').addEventListener('click', async () => { if (await save()) msg('已保存', 'ok'); });
+$('#del').addEventListener('click', async () => {
+  if (!st.cur || !confirm(`删除连接「${st.cur.name || st.cur.host}」?`)) return;
+  await invoke('delete_profile', { id: st.cur.id });
+  st.profiles = st.profiles.filter(p => p.id !== st.cur.id);
+  fill(st.profiles[0] || null);
+});
+$('#form').addEventListener('submit', async e => {
+  e.preventDefault(); if (st.busy) return;
+  const secret = $('#secret').value;
+  const p = await save(); if (!p) return;
+  connect(p, secret);
+});
+$('#auto-connect').addEventListener('change', e => invoke('set_options', { autoConnect: e.target.checked }));
+$('#auto-update').addEventListener('change', e => invoke('set_options', { autoUpdate: e.target.checked }));
+
+(async () => {
+  const s = await invoke('get_state');
+  st.profiles = s.profiles; st.hasSecret = new Set(s.has_secret);
+  $('#ver').textContent = `版本 ${s.version}` + (s.channel === 'dev' ? ' · 开发版' : '');
+  $('#chan').textContent = s.channel === 'dev' ? '桌面客户端 · 开发版' : '桌面客户端';
+  $('#auto-connect').checked = s.auto_connect; $('#auto-update').checked = s.auto_update;
+  const last = s.profiles.find(p => p.id === s.last);
+  fill(last || s.profiles[0] || null);
+  // 自动连接:上次那台,而且不需要现输密码(私钥、或密码已存进钥匙串)
+  const ready = last && (last.kind === 'direct' || last.auth === 'key' || st.hasSecret.has(last.id)) && (last.kind === 'direct' || last.fingerprint);
+  if (s.auto_connect && ready && !manual) connect(last);
+})();
+</script>
+</body>
+</html>

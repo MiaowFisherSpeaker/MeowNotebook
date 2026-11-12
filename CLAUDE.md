@@ -1,6 +1,6 @@
 # MeowNotebook
 
-用户说"帮我配置 QQ 机器人"(README 建议的说法是"帮我配置 QQ 机器人,不要在会话中明文显示 AppSecret")时,按 README.md 第三部分"QQ 机器人手动配置"的步骤带用户做:
+用户说"帮我配置 QQ 机器人"(README 建议的说法是"帮我配置 QQ 机器人,不要在会话中明文显示 AppSecret")时,按 README.md 第五部分"QQ 机器人手动配置"的步骤带用户做:
 
 - **绝不让用户把 AppSecret 发在对话里**(会话记录会显示在网站上)。请用户在自己的终端里运行
   `python3 ccnb.py qq setup`(交互式输入,不回显;不能用 `!` 在 cc 里运行),它会先验证再写入 `data/qqbot.json`。

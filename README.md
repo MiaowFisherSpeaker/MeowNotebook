@@ -5,7 +5,9 @@
 
 - [一、快速上手](#一快速上手)
 - [二、QQ 机器人(可选)](#二qq-机器人可选)
-- [三、详细配置与自定义](#三详细配置与自定义)
+- [三、桌面客户端(Windows / macOS)](#三桌面客户端windows--macos)
+- [四、版本与更新](#四版本与更新)
+- [五、详细配置与自定义](#五详细配置与自定义)
 
 ---
 
@@ -83,7 +85,7 @@ cd ~/projects/MeowNotebook && ./install.sh     # 卸载: ./install.sh --uninstal
    它会带你做完剩下的步骤。AppSecret 要在你自己的终端里运行 `python3 ccnb.py qq setup` 输入(不显示),
    不要直接发在对话里:对话会被记录,也会显示在网站上。
 
-想自己动手,见第三部分的 [QQ 机器人手动配置](#qq-机器人手动配置)。
+想自己动手,见第五部分的 [QQ 机器人手动配置](#qq-机器人手动配置)。
 
 ### 使用
 
@@ -113,7 +115,50 @@ cd ~/projects/MeowNotebook && ./install.sh     # 卸载: ./install.sh --uninstal
 
 ---
 
-## 三、详细配置与自定义
+## 三、桌面客户端(Windows / macOS)
+
+网站跑在服务器上(Linux / macOS,装好本项目)。桌面客户端只是一个很薄的壳:**登录界面填服务器的 SSH 信息,
+它把服务器的 8765 端口转发到本机,然后直接打开网站**。网页由服务器提供,网站更新不需要更新客户端。
+
+- 下载:[Releases](https://github.com/MiaowFisherSpeaker/MeowNotebook/releases) 里的 `*-setup.exe`(Windows)或 `.dmg`(macOS,Intel 和 Apple 芯片通用)。
+  macOS 包没有苹果开发者签名:第一次打开在"访达"里**右键 → 打开**;提示"已损坏"时运行 `xattr -cr "/Applications/MeowNotebook.app"`。
+- 登录:主机 / IP、SSH 端口、用户名,用**密码**或**私钥**(如 `~/.ssh/id_ed25519`)。SSH 是客户端自己实现的,不需要系统里装 ssh。
+  - 第一次连接会显示服务器指纹请你确认,以后指纹变了会拒绝连接并提醒(防止有人冒充服务器)。
+  - 勾选"记住"时,密码 / 私钥口令存进系统钥匙串(macOS 钥匙串、Windows 凭据管理器),不写进配置文件。
+  - "高级"里可以改服务器上的网站端口(默认 8765)和本机端口(默认 18765,被占用时自动换)。
+  - 网站就在本机(mac 上直接 `ccweb`)或已经用别的方式转发好时,选"直接打开网址"。
+- 菜单"切换服务器"(Ctrl/⌘+Shift+L)回到登录界面;断网、睡眠唤醒后隧道会自动重连。
+- 很省电:用系统自带的浏览器内核(WebView2 / WKWebView),没有常驻的后台进程;网页本身的"节能模式"照常生效。
+- 客户端自己的更新:启动时检查,有新版本**询问**你是否更新;菜单里"自动更新应用"打开后才会自动装(默认关)。
+- 正式版和开发版是两个独立的应用("MeowNotebook" / "MeowNotebook Dev"),可以同时安装,各自跟各自的更新。
+
+自己构建:装好 Rust 和 Node.js,`cd app && npm ci && npm run build`(开发版 `npm run build:dev`)。
+Windows 只能在 Windows 上打包,macOS 只能在 macOS 上打包;平时由 GitHub Actions 自动构建(见下一节)。
+
+---
+
+## 四、版本与更新
+
+- 版本号写在仓库根目录的 `VERSION`(语义化版本 `主.次.修订`)。正式版是 tag `vX.Y.Z`;不在 tag 上的提交显示为 `X.Y.Z-dev+提交号`。
+- **网站的更新**:网页左下角 ⚙ → 设置 → 版本与更新。
+  - 通道:**正式版**跟最新的 `vX.Y.Z`;**开发版**跟 `main` 分支的每次提交。
+  - 每 6 小时检查一次(`git fetch`),有新版本时页面顶部提示,点"更新"才更新;**自动更新默认关**。
+  - 更新只做快进(`git merge --ff-only`),然后自动重启网站;cc 会话在 tmux 里,不受影响。
+    本地改过代码、或有自己的提交时不会动它,只提示原因。
+  - 环境变量 `CCNB_UPDATE=off` 关掉检查,`CCNB_UPDATE_HOURS` 改检查间隔。
+- **发布新版本**(维护者):
+
+  ```bash
+  python3 scripts/release.py 1.2.0       # 改各处版本号、写 CHANGELOG.md、提交并打 tag(不推送)
+  git push && git push origin v1.2.0     # 推送后 GitHub Actions 构建 exe / dmg 并发布 Release
+  ```
+
+  开发版客户端:GitHub 上 Actions → 桌面客户端 → Run workflow,发布到预发布 `app-dev`。
+  第一次使用前,在仓库 Settings → Secrets 里加 `TAURI_SIGNING_PRIVATE_KEY`(客户端更新包的签名私钥)。
+
+---
+
+## 五、详细配置与自定义
 
 ### 环境变量
 
@@ -206,8 +251,16 @@ python3 ccnb.py qq probe           # QQ 机器人排查
 
 - `cc` 把会话放进专用的 tmux(`tmux -L ccnb`),网页底部接的是**同一个**会话,两边画面和输入完全同步;
   只转发终端字节,不额外消耗 token。两边同时连着时,窗口尺寸跟随最近操作的那一边。
-- 拖动底部标题栏调高度;"移到右侧"把终端放到右边栏(拖左边缘调宽度),"移到底部"放回来,选择会记住(默认在底部,窄屏上总在底部)。
-  切换时正文变窄 / 变宽,正在读的那段文字保持在原来的位置。"结束会话"关闭这个 cc(记录保留)。
+- "结束会话"关闭这个 cc(记录保留)。
+
+**布局**
+
+- 左边的图标栏:会话、文件、终端、收藏、总结,下面是 QQ 状态、节能模式和设置。点面板图标显示 / 收起它。
+- 会话、文件、终端都是可以移动的面板:**拖动面板的标题**放到左侧、右侧或底部,同一处的多个面板变成标签页;
+  也可以点标题栏右边的"⋯"选择移到哪里。拖边缘调整大小;布局会记住,设置里可以恢复默认(会话、文件在左,终端在底部)。
+- Ctrl/⌘+B 收起 / 展开左侧,Ctrl/⌘+J 收起 / 展开终端(焦点在终端里时不拦截,cc 自己要用 Ctrl+B)。
+- 改变布局时正文变窄 / 变宽,正在读的那段文字保持在原来的位置。窄屏(手机)上会话、文件是抽屉,终端总在底部。
+- 设置里可以选主题(跟随系统 / 浅色 / 深色)。
 - 网络差时敲的键不会丢:每次输入都等服务器确认,断线重连后补发,不会重复。等太久状态栏会提示,
   断开超过 30 秒的输入不再补发并提示重新输入;页面其余请求连续失败时右下角显示"网络不稳定"。
 - 会话正被别的 cc 进程使用(别的终端,或者 QQ 正在回答)时,"在此继续对话"会禁用,避免两个进程同时写同一会话。
@@ -251,6 +304,9 @@ python3 ccnb.py qq probe           # QQ 机器人排查
 | `term.py` | tmux 会话管理、网页终端的 WebSocket 桥接 |
 | `qqbot.py` | QQ 机器人(可选) |
 | `hook.py` | 挂在 `cc` 启动的进程上的 hook,记录终端当前所在会话 |
+| `updater.py` | 版本号与网站自身的更新(检查、快进、重启) |
+| `app/` | 桌面客户端(Tauri):`ui/` 登录界面,`src-tauri/src/tunnel.rs` SSH 端口转发 |
+| `scripts/release.py` | 发布新版本:统一版本号、CHANGELOG、打 tag |
 | `static/` | 前端(原生 JS;marked、DOMPurify、KaTeX、xterm.js、highlight.js、字体都在 `static/vendor/`,离线可用) |
 | `skill/qa-notes/` | `/qa-notes` 的整理规则 |
 | `shell/cc.bash` | `cc` / `ccr` / `cca` / `ccls` / `ccweb` / `ccd` 的定义 |

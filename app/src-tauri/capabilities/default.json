@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "只给应用自带的登录页;连上后加载的网站页面拿不到任何原生接口",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

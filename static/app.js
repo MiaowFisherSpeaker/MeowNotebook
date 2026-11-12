@@ -370,7 +370,7 @@ $('#sessions').addEventListener('click', async e => {
     nb.disabled = false;
     if (r.error) return toast(r.error);
     await loadTerms();
-    if (r.sid) { location.hash = '#/s/' + r.sid; if (narrow.matches) showSide(false, false); }
+    if (r.sid) { location.hash = '#/s/' + r.sid; if (narrow.matches) showSide(false); }
     loadSessions();
     return;
   }
@@ -883,9 +883,8 @@ function layoutMap() {
   const toc = $('#toc');
   const top = ($('#top')?.offsetHeight || 80) + 8;
   setVar($('#main'), '--top-h', (top - 8) + 'px');
-  const dockH = $('#view').classList.contains('file') || $('#view').classList.contains('stars') || dockAside() ? 0 : dock.offsetHeight;
   setVar(toc, '--toc-top', top + 'px');
-  setVar(toc, '--toc-h', Math.max(160, window.innerHeight - top - dockH - 8) + 'px');
+  setVar(toc, '--toc-h', Math.max(160, $('#main').clientHeight - top - 8) + 'px');
 }
 function spy() {
   if (!qmap.items.length) return;
@@ -1033,7 +1032,9 @@ async function loadTerms() {
 
 function syncDock() {
   requestAnimationFrame(layoutMap);
-  if (!state.data || $('#view').classList.contains('stars') || $('#view').classList.contains('file')) return detachTerm();
+  const idle = !state.data || $('#view').classList.contains('stars') || $('#view').classList.contains('file');
+  if (dock.classList.contains('idle') !== idle) { dock.classList.toggle('idle', idle); renderZones(); }
+  if (idle) { dock.classList.remove('on'); setZoneInfo(); return detachTerm(); }
   const t = tv.bySid.get(state.data.meta.id);
   if (t) {
     dock.classList.add('on');
@@ -1050,8 +1051,9 @@ function syncDock() {
     $('#dock-go').textContent = owner?.job ? '▶ 接入后台会话' : '▶ 在此继续对话';
     $('#dock-status').textContent = owner ? `在${owner.label}里运行中` : '未运行';
     if (owner) $('#dock-tip').textContent = owner.message;
-    else $('#dock-tip').innerHTML = '将以 <code>--resume</code> 在后台启动(bypass 模式),底部出现与终端完全相同的输入框。';
+    else $('#dock-tip').innerHTML = '将以 <code>--resume</code> 在后台启动(bypass 模式),这里出现与终端完全相同的输入框。';
   }
+  setZoneInfo();
 }
 
 function fitTerm() {
@@ -1206,47 +1208,6 @@ setInterval(() => {
   inputStatus();
 }, 1000);
 
-// 位置:底部(默认)或右侧边栏,记住选择;窄屏上总在底部。底部时拖标题栏调高度,右侧时拖左边缘调宽度
-const dockPos = { right: localGet('dockPos', 'bottom') === 'right' };
-const dockAside = () => getComputedStyle(dock).position === 'fixed';
-function setDockPos(right) {
-  dockPos.right = right;
-  localSet('dockPos', right ? 'right' : 'bottom');
-  document.body.classList.toggle('dock-right', right);
-  $('#dock-pos').textContent = right ? '移到底部' : '移到右侧';
-  requestAnimationFrame(() => { layoutMap(); fitTerm(); tv.term?.focus(); });
-}
-function setDockW(px) {
-  px = Math.max(320, Math.min(window.innerWidth - 520, px));
-  document.body.style.setProperty('--dock-w', px + 'px');
-  localSet('dockW', String(px));
-}
-setDockW(+localGet('dockW', '640'));
-setDockPos(dockPos.right);
-$('#dock-pos').addEventListener('click', () => setDockPos(!dockPos.right));
-$('#dock-edge').addEventListener('mousedown', e => {
-  e.preventDefault();
-  document.body.classList.add('dragging');
-  const move = ev => setDockW(window.innerWidth - ev.clientX);
-  const up = () => { removeEventListener('mousemove', move); removeEventListener('mouseup', up);
-    document.body.classList.remove('dragging'); fitTerm(); };
-  addEventListener('mousemove', move); addEventListener('mouseup', up);
-});
-
-function setDockH(px) {
-  px = Math.max(120, Math.min(window.innerHeight - 160, px));
-  dock.style.setProperty('--dock-h', px + 'px');
-  localSet('dockH', String(px));
-  requestAnimationFrame(layoutMap);
-}
-setDockH(+localGet('dockH', '300'));
-$('#dock-bar').addEventListener('mousedown', e => {
-  if (e.target.closest('button') || dockAside()) return;
-  e.preventDefault();
-  const move = ev => setDockH(window.innerHeight - ev.clientY - $('#dock-bar').offsetHeight);
-  const up = () => { removeEventListener('mousemove', move); removeEventListener('mouseup', up); fitTerm(); };
-  addEventListener('mousemove', move); addEventListener('mouseup', up);
-});
 $('#termbox').addEventListener('click', () => tv.term?.focus());
 $('#term-overlay').addEventListener('click', () => { clearTimeout(tv.retry); if (tv.name) connectTerm(); });
 
@@ -1277,19 +1238,12 @@ const dirname = p => p.replace(/\/[^/]*$/, '') || '/';
 const fileIcon = (e) => e.dir ? '▸' : /\.(png|jpe?g|gif|webp|bmp|avif|svg)$/i.test(e.name) ? '◩' : /\.pdf$/i.test(e.name) ? '▤'
   : /\.(md|markdown|txt)$/i.test(e.name) ? '≡' : '·';
 
-function setSide(which) {
-  localSet('side-tab', which);
-  document.querySelectorAll('.side-tabs button').forEach(b => b.classList.toggle('on', b.dataset.side === which));
-  $('#side-sessions').hidden = which !== 'sessions';
-  $('#side-files').hidden = which !== 'files';
-  // 优先显示当前上下文:正在预览的文件所在目录 > 当前会话目录 > 上次浏览的目录
-  if (which === 'files') {
-    const want = !$('#view').hidden && $('#view').classList.contains('file') && fs.file ? dirname(fs.file)
-      : state.data?.meta.cwd || fs.dir || '~';
-    if (want !== fs.dir || !$('#fs-list').childElementCount) loadDir(want);
-  }
+// 文件面板显示出来时:优先显示当前上下文 —— 正在预览的文件所在目录 > 当前会话目录 > 上次浏览的目录
+function onFilesShown() {
+  const want = !$('#view').hidden && $('#view').classList.contains('file') && fs.file ? dirname(fs.file)
+    : state.data?.meta.cwd || fs.dir || '~';
+  if (want !== fs.dir || !$('#fs-list').childElementCount) loadDir(want);
 }
-document.querySelectorAll('.side-tabs button').forEach(b => b.addEventListener('click', () => setSide(b.dataset.side)));
 
 async function loadDir(path) {
   const r = await fetch(`/api/fs/list?path=${encodeURIComponent(path)}&hidden=${$('#fs-hidden').checked ? 1 : 0}`)
@@ -1325,7 +1279,7 @@ async function openFile(path, line) {
     $('#title').textContent = path.split('/').pop(); $('#sub').innerHTML = `<span>${esc(path)}</span>`;
     $('#article').innerHTML = `<div class="hint">${esc(r.error)}</div>`; renderMap([]); return;
   }
-  if (r.kind === 'dir') { setSide('files'); loadDir(r.path); history.back(); return; }
+  if (r.kind === 'dir') { showPanel('files'); loadDir(r.path); history.back(); return; }
   fs.file = r.path;
   const raw = `/api/fs/raw?path=${encodeURIComponent(r.path)}`;
   $('#title').textContent = r.name;
@@ -1363,7 +1317,7 @@ async function openFile(path, line) {
     art.innerHTML = `<div class="hint">${r.kind === 'large' ? '文件超过 2 MB,不在页面里预览。' : '二进制文件,无法预览。'}<br>可以用右上角"下载"。</div>`; renderMap([]);
   }
   if (!line) $('#main').scrollTop = 0;
-  if (!$('#side-files').hidden && dirname(r.path) !== fs.dir) loadDir(dirname(r.path));
+  if (panelShown('files') && dirname(r.path) !== fs.dir) loadDir(dirname(r.path));
   else $('#fs-list').querySelectorAll('.fe').forEach(a => a.classList.toggle('on', a.getAttribute('href') === '#/f/' + encodeURIComponent(r.path)));
 }
 
@@ -1376,7 +1330,7 @@ function starBtn(sid, ts) {
 function setStars(list) {
   state.stars = list;
   state.starKeys = new Set(list.map(x => starKey(x.sid, x.ts)));
-  $('#star-count').textContent = list.length ? `(${list.length})` : '';
+  $('#star-count').textContent = list.length > 99 ? '99+' : list.length || '';
 }
 async function loadStars() {
   const r = await fetch('/api/stars').then(r => r.json()).catch(() => null);
@@ -1572,24 +1526,260 @@ document.querySelectorAll('[data-copy]').forEach(b => b.addEventListener('click'
   try { await navigator.clipboard.writeText(text); toast('已复制: ' + text); }
   catch { prompt('复制下面的命令', text); }
 }));
-// 窄屏(手机)上侧栏是盖在内容上的抽屉:默认收起,点遮罩或选了会话 / 文件后自动收起,开关状态不记到桌面端
+// ---------- 布局:面板(会话 / 文件 / 终端)放在左 / 右 / 底三个停靠区,拖标题移动,同一区的多个面板变成标签页 ----------
 const narrow = matchMedia('(max-width: 900px)');
-function showSide(on, remember = !narrow.matches) {
-  document.body.classList.toggle('side-hidden', !on);
-  if (remember) localSet('side', on ? '1' : '0');
-  setTimeout(fitTerm, 0);
+const PANELS = {
+  sessions: { title: '会话', icon: 'chat' },
+  files: { title: '文件', icon: 'folder' },
+  terminal: { title: '终端', icon: 'term' },
+};
+const ZONE_NAMES = { left: '左侧', right: '右侧', bottom: '底部' };
+const SIZE = { left: [200, 640], right: [280, 1400], bottom: [120, 2000] };
+function defaultLayout() {
+  return { v: 1, zones: {
+    left: { panels: ['sessions', 'files'], active: 'sessions', open: true, size: 300 },
+    right: { panels: [], active: null, open: true, size: 560 },
+    bottom: { panels: ['terminal'], active: 'terminal', open: true, size: 300 },
+  } };
 }
-$('#toggle-side').addEventListener('click', () => showSide(false));
+function loadLayout() {
+  let l = null;
+  try { l = JSON.parse(localGet('layout', 'null')); } catch {}
+  if (!l || l.v !== 1) {  // 从旧版本迁移:终端位置 / 尺寸、侧栏开关、侧栏标签
+    l = defaultLayout();
+    const z = l.zones;
+    if (localGet('dockPos', '') === 'right') { z.bottom.panels = []; z.bottom.active = null; z.right.panels = ['terminal']; z.right.active = 'terminal'; }
+    const w = +localGet('dockW', '0'), h = +localGet('dockH', '0');
+    if (w) z.right.size = w;
+    if (h) z.bottom.size = h + 31;  // 旧版只记终端本身的高度,新版含标题栏
+    if (localGet('side', '1') === '0') z.left.open = false;
+    if (localGet('side-tab', '') === 'files') z.left.active = 'files';
+  }
+  // 少了的面板补回默认位置,多余 / 重复的去掉
+  const seen = new Set();
+  for (const z of Object.values(l.zones)) {
+    z.panels = z.panels.filter(p => PANELS[p] && !seen.has(p) && seen.add(p));
+    if (!z.panels.includes(z.active)) z.active = z.panels[0] || null;
+  }
+  const d = defaultLayout().zones;
+  for (const p of Object.keys(PANELS)) if (!seen.has(p)) {
+    const zn = Object.keys(d).find(k => d[k].panels.includes(p));
+    l.zones[zn].panels.push(p); l.zones[zn].active ||= p;
+  }
+  return l;
+}
+let lay = loadLayout();
+const saveLayout = () => localSet('layout', JSON.stringify(lay));
+const zoneOf = p => Object.keys(lay.zones).find(k => lay.zones[k].panels.includes(p));
+// 窄屏:左侧抽屉放除终端外的所有面板,终端固定在底部,不用右侧
+function effective() {
+  if (!narrow.matches) return lay.zones;
+  const others = Object.keys(PANELS).filter(p => p !== 'terminal');
+  return {
+    left: { panels: others, active: others.includes(lay.mobile) ? lay.mobile : 'sessions', open: true, size: 300 },
+    right: { panels: [], active: null, open: false, size: 0 },
+    bottom: { panels: ['terminal'], active: 'terminal', open: true, size: lay.zones[zoneOf('terminal')].size },
+  };
+}
+function panelShown(p) {
+  const z = effective()[Object.keys(effective()).find(k => effective()[k].panels.includes(p))];
+  return !!z && z.open && z.active === p && (!narrow.matches || p === 'terminal' || !document.body.classList.contains('side-hidden'));
+}
+function renderZones() {
+  const E = effective();
+  for (const [zn, z] of Object.entries(E)) {
+    const el = $('#z-' + zn), body = el.querySelector('.zbody');
+    for (const p of z.panels) {
+      const pe = $('#p-' + p);
+      if (pe.parentNode !== body) body.appendChild(pe);
+      pe.hidden = p !== z.active;
+    }
+    el.hidden = !z.panels.length || !z.open;
+    // 底部只放着终端、又没有打开会话时,只留一条标题栏
+    el.classList.toggle('min', zn === 'bottom' && z.active === 'terminal' && dock.classList.contains('idle'));
+    if (zn !== 'bottom' || !narrow.matches) el.style.setProperty(zn === 'bottom' ? '--zh-bottom' : '--zw-' + zn, z.size + 'px');
+    const tabs = z.panels.map(p => `<button class="ztab${p === z.active ? ' on' : ''}" data-p="${p}" title="点击切换;拖动可移到别处">` +
+      `<svg class="i"><use href="#i-${PANELS[p].icon}"/></svg>${PANELS[p].title}</button>`).join('');
+    el.querySelector('.zhead').innerHTML = tabs + `<span class="zinfo"></span><span class="sp"></span>` +
+      (narrow.matches ? '' : `<button class="zbtn" data-act="menu" title="移动面板 / 布局"><svg class="i"><use href="#i-more"/></svg></button>`) +
+      `<button class="zbtn" data-act="close" title="收起${zn === 'bottom' ? '(Ctrl/⌘+J)' : zn === 'left' ? '(Ctrl/⌘+B)' : ''}"><svg class="i"><use href="#i-min"/></svg></button>`;
+  }
+  document.querySelectorAll('#rail [data-panel]').forEach(b => b.classList.toggle('on', panelShown(b.dataset.panel)));
+  setZoneInfo();
+  requestAnimationFrame(() => { fitTerm(); layoutMap(); spy(); });
+}
+// 底部收起成一条时,标题栏上显示终端状态
+function setZoneInfo() {
+  const zn = zoneOf('terminal'), el = $('#z-' + (narrow.matches ? 'bottom' : zn))?.querySelector('.zinfo');
+  if (el) el.textContent = dock.classList.contains('idle') ? '打开会话后可用' : '';
+}
+function showPanel(p, toggle = false) {
+  if (narrow.matches) {
+    if (p !== 'terminal') {
+      if (toggle && panelShown(p)) { showSide(false); return; }
+      lay.mobile = p; document.body.classList.remove('side-hidden');
+    }
+  } else {
+    const z = lay.zones[zoneOf(p)];
+    if (toggle && panelShown(p)) z.open = false;
+    else { z.open = true; z.active = p; }
+  }
+  saveLayout(); renderZones();
+  if (panelShown(p)) {
+    if (p === 'files') onFilesShown();
+    if (p === 'terminal') setTimeout(() => tv.term?.focus(), 50);
+    if (p === 'sessions' && !toggle) $('#search').focus();
+  }
+}
+function movePanel(p, to, before = null) {
+  const from = lay.zones[zoneOf(p)], dest = lay.zones[to];
+  from.panels = from.panels.filter(x => x !== p);
+  if (from.active === p) from.active = from.panels[0] || null;
+  const i = before ? dest.panels.indexOf(before) : -1;
+  if (i >= 0) dest.panels.splice(i, 0, p); else dest.panels.push(p);
+  dest.active = p; dest.open = true;
+  saveLayout(); renderZones();
+  if (p === 'files') onFilesShown();
+}
+function toggleZone(zn) {
+  const z = lay.zones[zn];
+  if (!z.panels.length) return;
+  z.open = !z.open; saveLayout(); renderZones();
+}
+document.querySelectorAll('#rail [data-panel]').forEach(b => b.addEventListener('click', () => showPanel(b.dataset.panel, true)));
+
+// 标题栏:点标签切换,拖标签移动;"…"菜单;"−"收起
+const zdrag = { p: null, x: 0, y: 0, on: false, target: null };
+document.querySelectorAll('.zone .zhead').forEach(h => {
+  h.addEventListener('pointerdown', e => {
+    const t = e.target.closest('.ztab');
+    if (!t || e.button !== 0 || narrow.matches) return;
+    Object.assign(zdrag, { p: t.dataset.p, x: e.clientX, y: e.clientY, on: false, target: null });
+  });
+  h.addEventListener('click', e => {
+    const t = e.target.closest('.ztab'), b = e.target.closest('.zbtn');
+    const zn = h.parentNode.dataset.zone;
+    if (t) {
+      if (narrow.matches) { lay.mobile = t.dataset.p; saveLayout(); renderZones(); if (t.dataset.p === 'files') onFilesShown(); return; }
+      const z = lay.zones[zn];
+      if (z.active !== t.dataset.p) { z.active = t.dataset.p; saveLayout(); renderZones(); if (z.active === 'files') onFilesShown(); }
+    } else if (b?.dataset.act === 'close') {
+      if (narrow.matches && zn === 'left') showSide(false); else toggleZone(narrow.matches ? zoneOf('terminal') : zn);
+    } else if (b?.dataset.act === 'menu') openZoneMenu(zn, b);
+  });
+});
+function dropTarget(x, y) {
+  const W = innerWidth, H = innerHeight, rail = $('#rail').offsetWidth;
+  const head = document.elementsFromPoint(x, y).find(el => el.classList?.contains('zhead'));
+  const z = head ? head.parentNode.dataset.zone : x < rail + Math.min(320, W * .22) ? 'left' : x > W - Math.min(380, W * .25) ? 'right'
+    : y > H * .62 ? 'bottom' : null;
+  if (!z) return null;
+  const el = $('#z-' + z), shown = !el.hidden;
+  const r = shown ? el.getBoundingClientRect() : null;
+  const box = shown ? { l: r.left, t: r.top, w: r.width, h: r.height }
+    : z === 'left' ? { l: rail, t: 0, w: lay.zones.left.size, h: H }
+    : z === 'right' ? { l: W - lay.zones.right.size, t: 0, w: lay.zones.right.size, h: H }
+    : { l: rail + ($('#z-left').hidden ? 0 : $('#z-left').offsetWidth), t: H - lay.zones.bottom.size,
+        w: $('#center').offsetWidth, h: lay.zones.bottom.size };
+  const tab = head && document.elementsFromPoint(x, y).find(el => el.classList?.contains('ztab'));
+  return { z, box, before: tab && tab.dataset.p !== zdrag.p ? tab.dataset.p : null };
+}
+addEventListener('pointermove', e => {
+  if (!zdrag.p) return;
+  if (!zdrag.on) {
+    if (Math.hypot(e.clientX - zdrag.x, e.clientY - zdrag.y) < 6) return;
+    zdrag.on = true;
+    document.body.classList.add('dragging');
+    $('#drop').hidden = false;
+    $('#drop-ghost').textContent = PANELS[zdrag.p].title;
+  }
+  const g = $('#drop-ghost'); g.style.left = e.clientX + 'px'; g.style.top = e.clientY + 'px';
+  // 遮罩挡住了下面的元素,找落点时先让它不接收指针
+  $('#drop').style.pointerEvents = 'none';
+  const t = zdrag.target = dropTarget(e.clientX, e.clientY);
+  $('#drop').style.pointerEvents = '';
+  const h = $('#drop-hint');
+  h.classList.toggle('on', !!t);
+  if (t) {
+    Object.assign(h.style, { left: t.box.l + 6 + 'px', top: t.box.t + 6 + 'px', width: t.box.w - 12 + 'px', height: t.box.h - 12 + 'px' });
+    h.dataset.label = `放到${ZONE_NAMES[t.z]}`;
+  }
+});
+addEventListener('pointerup', () => {
+  if (!zdrag.p) return;
+  const { p, on, target } = zdrag;
+  zdrag.p = null;
+  if (!on) return;
+  document.body.classList.remove('dragging');
+  $('#drop').hidden = true; $('#drop-hint').classList.remove('on');
+  if (target && (zoneOf(p) !== target.z || target.before)) movePanel(p, target.z, target.before);
+});
+addEventListener('pointercancel', () => { zdrag.p = null; document.body.classList.remove('dragging'); $('#drop').hidden = true; });
+
+function openZoneMenu(zn, btn) {
+  const z = lay.zones[zn], m = $('#zmenu');
+  const items = z.active ? Object.keys(ZONE_NAMES).filter(k => k !== zn)
+    .map(k => `<button data-move="${k}">把「${PANELS[z.active].title}」移到${ZONE_NAMES[k]}</button>`) : [];
+  m.innerHTML = items.join('') + '<hr><button data-reset>恢复默认布局</button>';
+  m.hidden = false;
+  const r = btn.getBoundingClientRect();
+  m.style.left = Math.min(innerWidth - m.offsetWidth - 8, r.right - m.offsetWidth) + 'px';
+  m.style.top = (r.bottom + 4 + m.offsetHeight > innerHeight ? r.top - m.offsetHeight - 4 : r.bottom + 4) + 'px';
+  m.onclick = e => {
+    const b = e.target.closest('button'); if (!b) return;
+    m.hidden = true;
+    if (b.dataset.move) movePanel(z.active, b.dataset.move);
+    else if ('reset' in b.dataset) resetLayout();
+  };
+}
+document.addEventListener('pointerdown', e => { if (!e.target.closest('#zmenu, .zbtn')) $('#zmenu').hidden = true; });
+function resetLayout() { lay = defaultLayout(); saveLayout(); renderZones(); toast('已恢复默认布局'); }
+
+// 拖边缘调整大小
+document.querySelectorAll('.zone .zsplit').forEach(sp => sp.addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  const zn = sp.parentNode.dataset.zone, z = lay.zones[zn], el = sp.parentNode;
+  const vert = zn === 'bottom';
+  document.body.classList.add('resizing', vert ? 'ns' : 'ew'); sp.classList.add('on');
+  const move = ev => {
+    const r = el.getBoundingClientRect();
+    let v = zn === 'left' ? ev.clientX - r.left : zn === 'right' ? r.right - ev.clientX : r.bottom - ev.clientY;
+    const max = vert ? innerHeight - 140 : Math.min(SIZE[zn][1], innerWidth - 420);
+    z.size = Math.round(Math.max(SIZE[zn][0], Math.min(max, v)));
+    el.style.setProperty(vert ? '--zh-bottom' : '--zw-' + zn, z.size + 'px');
+  };
+  const up = () => {
+    removeEventListener('pointermove', move); removeEventListener('pointerup', up);
+    document.body.classList.remove('resizing', 'ns', 'ew'); sp.classList.remove('on');
+    saveLayout(); fitTerm(); layoutMap();
+  };
+  addEventListener('pointermove', move); addEventListener('pointerup', up);
+}));
+// Ctrl/⌘+B 收起 / 展开左侧,Ctrl/⌘+J 底部。焦点在终端里时不拦截(cc 自己用 Ctrl+B)
+document.addEventListener('keydown', e => {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.target.closest?.('.xterm, input, textarea')) return;
+  const k = e.key.toLowerCase();
+  if (k === 'b') { e.preventDefault(); narrow.matches ? showSide(document.body.classList.contains('side-hidden')) : toggleZone('left'); }
+  else if (k === 'j') { e.preventDefault(); toggleZone(zoneOf('terminal') === 'bottom' ? 'bottom' : zoneOf('terminal')); }
+});
+window.addEventListener('resize', () => { if (!narrow.matches) requestAnimationFrame(fitTerm); });
+
+// 窄屏(手机)上左侧停靠区是盖在内容上的抽屉:默认收起,点遮罩或选了会话 / 文件后自动收起
+function showSide(on) {
+  if (!narrow.matches) { lay.zones.left.open = on; saveLayout(); renderZones(); return; }
+  document.body.classList.toggle('side-hidden', !on);
+}
 document.querySelectorAll('.show-side').forEach(b => b.addEventListener('click', () => showSide(true)));
 $('#side-mask').addEventListener('click', () => showSide(false));
-$('#side').addEventListener('click', e => {
-  if (narrow.matches && e.target.closest('a[href^="#/"]')) showSide(false, false);
+$('#z-left').addEventListener('click', e => {
+  if (narrow.matches && e.target.closest('a[href^="#/"]')) showSide(false);
 });
 function initSide() {
-  showSide(narrow.matches ? !/^#\/(s|f|stars|summary)\b/.test(location.hash) : localGet('side', '1') !== '0', false);
+  document.body.classList.toggle('side-hidden', narrow.matches && /^#\/(s|f|stars|summary)\b/.test(location.hash));
+  renderZones();
 }
 narrow.addEventListener?.('change', initSide);
-initSide();
 
 // ---------- 图片查看:盖在当前页面上,有自己的网址 #/i/<会话>/<编号>,返回就回到原来的位置 ----------
 const imgv = { open: false, under: null, fromApp: false, sid: null, k: null };
@@ -1703,6 +1893,8 @@ function connectLive() {
   es.onmessage = e => {
     live.last = Date.now();
     let ev; try { ev = JSON.parse(e.data); } catch { return; }
+    if (ev.hello && ev.version) onServerVersion(ev.version);
+    if (ev.update) onUpdate(ev.update);
     if (ev.hello) {  // 连上 / 重连:断开期间的变化不会补推,全量刷新一次
       live.ok = true; netState(true);
       loadTerms(); loadSessions(); loadSession(false, true); reportFocus();  // 服务器可能刚重启过,不记得选中的会话
@@ -1742,9 +1934,106 @@ function setEco(on) {
   b.title = on ? '节能模式已开:光标不闪,后台标签页 20 秒后断开终端(切回自动重连),降低刷新频率。点击关闭'
     : '节能模式已关:实时刷新,光标闪烁,后台也保持终端连接。点击开启';
   if (tv.term) tv.term.options.cursorBlink = !on;
+  $('#set-eco').checked = on;
 }
 $('#eco').addEventListener('click', () => { setEco(!state.eco); toast(state.eco ? '节能模式已开' : '节能模式已关'); });
+// ---------- 设置:主题、节能、布局、版本与更新 ----------
+const shell = (() => {  // 桌面客户端打开时网址带 ?shell=desktop&v=<版本>&ch=<通道>
+  const q = new URLSearchParams(location.search);
+  return q.get('shell') === 'desktop' ? { v: q.get('v') || '?', ch: q.get('ch') === 'dev' ? '开发版' : '正式版' } : null;
+})();
+function setTheme(t) {
+  localSet('theme', t);
+  if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
+  // 代码高亮的两套配色跟着切换
+  $('#hl-light').media = t === 'light' ? 'all' : t === 'dark' ? 'not all' : '(prefers-color-scheme: light)';
+  $('#hl-dark').media = t === 'dark' ? 'all' : t === 'light' ? 'not all' : '(prefers-color-scheme: dark)';
+  $('#set-theme').querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.v === t));
+}
+setTheme(localGet('theme', 'auto'));
+$('#set-theme').addEventListener('click', e => { const b = e.target.closest('button'); if (b) setTheme(b.dataset.v); });
+$('#set-eco').addEventListener('change', e => setEco(e.target.checked));
+$('#set-reset').addEventListener('click', () => { resetLayout(); closeSettings(); });
+function openSettings() {
+  $('#settings').hidden = false;
+  $('#set-shell-row').hidden = !shell;
+  if (shell) $('#set-shell').textContent = `${shell.v} · ${shell.ch}`;
+  api('/api/update').then(onUpdate).catch(() => {});
+}
+function closeSettings() { $('#settings').hidden = true; }
+$('#settings-btn').addEventListener('click', openSettings);
+$('#set-close').addEventListener('click', closeSettings);
+$('#settings').addEventListener('click', e => { if (e.target.id === 'settings') closeSettings(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#settings').hidden) closeSettings(); });
+
+const upd = { st: null, server: null, applying: false };
+function onServerVersion(v) {
+  // 推送重连时服务器版本变了 = 网站刚更新并重启过:页面还是旧代码,提示刷新
+  if (upd.server && upd.server !== v) showBanner(`网站已更新到 <b>${esc(v)}</b>,刷新页面就能用上新版本。`, [['刷新', () => location.reload(), true]]);
+  upd.server = v;
+  $('#set-ver').textContent = v;
+}
+function onUpdate(st) {
+  if (!st) return;
+  upd.st = st;
+  if (st.current) $('#set-ver').textContent = st.current.version;
+  $('#set-channel').querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.v === st.channel));
+  $('#set-auto').checked = !!st.auto;
+  const when = st.checked ? new Date(st.checked * 1000).toLocaleString() : '';
+  $('#set-upd-text').textContent = st.error ? '检查失败:' + st.error
+    : st.available ? `有新版本 ${st.target.version}` : st.checked ? `已是最新 · ${when} 检查` : '还没有检查';
+  const box = $('#set-upd');
+  if (st.available) {
+    box.innerHTML = `<div class="log">${st.commits.map(c => `<div><code>${esc(c.commit)}</code><span>${esc(c.subject)}</span></div>`).join('')}</div>
+      <div class="acts"><button class="btn-primary" id="set-apply" ${st.can_apply ? '' : 'disabled'}>更新到 ${esc(st.target.version)}</button>
+      ${st.reason ? `<span class="warn">${esc(st.reason)}</span>` : '<span class="muted">更新后网站会自动重启,cc 会话不受影响</span>'}</div>`;
+    $('#set-apply').onclick = applyUpdate;
+  } else box.innerHTML = '';
+  $('#upd-dot').hidden = !st.available;
+  const dismissed = localGet('upd-skip', '') === st.target?.commit;
+  if (st.available && !dismissed && !upd.applying) {
+    showBanner(`MeowNotebook 有新版本 <b>${esc(st.target.version)}</b>(${st.channel === 'dev' ? '开发版' : '正式版'})`,
+      [['查看', openSettings], ...(st.can_apply ? [['更新', applyUpdate, true]] : [])], () => localSet('upd-skip', st.target.commit));
+  } else if (!upd.applying && $('#banner').dataset.kind === 'update') hideBanner();
+}
+async function applyUpdate() {
+  if (upd.applying) return;
+  upd.applying = true;
+  showBanner('正在更新,网站马上重启…');
+  const b = $('#set-apply'); if (b) { b.disabled = true; b.textContent = '更新中…'; }
+  const r = await post('/api/update/apply').catch(() => ({ error: '网络错误' }));
+  if (r.error) { upd.applying = false; hideBanner(); toast('更新失败:' + r.error, 5000); if (b) { b.disabled = false; b.textContent = '重试'; } return; }
+  // 服务器重启后推送会自动重连,hello 里带着新版本号 → onServerVersion 提示刷新
+}
+function showBanner(html, actions = [], onClose = null) {
+  const el = $('#banner');
+  el.dataset.kind = onClose ? 'update' : 'info';
+  el.innerHTML = `<span>${html}</span><span class="sp"></span>`;
+  for (const [label, fn, primary] of actions) {
+    const b = document.createElement('button'); b.textContent = label; if (primary) b.className = 'btn-primary';
+    b.onclick = fn; el.appendChild(b);
+  }
+  if (onClose) {
+    const x = document.createElement('button'); x.className = 'x'; x.textContent = '✕'; x.title = '这个版本不再提示';
+    x.onclick = () => { onClose(); hideBanner(); }; el.appendChild(x);
+  }
+  el.hidden = false; requestAnimationFrame(() => { layoutMap(); fitTerm(); });
+}
+function hideBanner() { $('#banner').hidden = true; $('#banner').dataset.kind = ''; requestAnimationFrame(() => { layoutMap(); fitTerm(); }); }
+$('#set-check').addEventListener('click', async () => {
+  const b = $('#set-check'); b.disabled = true; b.textContent = '检查中…';
+  onUpdate(await post('/api/update/check').catch(() => ({ error: '网络错误' })));
+  b.disabled = false; b.textContent = '检查更新';
+});
+$('#set-channel').addEventListener('click', async e => {
+  const b = e.target.closest('button'); if (!b) return;
+  onUpdate(await post('/api/update/settings', { channel: b.dataset.v }).catch(() => null));
+  $('#set-check').click();
+});
+$('#set-auto').addEventListener('change', async e => onUpdate(await post('/api/update/settings', { auto: e.target.checked }).catch(() => null)));
+api('/api/version').then(r => r.version && onServerVersion(r.version)).catch(() => {});
+api('/api/update').then(onUpdate).catch(() => {});
 setEco(state.eco);
 connectLive();
-setSide(localGet('side-tab', 'sessions'));
-Promise.all([loadSessions(), loadStars()]).then(() => { route(); reportFocus(); });
+initSide();
+Promise.all([loadSessions(), loadStars()]).then(() => { route(); reportFocus(); if (panelShown('files')) onFilesShown(); });

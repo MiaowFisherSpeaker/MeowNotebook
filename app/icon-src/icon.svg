@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e2865a"/><stop offset="1" stop-color="#a8431f"/>
+    </linearGradient>
+    <linearGradient id="pg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fffaf4"/><stop offset="1" stop-color="#f6e6dc"/>
+    </linearGradient>
+  </defs>
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#bg)"/>
+  <!-- 猫头形状的笔记本:两只耳朵 + 圆角页面 -->
+  <path d="M262 380 L290 196 Q296 168 320 184 L452 292 L572 292 L704 184 Q728 168 734 196 L762 380
+           Q790 420 790 470 L790 700 Q790 790 700 790 L324 790 Q234 790 234 700 L234 470 Q234 420 262 380 Z"
+        fill="url(#pg)"/>
+  <!-- 眼睛 -->
+  <ellipse cx="410" cy="470" rx="30" ry="38" fill="#3b2a21"/>
+  <ellipse cx="614" cy="470" rx="30" ry="38" fill="#3b2a21"/>
+  <path d="M488 540 L536 540 L512 566 Z" fill="#c8623a"/>
+  <!-- 笔记横线 -->
+  <rect x="330" y="626" width="364" height="22" rx="11" fill="#e3c3b0"/>
+  <rect x="330" y="690" width="250" height="22" rx="11" fill="#e3c3b0"/>
+</svg>

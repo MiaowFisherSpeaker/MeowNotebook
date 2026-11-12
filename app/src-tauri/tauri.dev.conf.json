@@ -1,0 +1,27 @@
+{
+  "productName": "MeowNotebook Dev",
+  "identifier": "io.github.miaowfisherspeaker.meownotebook.dev",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "create": false,
+        "title": "MeowNotebook Dev",
+        "url": "index.html",
+        "width": 1320,
+        "height": 860,
+        "minWidth": 760,
+        "minHeight": 520,
+        "center": true,
+        "backgroundThrottling": "throttle"
+      }
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/MiaowFisherSpeaker/MeowNotebook/releases/download/app-dev/latest.json"
+      ]
+    }
+  }
+}
