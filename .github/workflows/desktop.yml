@@ -130,7 +130,8 @@ jobs:
           for f in app/src-tauri/target/*/release/bundle/dmg/*.dmg app/src-tauri/target/release/bundle/nsis/*-setup.exe; do
             [ -f "$f" ] || continue
             if command -v sha256sum >/dev/null; then sum=$(sha256sum "$f" | cut -d' ' -f1); else sum=$(shasum -a 256 "$f" | cut -d' ' -f1); fi
-            echo "$sum  $(basename "$f")" >> "$out"
+            # GitHub 存 Release 文件时把空格换成点("MeowNotebook Dev_…" → "MeowNotebook.Dev_…"),校验和里用同样的名字
+            echo "$sum  $(basename "$f" | tr ' ' '.')" >> "$out"
           done
           cat "$out"
           gh release upload "$TAG" "$out" --clobber -R "$GITHUB_REPOSITORY"
