@@ -1,37 +1,13 @@
 # 更新记录
 
-## v1.1.2 · 2026-11-12
+## v1.0.0 · 2026-11-12
 
-- Strip whitespace from the updater signing key in CI
+第一个正式版。
 
-## v1.1.1 · 2026-11-12
-
-- Fix desktop build: pass bundle args to tauri, not cargo
-
-## v1.1.0 · 2026-11-12
-
-- Desktop client, dockable panel layout, versioning and in-page updates
-- Keep the question map in step with the reading position
-- Restore the browser-style session tab bar
-- Open session images in an in-page viewer with its own URL
-- Cut idle browser work and add a power-saving switch (on by default)
-- Open sessions at the latest question again when switching from another session
-- Attach to forked sessions running as cc background sessions
-- Let cca list sessions to pick from, with confirmed kill
-- Speed up long sessions, dock the terminal on the right, and make cca follow the page
-- Fix narrow-screen sidebar drawer and terminal linking for forked sessions
-- Stop dropping and doubling keys typed with an IME in English mode
-- Pick relevant conversations before writing a topic summary
-- Fix QQ reply numbering and summary edge cases found in review
-- Add a QQ bot, topic summaries, and survive bad networks
-- Copy selections as Markdown from the right-click menu
-- Keep session data lean and refresh live sessions incrementally
-- Let terminal clients opt out of mouse reporting
-- Harden file preview, WebSocket input and star writes
-- Follow Claude Code session continuations
-- Pin the tab bar together with the header
-- Clip the terminal box so shrinking it leaves no gap
-- Contain absolutely positioned content inside #main
-- Fix blank scroll area below short conversations
-- Add full-text session search with title / question / full-text modes
-
+- **桌面客户端**(Windows `.exe` / macOS `.dmg`):登录界面填 SSH 信息,自动把服务器的 8765 转发到本机并打开网站;
+  内置 SSH(密码 / 私钥,首次确认服务器指纹,密码存系统钥匙串),断线自动重连;应用更新先询问,自动更新默认关;正式版与开发版可同时安装。
+- **可自由排布的界面**:左侧图标栏;会话、文件、终端是面板,拖标题放到左侧 / 右侧 / 底部,同处多个面板变标签页,可调大小,布局会记住;
+  设置里可选主题(跟随系统 / 浅色 / 深色)、节能模式、恢复默认布局。
+- **版本与更新**:`VERSION` 统一版本号;网站可在设置里选正式版 / 开发版通道,有新版本时提示,点击即快进更新并自动重启(自动更新默认关)。
+- 此前的功能:问答渲染(公式、代码)、/qa-notes 整理版、总结、收藏、搜索、文件浏览、图片查看、浏览器式会话标签栏、
+  网页终端(与本机 tmux 同步)、QQ 机器人、节能模式等。

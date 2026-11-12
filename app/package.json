@@ -1,7 +1,7 @@
 {
   "name": "meownotebook-app",
   "private": true,
-  "version": "1.1.2",
+  "version": "1.0.0",
   "scripts": {
     "tauri": "tauri",
     "dev": "tauri dev",
