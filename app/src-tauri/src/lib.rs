@@ -100,6 +100,18 @@ fn login_url(query: &str) -> Url {
     u
 }
 
+/// 当前连接的网站(scheme://host:port);窗口只在它和应用自带页面之间跳转
+static SITE_ORIGIN: Mutex<Option<String>> = Mutex::new(None);
+
+fn set_site(url: &str) {
+    *SITE_ORIGIN.lock().unwrap() = Url::parse(url).ok().map(|u| u.origin().ascii_serialization());
+}
+
+/// 应用自带的页面(登录页)
+fn is_app_page(u: &Url) -> bool {
+    matches!(u.scheme(), "tauri" | "about" | "data" | "blob") || u.host_str() == Some("tauri.localhost")
+}
+
 fn config_path(app: &AppHandle) -> PathBuf {
     app.path().app_config_dir().unwrap_or_else(|_| PathBuf::from(".")).join("config.json")
 }
@@ -300,6 +312,7 @@ async fn connect(
         }
         u.set_query(Some(&web_query(&app, &name, &[])));
         remember_last(&app, &st, &id);
+        set_site(u.as_str());
         *st.active.lock().await = Some(Active { id, name, url: u.to_string(), tunnel: None });
         return Ok(u.to_string());
     }
@@ -347,6 +360,7 @@ async fn connect(
     remember_last(&app, &st, &id);
     let url = format!("http://localhost:{}/?{}", p.forwards[0].local, web_query(&app, &name, &p.forwards));
     let web = p.forwards[0].clone();
+    set_site(&url);
     *st.active.lock().await = Some(Active { id, name, url: url.clone(), tunnel: Some(t) });
     // 隧道通了,再确认服务器上的网站在运行;没运行时连接保留(其他转发照常可用),告诉用户原因
     if !probe_http("127.0.0.1", web.local).await {
@@ -554,11 +568,22 @@ pub fn run() {
             // 窗口在这里建:要接管"新标签页打开"和下载,这两件事网页在普通浏览器里自己能做,在应用窗口里不行
             let conf = app.config().app.windows.iter().find(|w| w.label == "main").cloned().expect("缺少 main 窗口配置");
             let opener = handle.clone();
+            let nav_opener = handle.clone();
             WebviewWindowBuilder::from_config(&handle, &conf)?
                 // 新标签页 / 外部链接 → 系统浏览器(转发监听在本机,系统浏览器也能打开 localhost 的网址)
                 .on_new_window(move |url, _| {
                     let _ = opener.opener().open_url(url.as_str(), None::<&str>);
                     NewWindowResponse::Deny
+                })
+                // 兜底:网页里任何想把窗口带离网站的跳转(链接、脚本改地址)都改到系统浏览器打开,窗口留在原处
+                .on_navigation(move |url| {
+                    if is_app_page(url) || SITE_ORIGIN.lock().unwrap().as_deref() == Some(url.origin().ascii_serialization().as_str()) {
+                        return true;
+                    }
+                    if matches!(url.scheme(), "http" | "https" | "mailto") {
+                        let _ = nav_opener.opener().open_url(url.as_str(), None::<&str>);
+                    }
+                    false
                 })
                 .on_download(|_, ev| {
                     if let DownloadEvent::Requested { url, destination } = ev {

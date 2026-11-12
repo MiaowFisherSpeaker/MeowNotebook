@@ -1787,6 +1787,16 @@ $('#side-mask').addEventListener('click', () => showSide(false));
 $('#z-left').addEventListener('click', e => {
   if (narrow.matches && e.target.closest('a[href^="#/"]')) showSide(false);
 });
+// 指向别的网站的链接一律新标签页打开,不把本页跳走(桌面客户端里新标签页 = 系统默认浏览器)
+document.addEventListener('click', e => {
+  const a = e.target.closest?.('a[href]');
+  if (!a || a.target || a.hasAttribute('download')) return;
+  let u;
+  try { u = new URL(a.getAttribute('href'), location.href); } catch { return; }
+  if (u.origin === location.origin || !/^(https?|mailto):$/.test(u.protocol)) return;
+  a.target = '_blank';
+  a.rel = 'noopener noreferrer';
+}, true);
 function initSide() {
   document.body.classList.toggle('side-hidden', narrow.matches && /^#\/(s|f|stars|summary)\b/.test(location.hash));
   renderZones();
