@@ -87,7 +87,6 @@
         <textarea id="cm-text" rows="1" placeholder="给 cc 发消息…(Enter 发送,Shift+Enter 换行)" enterkeyhint="send"></textarea>
         <div class="cm-btns">
           <button id="cm-stop" class="danger" hidden title="打断 cc 当前的回答(相当于在终端里按 Esc)">停止</button>
-          <button id="cm-steer" hidden title="马上插进 cc 正在进行的回答,不等它答完(Ctrl/⌘+Enter;cc 里的 Ctrl+X Ctrl+S)">引导</button>
           <button id="cm-send" class="primary" title="发送(Enter)">发送</button>
         </div>
       </div>
@@ -105,6 +104,10 @@
 <div id="side-mask"></div>
 <div id="panel-home" hidden>
   <section class="panel" id="p-sessions" data-panel="sessions">
+    <div id="cli-bar" title="侧栏项目名右边的 new 用它打开;网页上继续 cc 的历史会话时也用 cc 这边的思考强度">
+      <label>打开方式<select id="cli-sel"><option value="claude">Claude Code</option></select></label>
+      <label>思考<select id="effort-sel"><option value="">默认</option></select></label>
+    </div>
     <div class="side-actions">
       <select id="search-mode" title="搜索范围:标题最快;提问 / 全文会搜索会话正文">
         <option value="title">标题</option><option value="q">提问</option><option value="all">全文</option>

@@ -12,6 +12,7 @@ import pty
 import re
 import select
 import shlex
+import shutil
 import signal
 import struct
 import subprocess
@@ -42,6 +43,72 @@ _P = CC_BIN.upper()
 CC_RUNTIME_ENV = [f"{_P}CODE", f"{_P}_PID", f"{_P}_JOB_DIR", f"{_P}_EFFORT",
                   *(f"{_P}_CODE_{x}" for x in ("CHILD_SESSION", "SESSION_ID", "SESSION_ATTENDED", "MESSAGING_SOCKET",
                                                 "MESSAGING_TOKEN", "ENTRYPOINT", "EXECPATH"))]
+
+
+# ---------------------------------------------------------------- 支持的命令行(cc 之外还有 codex / agy)
+# 网页上"用什么打开项目"可以选;cc(Claude Code)仍是默认,记录解析、hook、总结等目前只对它。
+# effort:思考强度,网页上的选项跟着所选的命令行变;None = 用它自己的默认值。
+#   claude / agy: --effort <级别>;codex: -c model_reasoning_effort="<级别>"(可选级别跟着它当前的模型)
+EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
+CODEX_HOME = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+AGY_BIN = os.environ.get("AGY_BIN", "agy")
+CLIS = {
+    # marker:菜单里选中项前面的符号;prompt:输入框开头的符号;steer:回答中插话的按键(None = 不支持,只能排队);
+    # busy:回答中屏幕底部会出现的提示文字
+    "claude": {"label": "Claude Code", "short": "cc", "bin": CC_BIN, "cmd": CC_CMD, "marker": "❯", "prompt": "❯",
+               "steer": ["C-x", "C-s"], "busy": ["esc to interrupt"]},
+    "codex": {"label": "Codex", "short": "codex", "bin": CODEX_BIN,
+              "cmd": [CODEX_BIN, "--dangerously-bypass-approvals-and-sandbox"], "marker": "›", "prompt": "›",
+              "steer": ["Enter"], "busy": ["esc to interrupt"],  # codex 回答中按 Enter 就是插进当前回答(Tab 是排队)
+              # 不用 codex 共享的后台服务:那样会话由后台进程执行、记录也由它写,看不出哪个终端在哪个会话;
+              # 自己跑的话,终端里的 codex 进程一直开着当前会话的记录文件(网页据此对应终端和会话)
+              "extra": ["--no-daemon"]},
+    "agy": {"label": "Antigravity", "short": "agy", "bin": AGY_BIN, "cmd": [AGY_BIN, "--dangerously-skip-permissions"],
+            "marker": ">", "prompt": ">", "steer": None, "busy": ["esc to interrupt", "esc to stop"]},
+}
+DEFAULT_CLI = "claude"
+
+
+def effort_args(cli, effort):
+    if not effort:
+        return []
+    if cli == "codex":
+        return ["-c", f'model_reasoning_effort="{effort}"']
+    return ["--effort", effort]
+
+
+def codex_efforts():
+    """codex 当前模型支持的思考强度(读它自己的 config.toml 和模型缓存),读不到就用通用的几档。"""
+    try:
+        m = re.search(r'^\s*model\s*=\s*"([^"]+)"', (CODEX_HOME / "config.toml").read_text(), re.M)
+        models = json.loads((CODEX_HOME / "models_cache.json").read_text())
+        models = models.get("models", []) if isinstance(models, dict) else models
+        cur = next((x for x in models if m and x.get("slug") == m.group(1)), None) or (models[0] if models else None)
+        levels = [x["effort"] for x in cur.get("supported_reasoning_levels") or [] if x.get("effort")]
+        return levels or EFFORTS, cur.get("default_reasoning_level"), cur.get("display_name") or cur.get("slug")
+    except (OSError, ValueError, TypeError, AttributeError, KeyError):
+        return EFFORTS, None, None
+
+
+def cli_info():
+    """网页上的选项:每个命令行装没装、可选的思考强度。"""
+    out = []
+    for k, c in CLIS.items():
+        efforts, default, model = codex_efforts() if k == "codex" else (EFFORTS, None, None)
+        out.append({"id": k, "label": c["label"], "short": c["short"], "available": bool(shutil.which(c["bin"])),
+                    "efforts": efforts, "default_effort": default, "model": model, "steer": bool(c["steer"])})
+    return out
+
+
+_cli_of = {}  # tmux 会话名 → 命令行;list_sessions / new_session 时记下,screen_state 不必每次问 tmux
+
+
+def session_cli(name):
+    if name not in _cli_of:
+        r = tmux("show-options", "-v", "-t", f"={name}:", "@ccnb_cli")
+        _cli_of[name] = r.stdout.strip() if r.stdout.strip() in CLIS else DEFAULT_CLI
+    return _cli_of[name]
 
 
 def clean_env(env):
@@ -76,15 +143,20 @@ def list_sessions():
     """ccnb socket 上跑着 cc 的 tmux 会话。别的程序(比如在这里开着的 cc-connect)不算,
     否则网页会把它们当成 cc 终端,猜一个会话挂上去,底部的输入就打进了那个程序。"""
     r = tmux("list-sessions", "-F", "#{session_name}\t#{session_path}\t#{session_created}\t#{session_attached}"
-             "\t#{@ccnb_sid}\t#{@ccnb_attach}\t#{pane_id}\t#{pane_pid}\t#{pane_start_command}")
+             "\t#{@ccnb_sid}\t#{@ccnb_attach}\t#{pane_id}\t#{pane_pid}\t#{@ccnb_cli}\t#{@ccnb_effort}\t#{pane_start_command}")
     out = []
     for line in r.stdout.splitlines():
-        name, path, created, attached, sid, job, pane, pid, cmd = (line.split("\t", 8) + [""] * 9)[:9]
+        name, path, created, attached, sid, job, pane, pid, cli, effort, cmd = (line.split("\t", 10) + [""] * 11)[:11]
         # attach:接入 cc 后台会话的终端(`claude attach <id>`),关掉它后台会话照常运行
-        if shlex.join(CC_CMD) not in cmd and not (job and shlex.join([CC_BIN, "attach", job]) in cmd):
+        if job and shlex.join([CC_BIN, "attach", job]) in cmd:
+            cli = "claude"
+        else:  # 以前开的终端没有 @ccnb_cli:看启动命令
+            cli = next((k for k in ([cli] if cli in CLIS else []) + list(CLIS) if shlex.join(CLIS[k]["cmd"]) in cmd), None)
+        if not cli:
             continue
+        _cli_of[name] = cli
         out.append({"name": name, "cwd": path, "created": int(created or 0), "clients": int(attached or 0),
-                    "launch_sid": sid or None, "attach": job or None,
+                    "launch_sid": sid or None, "attach": job or None, "cli": cli, "effort": effort or None,
                     "pane": pane.lstrip("%"), "pid": int(pid) if pid.isdigit() else None})
     return sorted(out, key=lambda s: -s["created"])
 
@@ -93,44 +165,67 @@ _BORDER_TITLE = re.compile(r"^[─━]{2,}\s+(.+?)\s+[─━]+\s*$")
 _BORDER = re.compile(r"^\s*[─━]{8,}")
 
 
-def _option_col(line):
-    """菜单里被选中的那一行("  ❯ 2. 选项"):返回选项文字开始的列,否则 None。"""
-    m = re.match(r"^(\s*)❯\s+(?=\S)", line)
+def _option_col(line, marker="❯", numbered=False):
+    """菜单里被选中的那一行("  ❯ 2. 选项"):返回选项文字开始的列,否则 None。
+    numbered:选项必须带序号(codex / agy 的输入框也以同一个符号开头,不带序号的是输入框)。"""
+    ahead = r"\d+\.\s" if numbered else r"\S"
+    m = re.match(r"^(\s*)" + re.escape(marker) + r"\s+(?=" + ahead + ")", line)
     return m.end() if m else None
 
 
-def parse_screen(lines):
+def _prompt_line(lines, prompt):
+    """codex / agy 的输入框:最下面几行里以输入符号开头、不是菜单选项的一行(下面只有状态栏)。"""
+    for i in range(len(lines) - 1, max(-1, len(lines) - 12), -1):
+        x = lines[i].lstrip(" │┃")
+        if (x.startswith(prompt + " ") or x.rstrip() == prompt) and not re.match(rf"{re.escape(prompt)}\s+\d+\.\s", x):
+            return i
+    return None
+
+
+def parse_screen(lines, cli="claude", raw=None):
     """从 cc 的屏幕内容看出它在干什么:
     ready  底部有输入框(边框之间以 ❯ 开头的一行),可以输入新消息;
     busy   正在回答(状态栏有 "esc to interrupt");
     menu   弹着选择菜单(权限确认、AskUserQuestion、/model…)时的选项 [{text, sel}] 和上方的说明文字;
-    title  输入框上边框里显示的会话标题。"""
+    title  输入框上边框里显示的会话标题。
+    cli 是 codex / agy 时按它们的界面认:菜单选中项和输入框用各自的符号,菜单优先(弹菜单时输入框会被收起,
+    但上面的对话记录里也有以同一符号开头的历史提问)。
+    raw:同样的几行但带着颜色(capture-pane -e),用来看提问菜单的标签里当前是哪一题。"""
+    c = CLIS.get(cli) or CLIS[DEFAULT_CLI]
+    marker = c["marker"]
     st = {"ready": False, "busy": False, "menu": None, "title": None}
     box = None
-    for i in range(len(lines) - 1, 0, -1):
-        if lines[i].startswith("❯") and _BORDER.match(lines[i - 1]):
-            box = i
-            m = _BORDER_TITLE.match(lines[i - 1].strip())
-            st["title"] = m.group(1).strip() if m else None
-            break
+    if cli == "claude":
+        for i in range(len(lines) - 1, 0, -1):
+            if lines[i].startswith("❯") and _BORDER.match(lines[i - 1]):
+                box = i
+                m = _BORDER_TITLE.match(lines[i - 1].strip())
+                st["title"] = m.group(1).strip() if m else None
+                break
     while lines and not lines[-1].strip():  # 屏幕没写满时末尾是空行
         lines = lines[:-1]
     tail = "\n".join(lines[-8:]).lower()
-    st["busy"] = "esc to interrupt" in tail
+    st["busy"] = any(b in tail for b in c["busy"])  # 回答中状态栏上的提示(菜单底下的 "Esc to cancel" 不算)
+    numbered = cli != "claude"
+    if cli != "claude":
+        sel = next((i for i in range(len(lines) - 1, max(-1, len(lines) - 40), -1)
+                    if _option_col(lines[i], marker, True) is not None), None)
+        if sel is None:
+            box = _prompt_line(lines, c["prompt"])
     st["ready"] = box is not None
     if box is not None:
         return st
     # 没有输入框:找最下面一个被选中的菜单项,以它的文字列为准收集同一列开头的选项
-    sel = next((i for i in range(len(lines) - 1, -1, -1) if _option_col(lines[i]) is not None), None)
+    sel = next((i for i in range(len(lines) - 1, -1, -1) if _option_col(lines[i], marker, numbered) is not None), None)
     if sel is None:
         return st
-    col = _option_col(lines[sel])
+    col = _option_col(lines[sel], marker, numbered)
 
     def is_opt(line):
         if len(line) <= col or line[col] == " ":
             return False
         pre = line[:col]
-        return pre.strip() in ("", "❯")
+        return pre.strip() in ("", marker)
 
     def deeper(line):  # 选项下面的说明行(缩进更深)
         return len(line) > col and not line[:col + 1].strip()
@@ -159,7 +254,10 @@ def parse_screen(lines):
             text = x[col:].strip() if is_opt(x) else x.strip()
             m = re.match(r"\d+\.\s+(\[.\]\s+)?", text)
             dcol = col + m.end() if m else None
-            opts.append({"text": re.sub(r"\s{2,}", "  ", text), "sel": i == sel, "desc": ""})
+            # "1. Red ✔":提问菜单里回到前面的题时,之前选的答案后面有 ✔
+            chosen = bool(re.search(r"\s✔$", text))
+            text = re.sub(r"\s+✔$", "", text)
+            opts.append({"text": re.sub(r"\s{2,}", "  ", text), "sel": i == sel, "desc": "", "chosen": chosen})
         elif opts and deeper(x) and x.strip():
             opts[-1]["desc"] = (opts[-1]["desc"] + " " + x.strip()).strip()
     while opts and not opts[0]["text"]:
@@ -168,20 +266,47 @@ def parse_screen(lines):
         return st
     # 说明文字:选项上方连续的几行非空内容(问题、"Select model"…)
     head, i = [], lo - 1
-    while i >= 0 and len(head) < 8:
+    while i >= 0 and len(head) < 12:  # 提问的检查页:每题一行问题、一行答案
         x = lines[i].strip()
         if x and (_BORDER.match(lines[i]) or set(x) <= set("▔▁─━")):
             break
         if x:  # 空行跳过:说明和选项之间、标签行和问题之间常隔空行
             head.insert(0, x)
+        elif head and cli != "claude":  # codex / agy 的菜单上面没有边框:说明只取紧挨着的一段,再往上是对话记录
+            break
         i -= 1
     foot = next((x.strip() for x in lines[hi + 1:] if x.strip() and not _BORDER.match(x)), "")
-    st["menu"] = {"options": opts, "head": "\n".join(head), "foot": foot[:200]}
+    # 一次问几个问题时,问题上面有一行标签:"←  ☒ Color  ☐ Pets  ✔ Submit  →"(☒ 答过,☐ 没答,✔ Submit 是最后检查答案那页)
+    tabs = None
+    for k in range(lo - 1, max(-1, lo - 30), -1):
+        m = _TABS.match(lines[k])
+        if m:
+            tabs = [{"label": lab.strip(), "done": mark == "☒", "submit": mark == "✔"} for mark, lab in _TAB_ITEM.findall(m.group(1))]
+            cur = _current_tab(raw[k]) if raw and k < len(raw) else None
+            for t in tabs:
+                t["cur"] = t["label"] == cur
+            head = [h for h in head if not _TABS.match(h)]
+            break
+        if _BORDER.match(lines[k]):
+            continue
+    st["menu"] = {"options": opts, "head": "\n".join(head), "foot": foot[:200], "tabs": tabs or None}
     return st
 
 
-def screen_state(name):
-    return parse_screen(tmux("capture-pane", "-p", "-t", f"={name}:").stdout.splitlines())
+_TABS = re.compile(r"^\s*←\s+(.*?)\s+→\s*$")
+_TAB_ITEM = re.compile(r"([☐☒✔])\s+(.+?)(?=\s{2,}[☐☒✔]|\s*$)")
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[()][A-Za-z0-9]|\x1b[=>]")
+
+
+def _current_tab(raw):
+    """标签行的原始输出(带颜色):当前这一题的标签有背景色(\\e[48;…m)。返回它的文字,看不出来就 None。"""
+    m = re.search(r"\x1b\[[0-9;]*\b48;[0-9;]*m\s*[☐☒✔]\s*([^\x1b]+?)\s*(?:\x1b|$)", raw)
+    return m.group(1).strip() if m else None
+
+
+def screen_state(name, cli=None):
+    raw = tmux("capture-pane", "-p", "-e", "-t", f"={name}:").stdout.splitlines()
+    return parse_screen([_ANSI.sub("", x) for x in raw], cli or session_cli(name), raw)
 
 
 def screen_title(name):
@@ -215,11 +340,16 @@ def send_text(name, text):
 
 
 def steer(name, text):
-    """cc 正在回答时把消息插进去(cc 的 Ctrl+X Ctrl+S "send now"):不用等它答完,也不打断正在跑的命令。"""
+    """cc 正在回答时把消息插进去(cc 的 Ctrl+X Ctrl+S "send now";codex 回答中的 Enter):
+    不用等它答完,也不打断正在跑的命令。"""
+    keys = CLIS[session_cli(name)]["steer"]
+    if not keys:
+        raise ValueError(f"{CLIS[session_cli(name)]['label']} 不支持插进正在进行的回答,请用排队")
     _paste(name, text)
-    tmux("send-keys", "-t", f"={name}:", "C-x")
-    time.sleep(0.05)
-    tmux("send-keys", "-t", f"={name}:", "C-s")
+    for i, k in enumerate(keys):
+        if i:
+            time.sleep(0.05)
+        tmux("send-keys", "-t", f"={name}:", k)
 
 
 _FREE = re.compile(r"^(\d+\.\s+)?(\[.\]\s+)?Type something", re.I)
@@ -269,6 +399,19 @@ def choose(name, index):
     send_keys(name, ["Down" if d > 0 else "Up"] * abs(d) + ["Enter"])
 
 
+def goto_tab(name, index):
+    """提问菜单:跳到第 index 个标签(某一题,或最后的 Submit 检查页),按 ←/→ 过去。可以回到答过的题改答案。"""
+    menu = screen_state(name)["menu"]
+    tabs = (menu or {}).get("tabs")
+    if not tabs or not 0 <= index < len(tabs):
+        raise ValueError("cc 现在没有在提问,刷新一下再试")
+    cur = next((i for i, t in enumerate(tabs) if t["cur"]), None)
+    if cur is None:
+        raise ValueError("看不出现在在第几题,打开终端用 ←/→ 切换")
+    d = index - cur
+    send_keys(name, ["Right" if d > 0 else "Left"] * abs(d))
+
+
 def wait_ready(name, timeout=30):
     """等 cc 启动完、出现输入框。弹着菜单(比如信任目录的确认)时返回菜单状态,让网页去选。"""
     end = time.monotonic() + timeout
@@ -311,9 +454,17 @@ def plan_session_id(args, latest_sid=None):
     return ["--session-id", sid, *args], sid
 
 
-def new_session(cwd, cc_args=(), cols=200, rows=50, latest_sid=None, attach=None, sid=None):
+def new_session(cwd, cc_args=(), cols=200, rows=50, latest_sid=None, attach=None, sid=None, cli=DEFAULT_CLI, effort=None):
     """新开一个 tmux 终端运行 cc。attach=<后台会话 id>:改为运行 `claude attach <id>` 接入 cc 后台会话
-    (agent 视图里 fork 出的会话都在 cc 的后台进程里跑,不能再 --resume),sid 是它的会话 ID。"""
+    (agent 视图里 fork 出的会话都在 cc 的后台进程里跑,不能再 --resume),sid 是它的会话 ID。
+    cli:用哪个命令行(CLIS 里的键);effort:思考强度,None 用它自己的默认值。
+    codex / agy 不能事先指定会话 ID:给终端一个 "<cli>-<随机>" 的临时 ID,网页先用它打开这个终端的会话页。"""
+    if cli not in CLIS:
+        raise ValueError(f"不支持的命令行: {cli}")
+    if effort and effort not in EFFORTS + ["ultra", "minimal", "none"]:
+        raise ValueError(f"不支持的思考强度: {effort}")
+    if not shutil.which(CLIS[cli]["bin"]):
+        raise ValueError(f"没找到 {CLIS[cli]['bin']} 命令,先安装 {CLIS[cli]['label']}")
     cwd = str(Path(cwd).expanduser().resolve())
     if not os.path.isdir(cwd):
         raise ValueError(f"目录不存在: {cwd}")
@@ -329,11 +480,15 @@ def new_session(cwd, cc_args=(), cols=200, rows=50, latest_sid=None, attach=None
     # tmux 服务器的全局环境可能带着这些变量,用 env -u 在 pane 里显式清掉
     unset = [x for k in CC_RUNTIME_ENV for x in ("-u", k)]
     if attach:
+        cli, effort = "claude", None
         cmd = shlex.join(["env", *unset, CC_BIN, "attach", attach])
-    else:
+    elif cli == "claude":
         cc_args, sid = plan_session_id(cc_args, latest_sid)
         hook = ["--settings", HOOK_SETTINGS] if CC_CMD[0] == CC_BIN else []
-        cmd = shlex.join(["env", *unset, *CC_CMD, *hook, *cc_args])
+        cmd = shlex.join(["env", *unset, *CC_CMD, *hook, *effort_args(cli, effort), *cc_args])
+    else:
+        sid = sid or f"{cli}-{uuid.uuid4().hex[:12]}"
+        cmd = shlex.join(["env", *unset, *CLIS[cli]["cmd"], *CLIS[cli].get("extra", []), *effort_args(cli, effort), *cc_args])
     r = tmux("new-session", "-d", "-s", name, "-c", cwd, "-x", str(cols), "-y", str(rows), *envs, cmd)
     if r.returncode:
         raise RuntimeError(r.stderr.strip() or "tmux new-session 失败")
@@ -341,6 +496,10 @@ def new_session(cwd, cc_args=(), cols=200, rows=50, latest_sid=None, attach=None
         tmux("set-option", "-t", f"={name}:", "@ccnb_sid", sid)
     if attach:
         tmux("set-option", "-t", f"={name}:", "@ccnb_attach", attach)
+    tmux("set-option", "-t", f"={name}:", "@ccnb_cli", cli)
+    _cli_of[name] = cli
+    if effort:
+        tmux("set-option", "-t", f"={name}:", "@ccnb_effort", effort)
     return name
 
 

@@ -304,6 +304,38 @@ document.addEventListener('mousedown', e => { if (!cmenu.contains(e.target)) cme
 document.addEventListener('keydown', e => { if (e.key === 'Escape') cmenu.hidden = true; });
 $('#main').addEventListener('scroll', () => { cmenu.hidden = true; });
 
+// ---------- 用什么命令行打开项目 / 思考强度 ----------
+// 全局一份,存在服务器上(data/cli.json),各个网页、桌面客户端共用;默认 Claude Code。
+// 思考强度的选项跟着所选的命令行变(codex 的跟着它当前的模型),每个命令行各记各的。
+const cli = { cur: 'claude', effort: {}, list: [] };
+const cliInfo = id => cli.list.find(c => c.id === id);
+const cliName = id => !id || id === 'claude' ? 'cc' : cliInfo(id)?.label || id;
+function renderCli() {
+  const sel = $('#cli-sel'), es = $('#effort-sel'), c = cliInfo(cli.cur);
+  if (cli.list.length) sel.innerHTML = cli.list.map(x =>
+    `<option value="${esc(x.id)}"${x.available || x.id === cli.cur ? '' : ' disabled'}>${esc(x.label)}${x.available ? '' : '(未安装)'}</option>`).join('');
+  sel.value = cli.cur;
+  es.innerHTML = `<option value="">${c?.default_effort ? `默认(${esc(c.default_effort)})` : '默认'}</option>` +
+    (c?.efforts || []).map(e => `<option value="${esc(e)}">${esc(e)}</option>`).join('');
+  es.value = cli.effort[cli.cur] || '';
+  es.title = c?.model ? `${c.label} 当前模型 ${c.model} 支持的思考强度` : `${c?.label || 'cc'} 的思考强度(新开的会话生效)`;
+  document.querySelectorAll('.proj-new').forEach(b => { b.title = `用 ${c?.label || 'Claude Code'} 在这个项目里新开会话`; });
+}
+function setCli(r) {
+  if (!r || r.error) return false;
+  cli.cur = r.cli; cli.effort = r.effort || {}; cli.list = r.clis || [];
+  renderCli(); return true;
+}
+async function loadCli() { setCli(await api('/api/cli').catch(() => null)); }
+async function saveCli(body) {
+  const r = await post('/api/cli', body).catch(() => ({ error: '网络错误' }));
+  if (!setCli(r)) { toast(r?.error || '没能保存', 2500); loadCli(); return; }
+  toast(body.effort !== undefined ? `思考强度:${cli.effort[cli.cur] || '默认'}(新开的会话生效)` : `新会话用 ${cliInfo(cli.cur)?.label} 打开`, 1800);
+}
+$('#cli-sel').addEventListener('change', e => saveCli({ cli: e.target.value }));
+$('#effort-sel').addEventListener('change', e => saveCli({ cli: cli.cur, effort: e.target.value }));
+loadCli();
+
 // ---------- 会话列表 ----------
 // 同时发起的几次刷新(启动时、推送连上时、记录变化时…)共用一个请求
 let sessionsReq = null;
@@ -346,11 +378,11 @@ function renderSessions() {
     const live = list.some(x => x.running) ? '<span class="dot live" title="有运行中的会话"></span>' : '';
     return `<div class="proj${col}" data-cwd="${esc(cwd)}" title="${esc(cwd)}"><span class="caret"></span>` +
       `<span class="pn"><span class="pp">${esc(name.slice(0, cut))}</span>${esc(name.slice(cut) || name)}</span>` +
-      (cwd.startsWith('/') ? '<button class="proj-new" title="cc in this project">new</button>' : '') +
+      (cwd.startsWith('/') ? `<button class="proj-new" title="用 ${esc(cliInfo(cli.cur)?.label || 'Claude Code')} 在这个项目里新开会话">new</button>` : '') +
       `${live}<span class="cnt">${list.length}</span></div><div class="proj-list">` +
       list.map(s => `<a class="sess${s.id === state.sid ? ' on' : ''}" href="#/s/${s.id}">
         <div class="t">${esc(s.title)}</div>
-        <div class="m">${s.running ? '<span class="badge run">运行中</span>' : ''}${s.via ? `<span class="badge via" title="在 ${esc(s.via.label)} 里开的会话">${esc(s.via.label)}</span>` : ''}${s.active ? '<span class="dot live" title="记录正在更新"></span>' : ''}${fmtTime(s.mtime)} · ${s.questions} 问
+        <div class="m">${s.running ? '<span class="badge run">运行中</span>' : ''}${s.cli && s.cli !== 'claude' ? `<span class="badge cli">${esc(cliName(s.cli))}</span>` : ''}${s.via ? `<span class="badge via" title="在 ${esc(s.via.label)} 里开的会话">${esc(s.via.label)}</span>` : ''}${s.active ? '<span class="dot live" title="记录正在更新"></span>' : ''}${fmtTime(s.mtime)} · ${s.questions} 问
         ${s.noted ? '<span class="badge">整理版</span>' : ''}</div></a>`).join('') + '</div>';
   }).join('');
   $('#sessions').innerHTML = html || '<div class="hint">没有匹配的会话</div>';
@@ -382,6 +414,8 @@ $('#sessions').addEventListener('click', async e => {
     if (r.error) return toast(r.error);
     await loadTerms();
     if (r.sid) { location.hash = '#/s/' + r.sid; if (narrow.matches) showSide(false); }
+    // codex / agy 的回答暂时只在终端里看得到:直接把终端打开
+    if (r.cli && r.cli !== 'claude' && !panelShown('terminal')) showPanel('terminal');
     loadSessions();
     return;
   }
@@ -714,6 +748,8 @@ function renderHead() {
     `<span>${esc(meta.cwd || '')}</span>`, `<span>${fmtTime(meta.started)} → ${fmtTime(meta.updated)}</span>`,
     `<span>${meta.questions} 问</span>`, `<span><code>${meta.id}</code></span>`,
   ].join(''));
+  // 还没有记录的 codex / agy 终端:"resume / qa-notes 命令"没有意义(codex 有记录后就有)
+  $('#s-actions').querySelectorAll('[data-copy]').forEach(b => { b.hidden = !!state.data.pending && !!meta.cli && meta.cli !== 'claude'; });
   const noteBtn = $('#tabs [data-tab=note]');
   noteBtn.disabled = !note;
   renderSendNote();
@@ -731,7 +767,13 @@ function renderSession() {
   renderHead();
   const tab = note ? state.tab : 'raw';
   tabBtns(tab);
-  if (state.data.pending) {
+  const other = state.data.meta.cli && state.data.meta.cli !== 'claude';
+  if (state.data.pending && other) {
+    const who = esc(cliName(state.data.meta.cli));
+    $('#article').innerHTML = `<div class="hint">${who} 会话。网页暂时还不显示 ${who} 的问答记录,回答请在终端里看(Ctrl/⌘+J 或输入框右下的"打开终端")。<br>` +
+      '下方的输入框照常可以发消息、排队,弹出选择菜单时也能直接点选项。</div>';
+    $('#toc').innerHTML = '';
+  } else if (state.data.pending) {
     $('#article').innerHTML = '<div class="hint">新会话,还没有提问。<br>在下方的输入框里开始对话,问答会实时显示在这里。</div>';
     $('#toc').innerHTML = '';
   } else if (tab === 'note') renderNote(note);
@@ -1107,6 +1149,8 @@ async function loadTerms() {
   if (r) onTerms(r.terms);
 }
 
+// 网页上继续这个会话时用的命令(提示文字里显示)
+const resumeCmd = () => state.data?.meta.cli === 'codex' ? 'codex resume' : '--resume';
 function syncDock() {
   requestAnimationFrame(layoutMap);
   const idle = !state.data || $('#view').classList.contains('stars') || $('#view').classList.contains('file');
@@ -1129,7 +1173,7 @@ function syncDock() {
     $('#dock-go').textContent = owner?.job ? '▶ 接入后台会话' : '▶ 在此继续对话';
     $('#dock-status').textContent = owner ? `在${owner.label}里运行中` : '未运行';
     if (owner) $('#dock-tip').textContent = owner.message;
-    else $('#dock-tip').innerHTML = '将以 <code>--resume</code> 在后台启动(bypass 模式),这里出现与终端完全相同的输入框。';
+    else $('#dock-tip').innerHTML = `将以 <code>${resumeCmd()}</code> 在后台启动(bypass 模式),这里出现与终端完全相同的输入框。`;
   }
   setZoneInfo();
   renderComposer();
@@ -1139,7 +1183,7 @@ function syncDock() {
 // 在本页打字,整条消息一次发给服务器,由它粘贴进 tmux 里的 cc 再回车:打字不经网络,网络差也只影响"发送"这一下。
 // cc 弹出选择菜单时(权限确认、提问、/model…)把选项列成按钮;正在回答时可以"停止"(= Esc)。
 // 草稿按会话存在本机,没发出去不会丢。
-// cc 正在回答时:Enter = 排队(等它答完依次发,列在输入框上方,可撤回 / 编辑);Ctrl/⌘+Enter = 引导(马上插进当前回答)。
+// cc 正在回答时:发出的消息先排队(等它答完依次发,列在输入框上方);排队的每条可以"引导"(马上插进当前回答)、编辑、删掉。
 // 撤回 / 编辑的消息回到输入框;输入框里已经有字时放进草稿箱,不覆盖正在写的东西。
 const cm = { sid: null, sending: false, err: '', sentAt: 0, note: '', queue: [], drafts: [] };
 // cc 提问(AskUserQuestion)时的特殊项:"Type something" = 自己填答案(用下面的输入框);[ ] / [✔] = 多选题
@@ -1147,29 +1191,63 @@ const FREE_RE = /^(\d+\.\s+)?(\[.\]\s+)?Type something/i, MULTI_RE = /^(\d+\.\s+
 const CM_PH = '给 cc 发消息…(Enter 发送,Shift+Enter 换行)';
 const cmText = $('#cm-text');
 const draftKey = sid => 'draft.' + sid;
-function cmAutosize() { cmText.style.height = 'auto'; cmText.style.height = Math.min(cmText.scrollHeight, innerHeight * 0.4) + 'px'; }
+// 输入框跟着内容长高。不能直接在输入框上 height=auto 再读 scrollHeight:那会让浏览器当场重排整页,
+// 会话长了(几千个公式、代码块)每敲一个字都要排一遍,打字就卡。改成在页面布局之外的"影子"输入框里量,
+// 高度真变了(多一行 / 少一行)才动真的输入框。
+const cmMirror = Object.assign(document.createElement('textarea'), { tabIndex: -1, ariaHidden: 'true', rows: 1 });
+cmMirror.style.cssText = 'position:fixed;left:-9999px;top:0;visibility:hidden;pointer-events:none;height:0;overflow:hidden;contain:strict;';
+document.body.append(cmMirror);
+let cmMirrorFor = '';
+function cmAutosize() {
+  const w = cmText.clientWidth;
+  if (!w) return;
+  if (cmMirrorFor !== cmText.className + w) {  // 字体等样式照抄一次(宽度变了再抄)
+    const cs = getComputedStyle(cmText);
+    for (const k of ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'letterSpacing', 'lineHeight', 'boxSizing', 'whiteSpace', 'wordBreak',
+      'overflowWrap', 'tabSize', 'paddingTop', 'paddingBottom', 'paddingLeft', 'paddingRight',
+      'borderTopWidth', 'borderBottomWidth', 'borderLeftWidth', 'borderRightWidth', 'borderTopStyle', 'borderBottomStyle', 'borderLeftStyle', 'borderRightStyle'])
+      cmMirror.style[k] = cs[k];
+    cmMirror.style.width = w + 'px';
+    cmMirrorFor = cmText.className + w;
+  }
+  cmMirror.value = cmText.value;
+  const h = Math.min(cmMirror.scrollHeight, innerHeight * 0.4) + 'px';
+  if (cmText.style.height !== h) cmText.style.height = h;
+}
+// 草稿存本机:停手 300ms 再写,不是每个字都写一次 localStorage(同步操作,也会拖慢打字)
+let cmSaveT = null;
+function cmSaveDraft(now) {
+  clearTimeout(cmSaveT);
+  const sid = cm.sid, v = cmText.value;
+  const save = () => { if (sid) localSet(draftKey(sid), v); };
+  if (now) save(); else cmSaveT = setTimeout(save, 300);
+}
+addEventListener('pagehide', () => cmSaveDraft(true));
+document.addEventListener('visibilitychange', () => { if (document.hidden) cmSaveDraft(true); });
 function renderComposer() {
   const box = $('#composer');
   const show = !!state.data && !$('#view').hidden && !$('#view').matches('.file, .stars, .summary');
   box.hidden = !show;
   if (!show) return;
   const sid = state.data.meta.id;
-  if (cm.sid !== sid) {  // 换了会话:放回这个会话的草稿
+  if (cm.sid !== sid) {  // 换了会话:先把上一个会话没存完的草稿存掉,再放回这个会话的草稿
+    if (cmSaveT) cmSaveDraft(true);
     cm.sid = sid; cm.err = ''; cm.sentAt = 0; cm.note = ''; cm.queue = [];
     cmText.value = localGet(draftKey(sid), ''); cmAutosize();
     loadQueue(sid);
   }
   const t = tv.bySid.get(sid), scr = t?.screen;
+  const tcli = t?.cli || state.data.meta.cli || 'claude', who = cliName(tcli);
+  const canSteer = tcli === 'claude' || !!cliInfo(tcli)?.steer;
   const owner = !t && !state.data.pending && state.data.owner;
   const blocked = !!owner && !owner.job;
   cmText.disabled = blocked;
   $('#cm-send').disabled = blocked || cm.sending;
   $('#cm-stop').hidden = !scr?.busy;
-  const busy = !!scr?.busy && !scr?.menu;  // 回答中:发送分成"排队"和"引导"
-  $('#cm-steer').hidden = !busy;
-  $('#cm-steer').disabled = blocked || cm.sending;
+  const busy = !!scr?.busy && !scr?.menu;  // 回答中:发出去的消息先排队,要插进当前回答就点排队那条的"引导"
+  cm.canSteer = busy && canSteer && !blocked; cm.who = who;
   $('#cm-send').textContent = busy || cm.queue.length ? '排队' : '发送';
-  $('#cm-send').title = busy || cm.queue.length ? '等 cc 答完再发(Enter)' : '发送(Enter)';
+  $('#cm-send').title = busy || cm.queue.length ? `等 ${who} 答完再发(Enter)` : '发送(Enter)';
   $('#cm-drafts').textContent = cm.drafts.length ? `草稿箱 ${cm.drafts.length}` : '草稿箱';
   renderQueue();
   const st = $('#cm-status');
@@ -1177,27 +1255,83 @@ function renderComposer() {
   if (blocked) { msg = esc(owner.message); warn = true; }
   else if (cm.sending) msg = '发送中…';
   else if (cm.err) { msg = esc(cm.err); warn = true; }
-  else if (!t) msg = owner?.job ? '发送后接入 cc 后台会话' : '未运行 · 发送第一条消息时以 <code>--resume</code> 在后台启动 cc';
-  else if (scr?.menu) { msg = 'cc 在等你选择 ↑'; warn = true; }
-  else if (scr?.busy) msg = '<span class="dot live"></span>cc 正在回答 · Enter 排队,Ctrl+Enter 引导(插进当前回答)';
+  else if (!t) msg = owner?.job ? '发送后接入 cc 后台会话' : `未运行 · 发送第一条消息时以 <code>${resumeCmd()}</code> 在后台启动 ${esc(who)}`;
+  else if (scr?.menu) { msg = `${esc(who)} 在等你选择 ↑`; warn = true; }
+  else if (scr?.busy) msg = `<span class="dot live"></span>${esc(who)} 正在回答 · 发出的消息先排队` + (canSteer ? ',点排队那条的"引导"可以马上插进当前回答' : '');
   else if (cm.sentAt && Date.now() - cm.sentAt < 6000) msg = esc(cm.note || '已发送');
-  else if (scr && !scr.ready) msg = 'cc 还没准备好(启动中?)';
+  else if (scr && !scr.ready) msg = `${esc(who)} 还没准备好(启动中?)`;
   else msg = `<span class="dot live"></span>运行中 · ${esc(t.name)}`;
   st.innerHTML = msg; st.classList.toggle('warn', warn); st.title = st.textContent;
   $('#cm-term').textContent = panelShown('terminal') ? '收起终端' : '打开终端';
   const menu = scr?.menu, mel = $('#cm-menu');
   const free = menu ? menu.options.findIndex(o => FREE_RE.test(o.text)) : -1;
   const multi = !!menu?.options.some(o => MULTI_RE.test(o.text));
-  cmText.placeholder = free >= 0 ? (multi ? '自己填一项:输入后 Enter,会勾上这一项(再点 Next / Submit)' : '或者输入自己的答案,Enter 发送') : CM_PH;
+  cmText.placeholder = free >= 0 ? (multi ? '自己填一项:输入后 Enter,会勾上这一项(再点 Next / Submit)' : '或者输入自己的答案,Enter 发送')
+    : CM_PH.replace('cc', who);
   if (menu && free >= 0 && !blocked && !cm.sending && !cm.err) st.textContent = 'cc 在问你 ↑ 点一个选项,或在下面输入自己的答案';
   mel.hidden = !menu;
-  if (menu) {
-    const tip = multi ? '多选:点选项打勾 / 取消,选好后点 Next 或 Submit' : menu.foot || '';
-    setHTML(mel, (menu.head ? `<div class="mh"><b>${esc(menu.head)}</b></div>` : '') +
-      '<div class="opts">' + menu.options.map((o, i) => i === free ? '' :  // 自己填的那项用下面的输入框
-        `<button class="opt${o.sel ? ' sel' : ''}" data-i="${i}">${esc(o.text)}${o.desc ? `<small>${esc(o.desc)}</small>` : ''}</button>`).join('') + '</div>' +
-      `<div class="mf"><span>${esc(tip)}</span><span class="sp"></span><button data-key="Escape" title="相当于在终端里按 Esc">取消</button></div>`);
+  if (menu) setHTML(mel, menuHTML(menu, { free, multi, who }));
+}
+// ---------- 选择菜单 / 提问 ----------
+// 权限确认、/model 这类菜单:一列选项,点一下 = 在终端里移过去回车。
+// cc 一次问几个问题时(AskUserQuestion):上面是题目标签,点标签切到那一题(终端里的 ←/→),
+// 答过的题可以回去改,之前选的答案带 ✓;最后一页"检查答案"列出每题的答案,点某一题回去改。
+const OPT_RE = /^(\d+)\.\s+(?:\[(.)\]\s+)?(.*)$/;
+function menuHTML(menu, { free, multi, who }) {
+  const tabs = menu.tabs || [], cur = tabs.findIndex(t => t.cur);
+  const review = tabs[cur]?.submit || /^Review your answers/m.test(menu.head);
+  const lines = (menu.head || '').split('\n').filter(Boolean);
+  let h = '';
+  if (tabs.length) {
+    const done = tabs.filter(t => t.done).length, total = tabs.filter(t => !t.submit).length;
+    h += `<div class="mq-tabs"><span class="mq-prog">${done}/${total}</span>` + tabs.map((t, i) =>
+      `<button class="mq-tab${t.cur ? ' cur' : ''}${t.done ? ' done' : ''}${t.submit ? ' submit' : ''}" data-tab="${i}" ` +
+      `title="${t.submit ? '检查答案并提交' : t.done ? '已回答 · 点击回去修改' : '未回答'}">` +
+      `<span class="mq-dot">${t.submit ? '✓' : t.done ? '✓' : i + 1}</span>${esc(t.submit ? '提交' : t.label)}</button>`).join('') + '</div>';
   }
+  if (review) {  // 检查答案:● 问题 / → 答案
+    const qa = [];
+    let warn = '';
+    for (const x of lines) {
+      if (/^●/.test(x)) qa.push({ q: x.replace(/^●\s*/, ''), a: [] });
+      else if (/^→/.test(x) && qa.length) qa.at(-1).a.push(x.replace(/^→\s*/, ''));
+      else if (/^⚠/.test(x)) warn = x.replace(/^⚠\s*/, '');
+    }
+    h += `<div class="mq-q">检查答案</div>` + (warn ? `<div class="mq-warn">⚠ 还有问题没回答</div>` : '');
+    // 检查页只列答过的题,顺序和标签一致:第 k 条对应第 k 个答过的标签
+    const answered = tabs.map((t, i) => t.done && !t.submit ? i : -1).filter(i => i >= 0);
+    h += '<div class="mq-review">' + qa.map((r, k) => {
+      const i = qa.length === answered.length ? answered[k] : -1;
+      return `<button class="mq-ans"${i >= 0 ? ` data-tab="${i}" title="回去修改"` : ' disabled'}><span class="q">${esc(r.q)}</span>` +
+        `<span class="a">${esc(r.a.join('、'))}</span><span class="ed">修改</span></button>`;
+    }).join('') + '</div>';
+    const un = tabs.filter(t => !t.done && !t.submit);
+    if (un.length) h += `<div class="mq-un">未回答:${un.map(t => `<button class="link" data-tab="${tabs.indexOf(t)}">${esc(t.label)}</button>`).join('、')}</div>`;
+  } else if (lines.length) {
+    const q = lines.at(-1), rest = lines.slice(0, -1);
+    h += (rest.length ? `<div class="mq-pre">${esc(rest.join('\n'))}</div>` : '') + `<div class="mq-q">${esc(q)}</div>`;
+  }
+  if (tabs.length && !review) h += `<div class="mq-kind">${multi ? '多选 · 可以选几项,选好后点"下一步"' : '单选 · 点一项就选定'}</div>`;
+  h += '<div class="mq-opts">' + menu.options.map((o, i) => {
+    if (i === free) return '';  // 自己填答案:用下面的输入框
+    const m = OPT_RE.exec(o.text);
+    if (!m) {  // 不带序号的一项:多选题下面的 Next
+      const next = /^next$/i.test(o.text.trim());
+      return `<button class="mq-act${o.sel ? ' sel' : ''}" data-i="${i}">${esc(next ? '下一步 →' : o.text)}</button>`;
+    }
+    const [, n, box, label] = m, checked = box && box !== ' ';
+    const chat = /^chat about this$/i.test(label.trim());
+    const mark = box != null ? `<span class="mq-box${checked ? ' on' : ''}">${checked ? '✓' : ''}</span>` : `<span class="mq-num">${n}</span>`;
+    return `<button class="mq-opt${o.sel ? ' sel' : ''}${o.chosen || checked ? ' chosen' : ''}${chat ? ' chat' : ''}" data-i="${i}">` +
+      `${mark}<span class="mq-t"><span class="mq-l">${esc(chat ? '换个方式:直接跟 ' + who + ' 聊' : label)}</span>` +
+      `${o.desc ? `<small>${esc(o.desc)}</small>` : ''}</span>${o.chosen ? '<span class="mq-ck" title="之前选的答案">✓ 已选</span>' : ''}</button>`;
+  }).join('') + '</div>';
+  const tip = free >= 0 ? '✎ 也可以在下面的输入框里写自己的答案' : menu.foot && !/^Enter to/i.test(menu.foot) ? menu.foot : '';
+  const prev = cur > 0 ? `<button data-tab="${cur - 1}" title="上一题(终端里的 ←)">‹ 上一题</button>` : '';
+  const next = cur >= 0 && cur < tabs.length - 1 ? `<button data-tab="${cur + 1}" title="下一题(终端里的 →)">${tabs[cur + 1].submit ? '去提交' : '下一题'} ›</button>` : '';
+  h += `<div class="mq-foot"><span class="mq-tip">${esc(tip)}</span><span class="sp"></span>${prev}${next}` +
+    `<button class="mq-cancel" data-key="Escape" title="相当于在终端里按 Esc">取消</button></div>`;
+  return h;
 }
 async function cmKeys(body) {
   const sid = state.data?.meta.id; if (!sid) return;
@@ -1209,9 +1343,12 @@ function renderQueue() {
   const q = $('#cm-queue');
   q.hidden = !cm.queue.length;
   if (!cm.queue.length) return setHTML(q, '');
-  setHTML(q, `<div class="qh">排队中 ${cm.queue.length} 条 · cc 答完后按顺序发送</div>` + cm.queue.map((it, i) =>
+  const who = cm.who || 'cc';
+  setHTML(q, `<div class="qh">排队中 ${cm.queue.length} 条 · ${esc(who)} 答完后按顺序发送</div>` + cm.queue.map((it, i) =>
     `<div class="qit" data-id="${esc(it.id)}"><span class="qn">#${i + 1}</span><span class="qt">${esc(it.text)}</span>` +
-    `<button class="qb" data-act="edit" title="拿回输入框修改">✎</button><button class="qb" data-act="cancel" title="撤回(文字回到输入框)">✕</button></div>`).join(''));
+    (cm.canSteer ? `<button class="qb steer" data-act="steer" title="不等了:马上插进 ${esc(who)} 正在进行的回答">引导</button>` : '') +
+    `<button class="qb" data-act="edit" title="拿回输入框修改(输入框里有字时放进草稿箱)">✎</button>` +
+    `<button class="qb" data-act="cancel" title="删掉这条(文字回到输入框;输入框里有字时放进草稿箱)">✕</button></div>`).join(''));
 }
 async function loadQueue(sid) {
   const r = await api(`/api/queue/${sid}`).catch(() => null);
@@ -1226,7 +1363,7 @@ async function loadDrafts() {
 // 撤回 / 编辑 / 草稿拿出来的文字:输入框空着就放进去;已经有字就存进草稿箱,弹窗说一声
 async function returnText(text, what) {
   if (!cmText.value.trim()) {
-    cmText.value = text; cmAutosize(); if (cm.sid) localSet(draftKey(cm.sid), text);
+    cmText.value = text; cmAutosize(); cmSaveDraft(true);
     cmText.focus(); cmText.setSelectionRange(text.length, text.length);
     return true;
   }
@@ -1239,11 +1376,18 @@ async function returnText(text, what) {
 }
 $('#cm-queue').addEventListener('click', async e => {
   const b = e.target.closest('.qb'); if (!b) return;
-  const id = b.closest('.qit').dataset.id, sid = cm.sid;
-  const r = await post(`/api/queue/${sid}/remove`, { id }).catch(() => null);
+  const id = b.closest('.qit').dataset.id, sid = cm.sid, steer = b.dataset.act === 'steer';
+  b.disabled = true;
+  const r = await post(`/api/queue/${sid}/${steer ? 'steer' : 'remove'}`, { id }).catch(() => null);
+  b.disabled = false;
   if (!r || r.error) return toast(r?.error || '网络错误', 2500);
   if (cm.sid === sid) { cm.queue = r.queue; renderComposer(); }
   if (!r.item) return toast('这条刚刚已经发出去了', 2500);
+  if (steer) {
+    toast(r.steered ? '已插进当前回答(引导)' : '已发送', 1800);
+    loadTerms(); setTimeout(loadTerms, 1500);
+    return;
+  }
   returnText(r.item.text, b.dataset.act === 'edit' ? '要编辑' : '撤回');
 });
 $('#cm-pop-ok').addEventListener('click', () => { $('#cm-pop').hidden = true; cmText.focus(); });
@@ -1312,7 +1456,7 @@ $('#cm-save').addEventListener('click', async () => {
   const text = cmText.value;
   if (!text.trim()) return toast('输入框是空的');
   const r = await draftOp({ op: 'add', text, sid: cm.sid, title: state.data?.meta.title || '' });
-  if (r) { cmText.value = ''; cmAutosize(); if (cm.sid) localSet(draftKey(cm.sid), ''); toast('已存进草稿箱'); }
+  if (r) { cmText.value = ''; cmAutosize(); cmSaveDraft(true); toast('已存进草稿箱'); }
 });
 
 async function sendMsg(mode = 'queue') {
@@ -1329,9 +1473,9 @@ async function sendMsg(mode = 'queue') {
   cm.sending = false;
   if (r && !r.error) {
     if (cmText.value === text) { cmText.value = ''; cmAutosize(); }
-    localSet(draftKey(sid), cmText.value);
+    clearTimeout(cmSaveT); localSet(draftKey(sid), cmText.value);  // 先取消还没写的草稿,免得发完又把旧内容写回去
     cm.sentAt = Date.now(); cm.err = '';
-    cm.note = r.queued ? '已排队,cc 答完后发送' : r.steered ? '已插进当前回答(引导)' : '已发送';
+    cm.note = r.queued ? '已排队,答完后发送' : r.steered ? '已插进当前回答(引导)' : '已发送';
     if (r.queued) { cm.queue = [...cm.queue.filter(x => x.id !== r.item.id), r.item]; }
     if (r.answered && r.multi) toast('已填入并勾选,选好后点 Next / Submit', 2500);
     if (state.data?.meta.id === sid) {
@@ -1342,19 +1486,19 @@ async function sendMsg(mode = 'queue') {
   } else cm.err = r?.error || '网络不通,消息没有送出(草稿还在,稍后再发)';
   if (state.data?.meta.id === sid) renderComposer();
 }
-cmText.addEventListener('input', () => { cmAutosize(); if (cm.sid) localSet(draftKey(cm.sid), cmText.value); });
+cmText.addEventListener('input', () => { cmAutosize(); cmSaveDraft(); });
 cmText.addEventListener('keydown', e => {
   // 输入法组字时的回车是确认候选词,不是发送
   if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229 || e.shiftKey || e.altKey) return;
-  e.preventDefault(); sendMsg(e.ctrlKey || e.metaKey ? 'steer' : 'queue');
+  e.preventDefault(); sendMsg('queue');
 });
 $('#cm-send').addEventListener('click', () => sendMsg('queue'));
-$('#cm-steer').addEventListener('click', () => sendMsg('steer'));
 $('#cm-stop').addEventListener('click', () => { cm.sentAt = 0; cmKeys({ keys: ['Escape'] }); });
 $('#cm-term').addEventListener('click', () => showPanel('terminal', true));
 $('#cm-menu').addEventListener('click', e => {
   const b = e.target.closest('button'); if (!b) return;
   if (b.dataset.i != null) cmKeys({ choose: +b.dataset.i });
+  else if (b.dataset.tab != null) cmKeys({ tab: +b.dataset.tab });
   else if (b.dataset.key) cmKeys({ keys: [b.dataset.key] });
 });
 
@@ -1845,7 +1989,7 @@ $('#send-note').addEventListener('click', async () => {
 
 document.querySelectorAll('[data-copy]').forEach(b => b.addEventListener('click', async () => {
   const m = state.data?.meta; if (!m) return;
-  const text = b.dataset.copy === 'resume' ? `cd ${m.cwd} && cc --resume ${m.id}` : `/qa-notes ${m.id}`;
+  const text = b.dataset.copy === 'resume' ? `cd ${m.cwd} && ${m.cli === 'codex' ? 'codex resume' : 'cc --resume'} ${m.id}` : `/qa-notes ${m.id}`;
   try { await navigator.clipboard.writeText(text); toast('已复制: ' + text); }
   catch { prompt('复制下面的命令', text); }
 }));

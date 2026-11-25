@@ -132,7 +132,7 @@ class SessionParser:
 
     def __init__(self, path):
         self.path = path
-        self.meta = {"id": path.stem, "file": str(path), "cwd": None, "title": None,
+        self.meta = {"id": path.stem, "file": str(path), "cwd": None, "title": None, "cli": "claude",
                      "ai_title": None, "first_q": None, "started": None, "updated": None, "continued_in": None}
         self.turns = []
         # 图片只记位置 (类型, 所在行的字节偏移, 该行第几个 base64 块),turn 里存索引;
@@ -328,9 +328,166 @@ class SessionParser:
         return meta, turns
 
 
+# ---------------------------------------------------------------- codex 的会话记录
+# codex 把每个会话写成 ~/.codex/sessions/YYYY/MM/DD/rollout-<时间>-<会话 ID>.jsonl,标题在 session_index.jsonl。
+# 网站各处都以"记录文件名 = 会话 ID"认会话,所以在 data/codex/ 下给每个记录建一个 <会话 ID>.jsonl 的软链接,
+# 其余代码(列表、搜索、收藏、整理版、总结…)不用分两套;解析时按所在目录换成 CodexParser。
+CODEX_SESSIONS = term.CODEX_HOME / "sessions"
+CODEX_INDEX = term.CODEX_HOME / "session_index.jsonl"
+CODEX_LINKS = ROOT / "data" / "codex"
+_ROLLOUT_RE = re.compile(r"rollout-.+-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$")
+_codex_sync = [0.0]
+_codex_sync_lock = threading.Lock()
+
+
+def is_codex(path):
+    return path.parent == CODEX_LINKS
+
+
+def sync_codex_links(force=False):
+    """让 data/codex/ 里的软链接和 codex 的记录一一对应:新会话加上,删掉 / 归档的去掉。最多 5 秒一次。"""
+    with _codex_sync_lock:
+        if not force and time.monotonic() - _codex_sync[0] < 5:
+            return
+        _codex_sync[0] = time.monotonic()
+        want = {}
+        if CODEX_SESSIONS.is_dir():
+            for f in CODEX_SESSIONS.glob("*/*/*/rollout-*.jsonl"):
+                m = _ROLLOUT_RE.search(f.name)
+                if m:
+                    want[m.group(1)] = str(f)
+        if not want and not CODEX_LINKS.is_dir():
+            return
+        CODEX_LINKS.mkdir(parents=True, exist_ok=True)
+        for link in CODEX_LINKS.glob("*.jsonl"):
+            try:
+                target = os.readlink(link)
+            except OSError:
+                target = None
+            if want.get(link.stem) == target:
+                del want[link.stem]
+            else:
+                link.unlink(missing_ok=True)
+        for sid, f in want.items():
+            try:
+                os.symlink(f, CODEX_LINKS / f"{sid}.jsonl")
+            except OSError:
+                pass
+
+
+_codex_names = [None, {}]
+
+
+def codex_names():
+    """codex 给会话起的标题(session_index.jsonl,同一个会话以最后一条为准)。"""
+    try:
+        st = CODEX_INDEX.stat()
+    except OSError:
+        return {}
+    key = (st.st_mtime_ns, st.st_size)
+    if _codex_names[0] != key:
+        names = {}
+        try:
+            for line in CODEX_INDEX.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    d = json.loads(line)
+                    if d.get("id") and d.get("thread_name"):
+                        names[d["id"]] = d["thread_name"]
+                except ValueError:
+                    pass
+        except OSError:
+            pass
+        _codex_names[:] = [key, names]
+    return _codex_names[1]
+
+
+class CodexParser(SessionParser):
+    """codex 的记录 → 和 cc 一样的问答轮次。只看整理好的条目(event_msg item_completed):
+    UserMessage 是一问,AgentMessage 是回答(commentary 是过程文字,final_answer 是最后的回答);
+    同一个 turn_id 里后来的 UserMessage 是回答进行中插进来的(引导),记成 #n-1 这样的追问。
+    response_item 里的工具调用只计数;那里的 user 消息带着 codex 自己塞的环境说明,不用。"""
+
+    def __init__(self, path):
+        super().__init__(path)
+        self.meta["cli"] = "codex"
+        self.turn_id = None
+        self.seen_ids = set()
+
+    def _line(self, raw, offset):
+        try:
+            d = json.loads(raw.decode("utf-8", errors="replace"))
+        except ValueError:
+            return
+        if not isinstance(d, dict):
+            return
+        t, p, ts = d.get("type"), d.get("payload"), d.get("timestamp")
+        if not isinstance(p, dict):
+            return
+        meta, cur = self.meta, self.cur
+        if t == "session_meta":
+            meta["cwd"] = meta["cwd"] or p.get("cwd")
+            meta["started"] = meta["started"] or p.get("timestamp") or ts
+            return
+        if t == "compacted":  # 上下文压缩:和 cc 的压缩摘要一样单独一轮
+            if p.get("message"):
+                self._new_turn("summary", p["message"], ts)
+                self.turn_id = None
+            return
+        if t == "response_item":
+            if str(p.get("type", "")).endswith("_call") and cur is not None:
+                cur["tools"] += 1
+            return
+        if t != "event_msg":
+            return
+        et = p.get("type")
+        if et == "turn_aborted":
+            if cur is not None:
+                cur["notes"].append("⏹ 用户中断")
+            return
+        if et != "item_completed":
+            return
+        it = p.get("item") or {}
+        kind, iid = it.get("type"), it.get("id")
+        if kind not in ("UserMessage", "AgentMessage") or (iid and iid in self.seen_ids):
+            return
+        if iid:
+            self.seen_ids.add(iid)
+        content = it.get("content") if isinstance(it.get("content"), list) else []
+        meta["started"] = meta["started"] or ts
+        meta["updated"] = ts or meta["updated"]
+        if kind == "UserMessage":
+            text = "\n\n".join(c.get("text", "") for c in content if c.get("type") == "text" and c.get("text")).strip()
+            if not text and any("image" in str(c.get("type", "")) for c in content):
+                text = "(图片)"
+            if not text:
+                return
+            tid = p.get("turn_id")
+            if cur is not None and tid and tid == self.turn_id:
+                cur["follows"].append({"q": text, "ts": ts, "at": len(cur["texts"])})
+                return
+            self.turn_id = tid
+            self._new_turn("question", text, ts)
+            meta["first_q"] = meta["first_q"] or text[:200]
+        else:
+            txt = "\n\n".join(c.get("text", "") for c in content if c.get("text")).strip()
+            if not txt:
+                return
+            if cur is None:
+                self._new_turn("question", "", ts)
+            self.cur["texts"].append(txt)
+
+    def result(self):
+        self.meta["ai_title"] = codex_names().get(self.meta["id"]) or self.meta["ai_title"]
+        return super().result()
+
+
+def parser_for(path):
+    return CodexParser(path) if is_codex(path) else SessionParser(path)
+
+
 def parse_session(path):
     """把一个 .jsonl 会话解析成问答轮次。"""
-    p = SessionParser(path)
+    p = parser_for(path)
     p.feed()
     return p.result()
 
@@ -389,7 +546,7 @@ def cached_parse(path):
     parser = hit[3] if hit else None
     with (parser.lock if parser else threading.Lock()):  # 同一个解析器不能两个线程同时续读
         if parser is None or not parser.can_resume(st):
-            parser = SessionParser(path)
+            parser = parser_for(path)
         parser.feed()
         res = parser.result()
     size = _turns_size(res[1])
@@ -486,6 +643,11 @@ def find_session(sid):
         return p
     for p in PROJECTS.glob(f"*/{sid}.jsonl"):  # 索引建立之后才出现的会话
         return p
+    if re.fullmatch(r"[0-9a-f-]{36}", sid or ""):  # 刚开始写的 codex 会话:软链接可能还没建
+        sync_codex_links(force=not (CODEX_LINKS / f"{sid}.jsonl").exists())
+        p = CODEX_LINKS / f"{sid}.jsonl"
+        if p.exists():
+            return p
     return None
 
 
@@ -533,7 +695,8 @@ def session_index():
         if _index and time.monotonic() - _index[0] < INDEX_MAX_AGE:
             return _index[2]
     files = []
-    for p in PROJECTS.glob("*/*.jsonl"):
+    sync_codex_links()
+    for p in [*PROJECTS.glob("*/*.jsonl"), *CODEX_LINKS.glob("*.jsonl")]:
         try:
             st = p.stat()
         except OSError:
@@ -660,9 +823,86 @@ def live_processes():
     return out
 
 
+def _proc_tree(pid):
+    """pid 和它的所有子孙进程(读 /proc/<pid>/task/*/children)。"""
+    out, todo = [], [pid]
+    while todo and len(out) < 200:
+        x = todo.pop()
+        out.append(x)
+        for task in Path(f"/proc/{x}/task").glob("*/children"):
+            try:
+                todo += [int(c) for c in task.read_text().split()]
+            except (OSError, ValueError):
+                pass
+    return out
+
+
+def _open_rollouts(pid):
+    """这个进程正开着的 codex 记录 → [会话 ID]。codex 运行时一直开着当前会话的 rollout 文件(/resume、/new 后换成新的)。"""
+    ids = []
+    try:
+        fds = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        return ids
+    for fd in fds:
+        try:
+            m = _ROLLOUT_RE.search(os.readlink(f"/proc/{pid}/fd/{fd}"))
+        except OSError:
+            continue
+        if m and m.group(1) not in ids:
+            ids.append(m.group(1))
+    return ids
+
+
+def codex_term_sid(t):
+    """codex 终端此刻所在的会话:窗格里的 codex 进程开着哪个 rollout 文件。还没写出记录(没提问)时 None。"""
+    if not t.get("pid"):
+        return None
+    ids = [x for pid in _proc_tree(t["pid"]) for x in _open_rollouts(pid)]
+    if len(ids) > 1:  # 一般只有一个;万一有几个,取最近写过的
+        ids.sort(key=lambda x: (find_session(x).stat().st_mtime if find_session(x) else 0), reverse=True)
+    return ids[0] if ids else None
+
+
+_codex_procs = (0.0, None)
+
+
+def codex_holders():
+    """所有开着 codex 记录的 codex 进程:{会话 ID: (pid, 是不是 codex 的后台服务)}。
+    别处开的 codex 默认把会话交给共享的后台服务(app-server)跑,记录由它开着;那个 codex 窗口关掉后它就放开了。"""
+    global _codex_procs
+    if time.monotonic() - _codex_procs[0] < INDEX_MAX_AGE:
+        return _codex_procs[1]
+    out = {}
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            if (d / "comm").read_text().strip() != "codex":
+                continue
+            daemon = b"app-server" in (d / "cmdline").read_bytes()
+        except OSError:
+            continue
+        for sid in _open_rollouts(int(d.name)):
+            out.setdefault(sid, (int(d.name), daemon))
+    _codex_procs = (time.monotonic(), out)
+    return out
+
+
 def session_owner(path, terms=None):
     """不是网页能接管的(cc 启动的 tmux 终端之外的)、正在使用这个会话的 cc 进程,没有则 None。
     同一条接续链上的会话算同一个(cc 接续时会换新 id)。"""
+    if is_codex(path):  # codex:看哪个 codex 进程开着这个会话的记录,不是网页终端里的就是"别的终端"
+        pid, daemon = codex_holders().get(path.stem) or (None, False)
+        if pid:
+            ours = {x for t in (terms if terms is not None else term.list_sessions()) if t.get("cli") == "codex" and t.get("pid")
+                    for x in _proc_tree(t["pid"])}
+            if pid not in ours:
+                owner = {"pid": pid, "label": "别的 codex 窗口" if daemon else "别的终端", "platform": None, "job": None}
+                msg = (f"这个会话正在别的 codex 窗口里打开着(由 codex 后台服务 pid {pid} 运行)。为避免两个进程同时写同一会话,"
+                       "请在那边继续,或先关掉那个 codex 再从网页继续。") if daemon else owner_message(owner)
+                return {**owner, "message": msg}
+        return None
     procs = live_processes()
     if procs is None:  # 老版本 cc:只能看记录文件最近有没有被写过
         if time.time() - path.stat().st_mtime < 60:
@@ -719,6 +959,12 @@ def link_terms(terms):
     在终端创建之后才开始、开始时原会话已不再写入问答、且没被其他终端占用。"""
     claimed = {t["launch_sid"] for t in terms if t["launch_sid"]}
     for t in terms:
+        if t.get("cli", "claude") != "claude":  # codex:进程开着哪个记录就是哪个会话;agy 还不读记录,用启动时给的临时 ID
+            scr = term.screen_state(t["name"], t["cli"])
+            t["screen"] = {k: scr[k] for k in ("ready", "busy", "menu")}
+            sid = codex_term_sid(t) if t["cli"] == "codex" else None
+            t["sid"] = sid if sid and find_session(sid) else None
+            continue
         reg = next((pr for pr in live_processes() or () if pr["pid"] == t.get("pid")), None)
         hook = pane_record(t.get("pane"))
         # 登记和 hook 都没变 → 终端没换过会话(没 /clear、/resume)
@@ -781,6 +1027,12 @@ def link_terms(terms):
         if p:
             t["sid"] = latest_continuation(p).stem
     return terms
+
+
+def pending_title(t):
+    if t.get("cli", "claude") == "claude":
+        return "新会话(尚未提问)"
+    return f"{term.CLIS[t['cli']]['label']} 会话" + (f" · {t['effort']}" if t.get("effort") else "")
 
 
 def latest_sid(cwd):
@@ -1006,6 +1258,42 @@ def _toggle_star(sid, ts, on):
 
 # ---------------------------------------------------------------- 网页继续对话
 
+# ---------------------------------------------------------------- 用什么命令行打开项目 / 思考强度
+# 全局一份(网页、桌面客户端共用),记在 data/cli.json:{"cli": "claude", "effort": {"claude": "high", ...}}
+CLI_PREFS = ROOT / "data" / "cli.json"
+
+
+def cli_prefs():
+    d = _read_json(CLI_PREFS, {})
+    cli = d.get("cli") if d.get("cli") in term.CLIS else term.DEFAULT_CLI
+    eff = {k: v for k, v in (d.get("effort") or {}).items() if k in term.CLIS and isinstance(v, str) and v}
+    return {"cli": cli, "effort": eff}
+
+
+def cli_state():
+    return {**cli_prefs(), "clis": term.cli_info()}
+
+
+def set_cli_prefs(b):
+    """网页上改了"打开方式"或思考强度。effort 是给 b["cli"](没给就是当前的)设的,空 = 用它自己的默认值。"""
+    prefs = cli_prefs()
+    cli = b.get("cli") or prefs["cli"]
+    info = next((c for c in term.cli_info() if c["id"] == cli), None)
+    if not info:
+        raise ValueError(f"不支持的命令行: {cli}")
+    prefs["cli"] = cli
+    if "effort" in b:
+        e = b.get("effort") or None
+        if e and e not in info["efforts"]:
+            raise ValueError(f"{info['label']} 没有 {e} 这一档")
+        if e:
+            prefs["effort"][cli] = e
+        else:
+            prefs["effort"].pop(cli, None)
+    _write_json(CLI_PREFS, prefs)
+    return cli_state()
+
+
 def running_term(sid):
     return next((t["name"] for t in link_terms(term.list_sessions()) if (t["sid"] or t["launch_sid"]) == sid), None)
 
@@ -1066,6 +1354,42 @@ def queue_remove(sid, qid):
                 return items.pop(i)
         return None
     return {"item": _queue_edit(sid, fn), "queue": queue_items(sid)}
+
+
+def queue_steer(sid, qid):
+    """排队的一条不等了:cc 正在回答就马上插进当前回答(引导),已经空闲就直接发。
+    和 queue_worker 一样在锁里从队列拿出来,谁先拿到谁发,不会发两遍;没送进去就放回原位。"""
+    name = running_term(sid)
+    if not name:
+        raise ValueError("cc 没在运行")
+    pos = {}
+
+    def take(items):
+        for i, it in enumerate(items):
+            if it["id"] == qid:
+                pos["i"] = i
+                return items.pop(i)
+        return None
+    item = _queue_edit(sid, take)
+    if not item:  # 刚刚已经按顺序发出去了
+        return {"item": None, "queue": queue_items(sid)}
+    try:
+        st = term.screen_state(name)
+        if st["menu"]:
+            raise ValueError("cc 正弹着一个选择菜单,先在输入框上方选一项")
+        if st["busy"]:
+            term.steer(name, item["text"])
+            how = "steered"
+        elif st["ready"]:
+            term.send_text(name, item["text"])
+            how = "sent"
+        else:
+            raise ValueError("cc 还没准备好,稍后再试")
+    except Exception:
+        _queue_edit(sid, lambda its: its.insert(min(pos["i"], len(its)), item))
+        raise
+    _q_cool[sid] = time.monotonic() + 5  # 刚插进去一条:别马上把下一条也发了
+    return {"item": item, how: True, "queue": queue_items(sid)}
 
 
 _q_idle = {}  # sid → 连续空闲的次数;发完一条后的冷却截止时间
@@ -1192,6 +1516,8 @@ def session_keys(sid, body):
         raise ValueError("cc 没在运行")
     if "choose" in body:
         term.choose(name, int(body["choose"]))
+    elif "tab" in body:
+        term.goto_tab(name, int(body["tab"]))
     else:
         term.send_keys(name, [str(k) for k in body.get("keys") or []])
     return {"ok": True}
@@ -1204,7 +1530,18 @@ def continue_session(sid):
     if name:
         return name
     p = find_session(sid)
+    if p and is_codex(p):  # codex 的历史会话:codex resume <ID>
+        owner = session_owner(p, terms)
+        if owner:
+            raise ValueError(owner_message(owner))
+        meta = cached_meta(p)
+        cwd = meta["cwd"] if meta["cwd"] and os.path.isdir(meta["cwd"]) else str(Path.home())
+        return term.new_session(cwd, ["resume", sid], cli="codex", effort=cli_prefs()["effort"].get("codex"), sid=sid)
     if not p:
+        cli = sid.split("-", 1)[0]
+        if cli in term.CLIS and cli != "claude":
+            raise ValueError(f"这个 {term.CLIS[cli]['label']} 终端已经结束了。网页暂时还不能接着它的历史会话,"
+                             f"请在终端里用 {term.CLIS[cli]['short']} 继续,或在侧栏 new 开一个新的")
         raise ValueError("会话不存在")
     owner = session_owner(p, terms)
     meta = cached_meta(p)
@@ -1213,7 +1550,7 @@ def continue_session(sid):
         return term.new_session(cwd, attach=owner["job"], sid=sid)
     if owner:
         raise ValueError(owner_message(owner))
-    return term.new_session(cwd, ["--resume", sid])
+    return term.new_session(cwd, ["--resume", sid], effort=cli_prefs()["effort"].get("claude"))
 
 
 # 每个会话最近几个版本里各轮的签名,用来算出"客户端手里的版本 → 当前版本"之间变了哪些轮
@@ -1248,7 +1585,7 @@ def session_summary(path):
     meta = cached_meta(path)
     mtime = path.stat().st_mtime
     return {
-        "id": meta["id"], "title": meta["title"], "cwd": meta["cwd"] or path.parent.name,
+        "id": meta["id"], "title": meta["title"], "cwd": meta["cwd"] or path.parent.name, "cli": meta.get("cli", "claude"),
         "first_q": meta["first_q"], "questions": meta["questions"],
         "started": meta["started"], "updated": meta["updated"], "mtime": mtime,
         "active": time.time() - mtime < ACTIVE_SECONDS,
@@ -1803,9 +2140,10 @@ class Handler(SimpleHTTPRequestHandler):
                 mid = str(b.get("id") or "")
                 mode = b.get("mode") if b.get("mode") in ("send", "queue", "steer") else "send"
                 return self._json(send_message(m.group(1), str(b.get("text") or ""), mid if re.fullmatch(r"[\w-]{8,64}", mid) else None, mode))
-            m = re.fullmatch(r"/api/queue/([\w-]+)/remove", u.path)
+            m = re.fullmatch(r"/api/queue/([\w-]+)/(remove|steer)", u.path)
             if m:
-                return self._json(queue_remove(m.group(1), str(self._body().get("id") or "")))
+                fn = queue_remove if m.group(2) == "remove" else queue_steer
+                return self._json(fn(m.group(1), str(self._body().get("id") or "")))
             if u.path == "/api/drafts":
                 return self._json(drafts_op(self._body()))
             m = re.fullmatch(r"/api/sessions/([\w-]+)/keys", u.path)
@@ -1818,6 +2156,8 @@ class Handler(SimpleHTTPRequestHandler):
                     raise ValueError("bad focus")
                 set_focus(page, sid)
                 return self._json({"ok": True})
+            if u.path == "/api/cli":
+                return self._json(set_cli_prefs(self._body()))
             if u.path == "/api/stars":
                 b = self._body()
                 return self._json({"stars": toggle_star(b["sid"], b["ts"], bool(b.get("on", True)))})
@@ -1825,13 +2165,16 @@ class Handler(SimpleHTTPRequestHandler):
             if m:
                 term.kill_session(m.group(1))
                 return self._json({"ok": True})
-            if u.path == "/api/terms/new":  # 侧栏项目名右边的 new:在这个目录新开一个 cc
-                cwd = self._body().get("cwd") or ""
+            if u.path == "/api/terms/new":  # 侧栏项目名右边的 new:在这个目录新开一个 cc(或选好的 codex / agy)
+                b = self._body()
+                cwd = b.get("cwd") or ""
                 if not os.path.isabs(cwd):
                     raise ValueError("需要绝对路径")
-                name = term.new_session(cwd)
+                prefs = cli_prefs()
+                cli = b.get("cli") or prefs["cli"]
+                name = term.new_session(cwd, cli=cli, effort=prefs["effort"].get(cli))
                 t = next((t for t in term.list_sessions() if t["name"] == name), None)
-                return self._json({"term": name, "sid": t and t["launch_sid"]})
+                return self._json({"term": name, "sid": t and t["launch_sid"], "cli": cli})
             m = re.fullmatch(r"/api/sessions/([\w-]+)/send-note", u.path)
             if m:
                 return self._json({"ok": True, "to": send_note(m.group(1))})
@@ -1905,6 +2248,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json(search(q.get("q", [""])[0], q.get("scope", ["all"])[0]))
             if u.path == "/api/terms":
                 return self._json({"terms": link_terms(term.list_sessions())})
+            if u.path == "/api/cli":
+                return self._json(cli_state())
             if u.path == "/api/focus":  # cca 用:网页上选中的会话
                 return self._json({"sid": focused_session()})
             if u.path == "/api/summaries":
@@ -1925,7 +2270,7 @@ class Handler(SimpleHTTPRequestHandler):
                 for t in terms:  # 刚启动、还没提问的会话也列出来
                     sid = t["sid"] or t["launch_sid"]
                     if sid and not (find_session(sid) and cached_meta(find_session(sid))["questions"]):
-                        items.append({"id": sid, "title": "新会话(尚未提问)", "cwd": t["cwd"], "first_q": "",
+                        items.append({"id": sid, "title": pending_title(t), "cwd": t["cwd"], "first_q": "", "cli": t["cli"],
                                       "questions": 0, "started": None, "updated": None, "mtime": t["created"],
                                       "active": True, "noted": False, "running": t["name"]})
                 for p in all_session_files():
@@ -1947,7 +2292,7 @@ class Handler(SimpleHTTPRequestHandler):
                               if (t["sid"] or t["launch_sid"]) == m.group(1)), None)
                     if t:
                         return self._json({"pending": True, "active": True, "version": "pending", "note": None, "turns": [],
-                                           "meta": {"id": m.group(1), "title": "新会话(尚未提问)", "cwd": t["cwd"],
+                                           "meta": {"id": m.group(1), "title": pending_title(t), "cwd": t["cwd"], "cli": t["cli"],
                                                     "questions": 0, "started": None, "updated": None}})
                 if not p:
                     return self._json({"error": "not found"}, 404)
@@ -2168,7 +2513,8 @@ def enter_choices(focus):
     rows = []
     for t in link_terms(term.list_sessions()):
         sid = t["sid"] or t["launch_sid"]
-        rows.append({"name": t["name"], "sid": sid, "title": _session_title(sid), "cwd": t["cwd"],
+        title = _session_title(sid) if t["cli"] == "claude" or (sid and find_session(sid)) else pending_title(t)
+        rows.append({"name": t["name"], "sid": sid, "title": title, "cwd": t["cwd"],
                      "clients": t["clients"], "created": t["created"], "focus": bool(focus) and sid == focus})
     if focus and not any(r["focus"] for r in rows) and find_session(focus):
         meta = cached_meta(find_session(focus))
