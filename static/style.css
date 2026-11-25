@@ -169,6 +169,7 @@ body.resizing iframe, body.resizing #termbox, body.dragging iframe, body.draggin
 .tb.drag { opacity: .45; }
 .tb .tt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .tb .dot { flex: none; }
+.tb .ic { flex: none; color: var(--muted); }
 .tb .tx { flex: none; border: 0; background: none; padding: 0 5px; font-size: 14px; line-height: 18px; color: var(--muted);
   border-radius: 4px; visibility: hidden; }
 .tb:hover .tx, .tb.on .tx { visibility: visible; }

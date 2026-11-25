@@ -465,11 +465,23 @@ const tabset = { list: [], cache: new Map(), drag: null };
 try { tabset.list = JSON.parse(localGet('tabs', '[]')).filter(t => t?.id); } catch {}
 const saveTabs = () => localSet('tabs', JSON.stringify(tabset.list.map(({ id, title }) => ({ id, title }))));
 const tabIdx = id => tabset.list.findIndex(t => t.id === id);
+// 文件也能成为标签(从回答里的链接、文件面板打开的 md / 图片 / 代码…):id 是 "f:" + 路径。会话 id 不含冒号,不会撞
+const FILE_TAB = 'f:';
+const isFileTab = id => id.startsWith(FILE_TAB);
+const tabHref = id => isFileTab(id) ? '#/f/' + encodeURIComponent(id.slice(FILE_TAB.length)) : '#/s/' + id;
+const baseName = p => p.replace(/\/+$/, '').split('/').pop() || p;
+// 当前显示的是哪个标签
+function curTab() {
+  const f = location.hash.match(/^#\/f\/([^@]*)/);
+  if (f) { try { return FILE_TAB + decodeURIComponent(f[1]); } catch { return null; } }
+  return state.sid;
+}
 
 function openTab(sid) {
   let t = tabset.list[tabIdx(sid)];
   if (!t) {
-    tabset.list.push(t = { id: sid, title: state.sessions.find(s => s.id === sid)?.title || sid.slice(0, 8) });
+    tabset.list.push(t = { id: sid, title: isFileTab(sid) ? baseName(sid.slice(FILE_TAB.length))
+      : state.sessions.find(s => s.id === sid)?.title || sid.slice(0, 8) });
     while (tabset.list.length > TAB_MAX) {  // 太多了:关掉最久没看的那个
       const old = tabset.list.filter(x => x.id !== sid).sort((a, b) => (a.used || 0) - (b.used || 0))[0];
       tabset.list.splice(tabIdx(old.id), 1); tabset.cache.delete(old.id);
@@ -483,9 +495,9 @@ function closeTab(id) {
   const i = tabIdx(id);
   if (i < 0) return;
   tabset.list.splice(i, 1); tabset.cache.delete(id); saveTabs();
-  if (id === state.sid) {  // 关掉的是当前标签:去右边那个,没有就左边那个
+  if (id === curTab()) {  // 关掉的是当前标签:去右边那个,没有就左边那个
     const n = tabset.list[i] || tabset.list[i - 1];
-    location.hash = n ? '#/s/' + n.id : '#';
+    location.hash = n ? tabHref(n.id) : '#';
   }
   renderTabbar();
 }
@@ -498,15 +510,16 @@ function renameTab(from, to) {
   saveTabs();
 }
 function renderTabbar() {
-  const bar = $('#tabbar'), info = new Map(state.sessions.map(s => [s.id, s]));
+  const bar = $('#tabbar'), info = new Map(state.sessions.map(s => [s.id, s])), cur = curTab();
   let dirty = false;
   bar.hidden = !tabset.list.length;
   setHTML(bar, tabset.list.map(t => {
-    const s = info.get(t.id);
+    const file = isFileTab(t.id), s = file ? null : info.get(t.id);
     if (s?.title && s.title !== t.title) { t.title = s.title; dirty = true; }
-    return `<a class="tb${t.id === state.sid ? ' on' : ''}" href="#/s/${t.id}" data-sid="${t.id}" draggable="true" title="${esc(t.title)}">` +
-      `${s?.running || s?.active ? '<span class="dot live"></span>' : ''}<span class="tt">${esc(t.title)}</span>` +
-      `<button class="tx" data-close="${t.id}" title="关闭标签(也可以中键点标签)">×</button></a>`;
+    return `<a class="tb${file ? ' file' : ''}${t.id === cur ? ' on' : ''}" href="${esc(tabHref(t.id))}" data-sid="${esc(t.id)}" draggable="true" ` +
+      `title="${esc(file ? t.id.slice(FILE_TAB.length) : t.title)}">` +
+      `${file ? `<span class="ic">${fileIcon({ name: t.title })}</span>` : s?.running || s?.active ? '<span class="dot live"></span>' : ''}<span class="tt">${esc(t.title)}</span>` +
+      `<button class="tx" data-close="${esc(t.id)}" title="关闭标签(也可以中键点标签)">×</button></a>`;
   }).join(''));
   if (dirty) saveTabs();
   const on = bar.querySelector('.tb.on');  // 当前标签滚进可见范围(不用 scrollIntoView,免得带着页面一起滚)
@@ -1302,7 +1315,10 @@ async function openFile(path, line) {
     $('#title').textContent = path.split('/').pop(); $('#sub').innerHTML = `<span>${esc(path)}</span>`;
     $('#article').innerHTML = `<div class="hint">${esc(r.error)}</div>`; renderMap([]); return;
   }
-  if (r.kind === 'dir') { showPanel('files'); loadDir(r.path); history.back(); return; }
+  if (r.kind === 'dir') {  // 目录不开标签,在文件面板里打开
+    const i = tabIdx(FILE_TAB + path); if (i >= 0) { tabset.list.splice(i, 1); saveTabs(); }
+    showPanel('files'); loadDir(r.path); history.back(); return;
+  }
   fs.file = r.path;
   const raw = `/api/fs/raw?path=${encodeURIComponent(r.path)}`;
   $('#title').textContent = r.name;
@@ -1881,7 +1897,7 @@ function route() {
   if (f) {
     let path;
     try { path = decodeURIComponent(f[1]); } catch { location.replace('#'); return; }
-    stash(); openFile(path, f[2] ? +f[2] : null); renderTabbar(); return;
+    stash(); openTab(FILE_TAB + path); openFile(path, f[2] ? +f[2] : null); return;
   }
   if (location.hash === '#/stars') {
     stash(); state.sid = null; state.data = null; renderSessions(); renderTabbar(); loadStars().then(renderStars); return;
