@@ -83,6 +83,7 @@
     <div id="composer" hidden>
       <div id="cm-queue" hidden></div>
       <div id="cm-menu" hidden></div>
+      <div id="cm-sg" hidden role="listbox"></div>
       <div class="cm-box">
         <textarea id="cm-text" rows="1" placeholder="给 cc 发消息…(Enter 发送,Shift+Enter 换行)" enterkeyhint="send"></textarea>
         <div class="cm-btns">
@@ -90,7 +91,7 @@
           <button id="cm-send" class="primary" title="发送(Enter)">发送</button>
         </div>
       </div>
-      <div class="cm-foot"><span id="cm-status"></span><span class="sp"></span>
+      <div class="cm-foot"><button id="cm-model" class="chip" hidden title="模型和思考强度(只对这个会话;也可以输入 /model、/effort)"></button><span id="cm-status"></span><span class="sp"></span>
         <button id="cm-save" class="link" title="把输入框里的内容存进草稿箱,清空输入框">存草稿</button>
         <button id="cm-drafts" class="link" title="草稿箱">草稿箱</button>
         <button id="cm-term" class="link" title="打开 / 收起终端(Ctrl/⌘+J)">终端</button></div>
@@ -104,9 +105,8 @@
 <div id="side-mask"></div>
 <div id="panel-home" hidden>
   <section class="panel" id="p-sessions" data-panel="sessions">
-    <div id="cli-bar" title="侧栏项目名右边的 new 用它打开;网页上继续 cc 的历史会话时也用 cc 这边的思考强度">
+    <div id="cli-bar" title="侧栏项目名右边的 new 用它打开。模型和思考强度在会话页底部的输入框里选(或输入 /model、/effort)">
       <label>打开方式<select id="cli-sel"><option value="claude">Claude Code</option></select></label>
-      <label>思考<select id="effort-sel"><option value="">默认</option></select></label>
     </div>
     <div class="side-actions">
       <select id="search-mode" title="搜索范围:标题最快;提问 / 全文会搜索会话正文">

@@ -311,14 +311,10 @@ const cli = { cur: 'claude', effort: {}, list: [] };
 const cliInfo = id => cli.list.find(c => c.id === id);
 const cliName = id => !id || id === 'claude' ? 'cc' : cliInfo(id)?.label || id;
 function renderCli() {
-  const sel = $('#cli-sel'), es = $('#effort-sel'), c = cliInfo(cli.cur);
+  const sel = $('#cli-sel'), c = cliInfo(cli.cur);
   if (cli.list.length) sel.innerHTML = cli.list.map(x =>
     `<option value="${esc(x.id)}"${x.available || x.id === cli.cur ? '' : ' disabled'}>${esc(x.label)}${x.available ? '' : '(未安装)'}</option>`).join('');
   sel.value = cli.cur;
-  es.innerHTML = `<option value="">${c?.default_effort ? `默认(${esc(c.default_effort)})` : '默认'}</option>` +
-    (c?.efforts || []).map(e => `<option value="${esc(e)}">${esc(e)}</option>`).join('');
-  es.value = cli.effort[cli.cur] || '';
-  es.title = c?.model ? `${c.label} 当前模型 ${c.model} 支持的思考强度` : `${c?.label || 'cc'} 的思考强度(新开的会话生效)`;
   document.querySelectorAll('.proj-new').forEach(b => { b.title = `用 ${c?.label || 'Claude Code'} 在这个项目里新开会话`; });
 }
 function setCli(r) {
@@ -330,10 +326,9 @@ async function loadCli() { setCli(await api('/api/cli').catch(() => null)); }
 async function saveCli(body) {
   const r = await post('/api/cli', body).catch(() => ({ error: '网络错误' }));
   if (!setCli(r)) { toast(r?.error || '没能保存', 2500); loadCli(); return; }
-  toast(body.effort !== undefined ? `思考强度:${cli.effort[cli.cur] || '默认'}(新开的会话生效)` : `新会话用 ${cliInfo(cli.cur)?.label} 打开`, 1800);
+  toast(`新会话用 ${cliInfo(cli.cur)?.label} 打开`, 1800);
 }
 $('#cli-sel').addEventListener('change', e => saveCli({ cli: e.target.value }));
-$('#effort-sel').addEventListener('change', e => saveCli({ cli: cli.cur, effort: e.target.value }));
 loadCli();
 
 // ---------- 会话列表 ----------
@@ -1232,6 +1227,7 @@ function renderComposer() {
   const sid = state.data.meta.id;
   if (cm.sid !== sid) {  // 换了会话:先把上一个会话没存完的草稿存掉,再放回这个会话的草稿
     if (cmSaveT) cmSaveDraft(true);
+    sg.info = null; sg.sid = null; sgClose(); loadSessionCli(sid);
     cm.sid = sid; cm.err = ''; cm.sentAt = 0; cm.note = ''; cm.queue = [];
     cmText.value = localGet(draftKey(sid), ''); cmAutosize();
     loadQueue(sid);
@@ -1250,6 +1246,7 @@ function renderComposer() {
   $('#cm-send').title = busy || cm.queue.length ? `等 ${who} 答完再发(Enter)` : '发送(Enter)';
   $('#cm-drafts').textContent = cm.drafts.length ? `草稿箱 ${cm.drafts.length}` : '草稿箱';
   renderQueue();
+  renderModelChip();
   const st = $('#cm-status');
   let msg, warn = false;
   if (blocked) { msg = esc(owner.message); warn = true; }
@@ -1272,6 +1269,161 @@ function renderComposer() {
   mel.hidden = !menu;
   if (menu) setHTML(mel, menuHTML(menu, { free, multi, who }));
 }
+// ---------- 模型 / 思考强度 / 斜杠命令候选 ----------
+// 输入框底栏的按钮显示这个会话现在的模型和强度,点开选;也可以输入 /model、/effort。
+// 在 cc 里直接发 "/model xxx" "/effort xxx" 会存成 cc 全局的默认(影响以后所有会话),
+// 所以这两个命令由网页处理:服务器走 cc 的 /model 菜单按 s(只用于本会话),codex 则带新参数接着这个会话。
+// 输入 / 开头时弹出候选:命令(含 cc 的 skill);/model 后面是模型,/effort 后面是强度。↑↓ 选,Tab / Enter 确认,Esc 关。
+const sg = { info: null, sid: null, items: [], i: 0, mode: null, open: false, busy: false };
+const EFFORT_ZH = { low: '低', medium: '中', high: '高', xhigh: '很高', max: '最高', ultra: '极限', minimal: '最少' };
+async function loadSessionCli(sid) {
+  const r = await api(`/api/sessions/${sid}/cli`).catch(() => null);
+  if (r && !r.error && sid === state.data?.meta.id) { sg.info = r; sg.sid = sid; renderModelChip(); }
+}
+function curModel() {  // 正在运行的终端记着自己的模型 / 强度;没在运行时是下次启动要用的
+  const t = tv.bySid.get(state.data?.meta.id), i = sg.info;
+  if (!i) return {};
+  return { model: t ? t.model : i.model, effort: t ? t.effort : i.effort };
+}
+const modelLabel = id => sg.info?.models.find(m => m.id === id)?.label || id;
+function renderModelChip() {
+  const b = $('#cm-model'), i = sg.info;
+  const ok = !!i && i.cli !== 'agy' && sg.sid === state.data?.meta.id;
+  b.hidden = !ok;
+  if (!ok) return;
+  const { model, effort } = curModel();
+  setHTML(b, `<span class="mi">◆</span>${esc(model ? modelLabel(model) : '默认模型')}<span class="dotsep">·</span>` +
+    `${esc(effort || '默认强度')}<span class="car">▾</span>`);
+}
+function sgItems(text) {
+  const i = sg.info;
+  if (!i) return null;
+  let m = /^\/model\s+(\S*)$/.exec(text);
+  if (m && i.cli !== 'agy') {
+    const kw = m[1].toLowerCase(), cur = curModel().model;
+    return { mode: 'model', items: i.models.filter(x => !kw || (x.id + ' ' + x.label).toLowerCase().includes(kw))
+      .map(x => ({ kind: 'model', v: x.id, title: x.label, desc: x.id, on: x.id === cur })) };
+  }
+  m = /^\/effort\s+(\S*)$/.exec(text);
+  if (m && i.cli !== 'agy') {
+    const kw = m[1].toLowerCase(), cur = curModel();
+    const mod = i.models.find(x => x.id === cur.model);
+    return { mode: 'effort', items: (mod?.efforts || i.efforts).filter(e => !kw || e.startsWith(kw))
+      .map(e => ({ kind: 'effort', v: e, title: e, desc: EFFORT_ZH[e] || '', on: e === cur.effort })) };
+  }
+  m = /^\/([^\s/]*)$/.exec(text);
+  if (m) {
+    const kw = m[1].toLowerCase();
+    const list = i.commands.filter(c => c.name.slice(1).toLowerCase().startsWith(kw))
+      .concat(kw ? i.commands.filter(c => !c.name.slice(1).toLowerCase().startsWith(kw) && (c.name + ' ' + c.desc).toLowerCase().includes(kw)) : []);
+    return { mode: 'cmd', items: list.slice(0, 40).map(c => ({ kind: 'cmd', v: c.name, title: c.name, desc: c.desc, skill: c.skill })) };
+  }
+  return null;
+}
+function sgUpdate() {
+  if (sg.mode === 'picker') return;
+  const r = state.data && !cmText.disabled ? sgItems(cmText.value) : null;
+  if (!r || !r.items.length) return sgClose();
+  const same = sg.open && sg.mode === r.mode;
+  Object.assign(sg, { open: true, mode: r.mode, items: r.items, i: same ? Math.min(sg.i, r.items.length - 1) : Math.max(0, r.items.findIndex(x => x.on)) });
+  sgRender();
+}
+function sgOpenPicker() {  // 底栏按钮:模型列表 + 强度
+  if (!sg.info) return;
+  if (sg.open && sg.mode === 'picker') return sgClose();
+  const cur = curModel(), mod = sg.info.models.find(x => x.id === cur.model);
+  const items = sg.info.models.map(x => ({ kind: 'model', v: x.id, title: x.label, desc: x.id, on: x.id === cur.model }))
+    .concat((mod?.efforts || sg.info.efforts).map(e => ({ kind: 'effort', v: e, title: e, desc: EFFORT_ZH[e] || '', on: e === cur.effort })));
+  Object.assign(sg, { open: true, mode: 'picker', items, i: Math.max(0, items.findIndex(x => x.on)) });
+  sgRender();
+}
+function sgClose() { sg.open = false; sg.mode = null; $('#cm-sg').hidden = true; }
+function sgRender() {
+  const box = $('#cm-sg'), who = cliName(sg.info?.cli);
+  box.hidden = false;
+  const row = (x, k) => `<div class="sg-it${k === sg.i ? ' on' : ''}${x.on ? ' cur' : ''}" data-k="${k}" role="option">` +
+    `<span class="sg-t">${esc(x.title)}</span>${x.skill ? '<span class="sg-tag">skill</span>' : ''}<span class="sg-d">${esc(x.desc)}</span>` +
+    `${x.on ? '<span class="sg-ck">✓ 当前</span>' : ''}</div>`;
+  let h;
+  if (sg.mode === 'picker') {
+    const ms = sg.items.map((x, k) => [x, k]).filter(([x]) => x.kind === 'model'), es = sg.items.map((x, k) => [x, k]).filter(([x]) => x.kind === 'effort');
+    h = `<div class="sg-h">模型 <small>只对这个会话 · 也会记成 ${esc(who)} 新会话的默认</small></div>` + ms.map(([x, k]) => row(x, k)).join('') +
+      `<div class="sg-h">思考强度</div><div class="sg-effs">` + es.map(([x, k]) =>
+        `<button class="sg-eff${k === sg.i ? ' on' : ''}${x.on ? ' cur' : ''}" data-k="${k}" title="${esc(x.desc)}">${esc(x.title)}</button>`).join('') + '</div>';
+  } else {
+    const head = { cmd: `${esc(who)} 的命令`, model: '选模型(只对这个会话)', effort: '选思考强度(只对这个会话)' }[sg.mode];
+    h = `<div class="sg-h">${head}<small>↑↓ 选择 · Tab / Enter 确认 · Esc 关闭</small></div>` + sg.items.map(row).join('');
+  }
+  if (sg.busy) h += '<div class="sg-busy">切换中…</div>';
+  setHTML(box, h);
+  box.querySelector('.on')?.scrollIntoView({ block: 'nearest' });
+}
+async function sgAccept(k = sg.i) {
+  const x = sg.items[k];
+  if (!x) return;
+  if (x.kind === 'cmd') {
+    cmText.value = x.v + ' '; cmAutosize(); cmSaveDraft(); cmText.focus();
+    if (x.v === '/model' || x.v === '/effort') sgUpdate(); else sgClose();
+    return;
+  }
+  const fromText = sg.mode !== 'picker';
+  await applyModel(x.kind === 'model' ? { model: x.v } : { effort: x.v });
+  if (fromText) { cmText.value = ''; cmAutosize(); cmSaveDraft(true); }
+}
+async function applyModel(body) {
+  const sid = state.data?.meta.id;
+  if (!sid || sg.busy) return;
+  sg.busy = true; if (sg.open) sgRender();
+  const r = await post(`/api/sessions/${sid}/model`, body).catch(() => ({ error: '网络错误' }));
+  sg.busy = false; sgClose();
+  if (r.error) return toast(r.error, 3000);
+  const what = body.model ? modelLabel(body.model) : `思考强度 ${body.effort}`;
+  toast(r.applied === 'later' ? `已选 ${what},下次启动这个会话时生效` : r.applied === 'restart' ? `已换成 ${what}(重新接上了这个会话)` : `已换成 ${what}(只对这个会话)`, 2200);
+  await loadTerms(); await loadSessionCli(sid);
+  if (r.applied === 'restart') setTimeout(loadTerms, 2500);
+}
+// 发送 "/model xxx" "/effort xxx":网页处理;不带参数就打开候选
+async function slashIntercept(text) {
+  const i = sg.info, t = text.trim();
+  if (!i || i.cli === 'agy') return false;
+  let m = /^\/model(?:\s+(\S+))?(?:\s+(\S+))?$/.exec(t);
+  const e = /^\/effort(?:\s+(\S+))?$/.exec(t);
+  if (!m && !e) return false;
+  const arg = (m ? m[1] : e[1]) || '';
+  if (!arg) { cmText.value = (m ? '/model ' : '/effort '); cmAutosize(); sgUpdate(); return true; }
+  const body = {};
+  if (m) {
+    const kw = arg.toLowerCase();
+    const mod = i.models.find(x => x.id === arg) || i.models.find(x => (x.id + ' ' + x.label).toLowerCase().includes(kw));
+    if (!mod) { toast(`没有 ${arg} 这个模型`, 2500); return true; }
+    body.model = mod.id;
+    if (m[2]) body.effort = m[2].toLowerCase();
+  } else body.effort = arg.toLowerCase();
+  await applyModel(body);
+  cmText.value = ''; cmAutosize(); cmSaveDraft(true);
+  return true;
+}
+function sgKey(e) {
+  if (!sg.open || e.isComposing || e.keyCode === 229) return false;
+  const n = sg.items.length;
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    sg.i = (sg.i + (e.key === 'ArrowDown' ? 1 : -1) + n) % n; sgRender();
+  } else if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+    // 命令候选里 Enter:输入的已经是完整命令(如 /compact)就直接发送
+    if (e.key === 'Enter' && sg.mode === 'cmd' && sg.items.some(x => x.v === cmText.value.trim()) && !['/model', '/effort'].includes(cmText.value.trim())) {
+      sgClose(); return false;
+    }
+    sgAccept();
+  } else if (e.key === 'Escape') sgClose();
+  else return false;
+  e.preventDefault(); e.stopPropagation();
+  return true;
+}
+$('#cm-sg').addEventListener('mousedown', e => e.preventDefault());  // 点候选时输入框不失焦
+$('#cm-sg').addEventListener('click', e => { const el = e.target.closest('[data-k]'); if (el) sgAccept(+el.dataset.k); });
+$('#cm-model').addEventListener('click', () => { sgOpenPicker(); });
+document.addEventListener('mousedown', e => { if (sg.open && !e.target.closest('#cm-sg, #cm-model, #cm-text')) sgClose(); });
+
 // ---------- 选择菜单 / 提问 ----------
 // 权限确认、/model 这类菜单:一列选项,点一下 = 在终端里移过去回车。
 // cc 一次问几个问题时(AskUserQuestion):上面是题目标签,点标签切到那一题(终端里的 ←/→),
@@ -1462,6 +1614,7 @@ $('#cm-save').addEventListener('click', async () => {
 async function sendMsg(mode = 'queue') {
   const text = cmText.value;
   if (!text.trim() || cm.sending || !state.data || cmText.disabled) return;
+  if (await slashIntercept(text)) return;  // /model、/effort 由网页处理(只对这个会话),不原样发给命令行
   const sid = state.data.meta.id, id = crypto.randomUUID?.() || String(Math.random()).slice(2) + Date.now();
   cm.sending = true; cm.err = ''; renderComposer();
   let r = null;
@@ -1486,8 +1639,9 @@ async function sendMsg(mode = 'queue') {
   } else cm.err = r?.error || '网络不通,消息没有送出(草稿还在,稍后再发)';
   if (state.data?.meta.id === sid) renderComposer();
 }
-cmText.addEventListener('input', () => { cmAutosize(); cmSaveDraft(); });
+cmText.addEventListener('input', () => { cmAutosize(); cmSaveDraft(); sgUpdate(); });
 cmText.addEventListener('keydown', e => {
+  if (sgKey(e)) return;  // 斜杠命令候选开着:↑↓ / Tab / Enter / Esc 给候选列表
   // 输入法组字时的回车是确认候选词,不是发送
   if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229 || e.shiftKey || e.altKey) return;
   e.preventDefault(); sendMsg('queue');

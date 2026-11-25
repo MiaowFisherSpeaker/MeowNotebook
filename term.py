@@ -68,6 +68,39 @@ CLIS = {
             "marker": ">", "prompt": ">", "steer": None, "busy": ["esc to interrupt", "esc to stop"]},
 }
 DEFAULT_CLI = "claude"
+# 模型:claude 的固定几个(和它 /model 菜单里的名字一样);codex 的读它自己的模型缓存;agy 暂不列
+CLAUDE_MODELS = [("claude-opus-5-5", "Opus 5.5"), ("claude-sonnet-5-5", "Sonnet 5.5"),
+                 ("claude-fable-5-2", "Fable 5.2"), ("claude-haiku-5-5", "Haiku 5.5")]
+# 网页新开会话的默认模型 / 思考强度(网页上改过就用改过的)
+DEFAULTS = {"claude": {"model": "claude-opus-5-5", "effort": "medium"}}
+
+
+def models(cli):
+    """[{id, label, efforts, default_effort}]"""
+    if cli == "claude":
+        return [{"id": m, "label": lab, "efforts": EFFORTS, "default_effort": None} for m, lab in CLAUDE_MODELS]
+    if cli == "codex":
+        try:
+            ms = json.loads((CODEX_HOME / "models_cache.json").read_text())
+            ms = ms.get("models", []) if isinstance(ms, dict) else ms
+        except (OSError, ValueError):
+            return []
+        ms = sorted((x for x in ms if isinstance(x, dict) and x.get("slug") and x.get("visibility", "list") == "list"),
+                    key=lambda x: x.get("priority") or 99)
+        return [{"id": x["slug"], "label": x.get("display_name") or x["slug"],
+                 "efforts": [y["effort"] for y in x.get("supported_reasoning_levels") or [] if y.get("effort")] or EFFORTS,
+                 "default_effort": x.get("default_reasoning_level")} for x in ms]
+    return []
+
+
+def model_label(cli, model):
+    return next((m["label"] for m in models(cli) if m["id"] == model), model)
+
+
+def model_args(cli, model):
+    if not model:
+        return []
+    return ["-m", model] if cli == "codex" else ["--model", model]
 
 
 def effort_args(cli, effort):
@@ -143,10 +176,11 @@ def list_sessions():
     """ccnb socket 上跑着 cc 的 tmux 会话。别的程序(比如在这里开着的 cc-connect)不算,
     否则网页会把它们当成 cc 终端,猜一个会话挂上去,底部的输入就打进了那个程序。"""
     r = tmux("list-sessions", "-F", "#{session_name}\t#{session_path}\t#{session_created}\t#{session_attached}"
-             "\t#{@ccnb_sid}\t#{@ccnb_attach}\t#{pane_id}\t#{pane_pid}\t#{@ccnb_cli}\t#{@ccnb_effort}\t#{pane_start_command}")
+             "\t#{@ccnb_sid}\t#{@ccnb_attach}\t#{pane_id}\t#{pane_pid}\t#{@ccnb_cli}\t#{@ccnb_effort}\t#{@ccnb_model}"
+             "\t#{pane_start_command}")
     out = []
     for line in r.stdout.splitlines():
-        name, path, created, attached, sid, job, pane, pid, cli, effort, cmd = (line.split("\t", 10) + [""] * 11)[:11]
+        name, path, created, attached, sid, job, pane, pid, cli, effort, model, cmd = (line.split("\t", 11) + [""] * 12)[:12]
         # attach:接入 cc 后台会话的终端(`claude attach <id>`),关掉它后台会话照常运行
         if job and shlex.join([CC_BIN, "attach", job]) in cmd:
             cli = "claude"
@@ -156,7 +190,7 @@ def list_sessions():
             continue
         _cli_of[name] = cli
         out.append({"name": name, "cwd": path, "created": int(created or 0), "clients": int(attached or 0),
-                    "launch_sid": sid or None, "attach": job or None, "cli": cli, "effort": effort or None,
+                    "launch_sid": sid or None, "attach": job or None, "cli": cli, "effort": effort or None, "model": model or None,
                     "pane": pane.lstrip("%"), "pid": int(pid) if pid.isdigit() else None})
     return sorted(out, key=lambda s: -s["created"])
 
@@ -412,6 +446,69 @@ def goto_tab(name, index):
     send_keys(name, ["Right" if d > 0 else "Left"] * abs(d))
 
 
+def _wait_menu(name, pred, timeout=5):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        m = screen_state(name)["menu"]
+        if m and pred(m):
+            return m
+        time.sleep(0.2)
+    return None
+
+
+_EFFORT_WORDS = {"low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "extra high": "xhigh", "x-high": "xhigh",
+                 "max": "max", "maximum": "max"}
+
+
+def _claude_menu_effort(name):
+    """/model 菜单底下 "◐ Medium effort (default) ←/→ to adjust" 里现在的强度。"""
+    for line in reversed(tmux("capture-pane", "-p", "-t", f"={name}:").stdout.splitlines()):
+        if "to adjust" in line:
+            m = re.search(r"([A-Za-z][A-Za-z -]*?)\s+effort\b", line)
+            return _EFFORT_WORDS.get(m.group(1).strip().lower().lstrip("◐◑◒◓○●◔◕ ")) if m else None
+    return None
+
+
+def claude_set_model(name, model=None, effort=None):
+    """在 cc 里只对这个会话换模型 / 思考强度:打开 /model 菜单,移到这个模型,←/→ 调强度,按 s(= 只用于本会话)。
+    不用 "/model xxx" "/effort xxx":那样会存成 cc 新会话的全局默认,影响以后所有的 cc。"""
+    st = screen_state(name)
+    if st["busy"] or st["menu"] or not st["ready"]:
+        raise ValueError("cc 正在回答或弹着菜单,等它停下再换")
+    send_text(name, "/model")
+    menu = _wait_menu(name, lambda m: "select model" in m["head"].lower())
+    if not menu:
+        raise RuntimeError("没打开 cc 的 /model 菜单,打开终端看看")
+    try:
+        if model:
+            label = model_label("claude", model)
+            i = next((k for k, o in enumerate(menu["options"]) if re.match(rf"\d+\.\s+{re.escape(label)}(\s|$)", o["text"])), None)
+            if i is None:
+                raise ValueError(f"cc 的 /model 菜单里没有 {label}")
+            cur = next(k for k, o in enumerate(menu["options"]) if o["sel"])
+            send_keys(name, ["Down" if i > cur else "Up"] * abs(i - cur))
+            time.sleep(0.3)
+        if effort:
+            for _ in range(8):
+                now = _claude_menu_effort(name)
+                if now is None:
+                    raise ValueError("这个模型不能调思考强度")
+                if now == effort:
+                    break
+                send_keys(name, ["Right" if EFFORTS.index(effort) > EFFORTS.index(now) else "Left"])
+                time.sleep(0.25)
+            else:
+                raise ValueError(f"没调到 {effort}")
+        tmux("send-keys", "-t", f"={name}:", "s")  # s = 只用于本会话(Enter 会存成默认)
+    except Exception:
+        send_keys(name, ["Escape"])
+        raise
+    if model:
+        set_session_opt(name, "model", model)
+    if effort:
+        set_session_opt(name, "effort", effort)
+
+
 def wait_ready(name, timeout=30):
     """等 cc 启动完、出现输入框。弹着菜单(比如信任目录的确认)时返回菜单状态,让网页去选。"""
     end = time.monotonic() + timeout
@@ -454,7 +551,8 @@ def plan_session_id(args, latest_sid=None):
     return ["--session-id", sid, *args], sid
 
 
-def new_session(cwd, cc_args=(), cols=200, rows=50, latest_sid=None, attach=None, sid=None, cli=DEFAULT_CLI, effort=None):
+def new_session(cwd, cc_args=(), cols=200, rows=50, latest_sid=None, attach=None, sid=None, cli=DEFAULT_CLI, effort=None,
+                model=None):
     """新开一个 tmux 终端运行 cc。attach=<后台会话 id>:改为运行 `claude attach <id>` 接入 cc 后台会话
     (agent 视图里 fork 出的会话都在 cc 的后台进程里跑,不能再 --resume),sid 是它的会话 ID。
     cli:用哪个命令行(CLIS 里的键);effort:思考强度,None 用它自己的默认值。
@@ -479,16 +577,19 @@ def new_session(cwd, cc_args=(), cols=200, rows=50, latest_sid=None, attach=None
             envs += ["-e", f"{k}={v}"]
     # tmux 服务器的全局环境可能带着这些变量,用 env -u 在 pane 里显式清掉
     unset = [x for k in CC_RUNTIME_ENV for x in ("-u", k)]
+    if model and not re.fullmatch(r"[\w.:/-]{1,80}", model):
+        raise ValueError(f"模型名不对: {model}")
     if attach:
-        cli, effort = "claude", None
+        cli, effort, model = "claude", None, None
         cmd = shlex.join(["env", *unset, CC_BIN, "attach", attach])
     elif cli == "claude":
         cc_args, sid = plan_session_id(cc_args, latest_sid)
         hook = ["--settings", HOOK_SETTINGS] if CC_CMD[0] == CC_BIN else []
-        cmd = shlex.join(["env", *unset, *CC_CMD, *hook, *effort_args(cli, effort), *cc_args])
+        cmd = shlex.join(["env", *unset, *CC_CMD, *hook, *model_args(cli, model), *effort_args(cli, effort), *cc_args])
     else:
         sid = sid or f"{cli}-{uuid.uuid4().hex[:12]}"
-        cmd = shlex.join(["env", *unset, *CLIS[cli]["cmd"], *CLIS[cli].get("extra", []), *effort_args(cli, effort), *cc_args])
+        cmd = shlex.join(["env", *unset, *CLIS[cli]["cmd"], *CLIS[cli].get("extra", []), *model_args(cli, model),
+                          *effort_args(cli, effort), *cc_args])
     r = tmux("new-session", "-d", "-s", name, "-c", cwd, "-x", str(cols), "-y", str(rows), *envs, cmd)
     if r.returncode:
         raise RuntimeError(r.stderr.strip() or "tmux new-session 失败")
@@ -500,7 +601,16 @@ def new_session(cwd, cc_args=(), cols=200, rows=50, latest_sid=None, attach=None
     _cli_of[name] = cli
     if effort:
         tmux("set-option", "-t", f"={name}:", "@ccnb_effort", effort)
+    if model:
+        tmux("set-option", "-t", f"={name}:", "@ccnb_model", model)
     return name
+
+
+def set_session_opt(name, key, value):
+    if value:
+        tmux("set-option", "-t", f"={name}:", f"@ccnb_{key}", value)
+    else:
+        tmux("set-option", "-u", "-t", f"={name}:", f"@ccnb_{key}")
 
 
 def kill_session(name):

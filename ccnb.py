@@ -1264,10 +1264,21 @@ CLI_PREFS = ROOT / "data" / "cli.json"
 
 
 def cli_prefs():
+    """{"cli", "effort": {cli: 级别}, "model": {cli: 模型}}。没设过的用 term.DEFAULTS(cc:Opus 5.5 + medium)。"""
     d = _read_json(CLI_PREFS, {})
     cli = d.get("cli") if d.get("cli") in term.CLIS else term.DEFAULT_CLI
-    eff = {k: v for k, v in (d.get("effort") or {}).items() if k in term.CLIS and isinstance(v, str) and v}
-    return {"cli": cli, "effort": eff}
+    out = {"cli": cli}
+    for key in ("effort", "model"):
+        v = {k: x for k, x in (d.get(key) or {}).items() if k in term.CLIS and isinstance(x, str)}
+        for k, dft in term.DEFAULTS.items():
+            v.setdefault(k, dft.get(key) or "")
+        out[key] = {k: x for k, x in v.items() if x}  # "" = 明确选了"跟随命令行自己的默认"
+    return out
+
+
+def _raw_prefs():
+    d = _read_json(CLI_PREFS, {})
+    return {"cli": d.get("cli"), "effort": dict(d.get("effort") or {}), "model": dict(d.get("model") or {})}
 
 
 def cli_state():
@@ -1275,23 +1286,122 @@ def cli_state():
 
 
 def set_cli_prefs(b):
-    """网页上改了"打开方式"或思考强度。effort 是给 b["cli"](没给就是当前的)设的,空 = 用它自己的默认值。"""
-    prefs = cli_prefs()
-    cli = b.get("cli") or prefs["cli"]
+    """网页上改了"打开方式",或某个命令行新会话的默认模型 / 思考强度(b["cli"],没给就是当前的)。空 = 用它自己的默认值。"""
+    raw = _raw_prefs()
+    cli = b.get("cli") or cli_prefs()["cli"]
     info = next((c for c in term.cli_info() if c["id"] == cli), None)
     if not info:
         raise ValueError(f"不支持的命令行: {cli}")
-    prefs["cli"] = cli
     if "effort" in b:
-        e = b.get("effort") or None
-        if e and e not in info["efforts"]:
+        e = b.get("effort") or ""
+        if e and e not in info["efforts"] + [x for m in term.models(cli) for x in m["efforts"]]:
             raise ValueError(f"{info['label']} 没有 {e} 这一档")
-        if e:
-            prefs["effort"][cli] = e
-        else:
-            prefs["effort"].pop(cli, None)
-    _write_json(CLI_PREFS, prefs)
+        raw["effort"][cli] = e
+    if "model" in b:
+        m = b.get("model") or ""
+        if m and term.models(cli) and m not in [x["id"] for x in term.models(cli)]:
+            raise ValueError(f"{info['label']} 没有 {m} 这个模型")
+        raw["model"][cli] = m
+    if "effort" not in b and "model" not in b:
+        raw["cli"] = cli
+    _write_json(CLI_PREFS, {"cli": raw["cli"] or cli_prefs()["cli"], "effort": raw["effort"], "model": raw["model"]})
     return cli_state()
+
+
+# ---------------------------------------------------------------- 输入框里的斜杠命令候选 / 换模型、思考强度
+CLAUDE_COMMANDS = [
+    ("/model", "换模型(和思考强度),只对这个会话"), ("/effort", "换思考强度,只对这个会话"),
+    ("/compact", "压缩上下文"), ("/clear", "清空对话,开始新会话"), ("/context", "看上下文用了多少"),
+    ("/usage", "看用量"), ("/cost", "这次会话的花费"), ("/status", "当前状态、模型、账号"), ("/init", "生成 CLAUDE.md"),
+    ("/memory", "编辑记忆文件"), ("/review", "审查代码改动"), ("/agents", "管理子 agent"), ("/mcp", "管理 MCP 服务器"),
+    ("/permissions", "权限设置"), ("/hooks", "hook 设置"), ("/export", "导出对话"), ("/help", "帮助"),
+]
+CODEX_COMMANDS = [
+    ("/model", "换模型和思考强度,只对这个会话"), ("/effort", "换思考强度,只对这个会话"),
+    ("/new", "开始新会话"), ("/compact", "压缩上下文"), ("/status", "当前配置、用量"), ("/init", "生成 AGENTS.md"),
+    ("/review", "审查代码改动"), ("/diff", "看 git 改动"), ("/mention", "提到某个文件"), ("/permissions", "权限设置"),
+    ("/mcp", "看 MCP 工具"), ("/quit", "退出 codex"),
+]
+
+
+def _skill_desc(f):
+    """SKILL.md / 命令 .md 开头 frontmatter 里的 name、description。"""
+    try:
+        text = f.read_text(encoding="utf-8", errors="replace")[:4000]
+    except OSError:
+        return None, ""
+    m = re.match(r"---\s*\n(.*?)\n---", text, re.S)
+    fm = m.group(1) if m else ""
+    name = re.search(r"^name:\s*(.+)$", fm, re.M)
+    desc = re.search(r"^description:\s*(.+)$", fm, re.M)
+    return (name.group(1).strip().strip("\"'") if name else None), (desc.group(1).strip().strip("\"'")[:120] if desc else "")
+
+
+def slash_commands(cli, cwd=None):
+    """[{name, desc}]:命令行自带的常用命令,cc 还有用户 / 项目里的 skill 和自定义命令。"""
+    out = [{"name": n, "desc": d} for n, d in (CODEX_COMMANDS if cli == "codex" else CLAUDE_COMMANDS if cli == "claude" else [])]
+    if cli != "claude":
+        return out
+    seen = {x["name"] for x in out}
+    roots = [term.CC_HOME] + ([Path(cwd) / ".claude"] if cwd else [])
+    for root in roots:
+        for f in sorted(root.glob("skills/*/SKILL.md")) + sorted(root.glob("commands/*.md")):
+            name, desc = _skill_desc(f)
+            name = "/" + (name or (f.parent.name if f.name == "SKILL.md" else f.stem))
+            if name not in seen:
+                seen.add(name)
+                out.append({"name": name, "desc": desc, "skill": True})
+    return out
+
+
+def session_cli_info(sid):
+    """输入框要的东西:这个会话的命令行、能选的模型 / 强度、现在用的模型 / 强度、斜杠命令候选。"""
+    t = next((t for t in link_terms(term.list_sessions()) if (t["sid"] or t["launch_sid"]) == sid), None)
+    p = find_session(sid)
+    meta = cached_meta(p) if p else None
+    cli = t["cli"] if t else (meta or {}).get("cli") or ("codex" if p and is_codex(p) else "claude")
+    prefs = cli_prefs()
+    cur_model = (t or {}).get("model") or (None if t else prefs["model"].get(cli))
+    cur_effort = (t or {}).get("effort") or (None if t else prefs["effort"].get(cli))
+    info = next((c for c in term.cli_info() if c["id"] == cli), {})
+    return {"cli": cli, "running": bool(t), "models": term.models(cli), "efforts": info.get("efforts") or term.EFFORTS,
+            "model": cur_model, "effort": cur_effort, "default_model": prefs["model"].get(cli), "default_effort": prefs["effort"].get(cli),
+            "commands": slash_commands(cli, (t or {}).get("cwd") or (meta or {}).get("cwd"))}
+
+
+def set_session_model(sid, model=None, effort=None):
+    """输入框里换模型 / 思考强度:只对这个会话。同时记成这个命令行新会话的默认(和 cc 自己的 /model 一样会记住)。
+    cc 在运行:走它的 /model 菜单(按 s = 只用于本会话);codex 在运行:带着新参数 codex resume 重启这个会话;
+    没在运行:下次在网页上启动时用。"""
+    info = session_cli_info(sid)
+    cli = info["cli"]
+    if cli not in ("claude", "codex"):
+        raise ValueError("这个命令行还不能在网页上换模型")
+    if model and info["models"] and model not in [m["id"] for m in info["models"]]:
+        raise ValueError(f"没有 {model} 这个模型")
+    target = next((m for m in info["models"] if m["id"] == (model or info["model"])), None)
+    if effort and target and effort not in target["efforts"]:
+        raise ValueError(f"{target['label']} 没有 {effort} 这一档")
+    set_cli_prefs({"cli": cli, **({"model": model} if model else {}), **({"effort": effort} if effort else {})})
+    name = running_term(sid)
+    if not name:
+        return {"ok": True, "applied": "later"}
+    if cli == "claude":
+        term.claude_set_model(name, model, effort)
+        return {"ok": True, "applied": "now"}
+    # codex:换模型 / 强度最稳的办法是带新参数接着这个会话(只对这个会话,不改 config.toml)
+    st = term.screen_state(name, "codex")
+    if st["busy"] or st["menu"]:
+        raise ValueError("Codex 正在回答或弹着菜单,等它停下再换")
+    t = next(t for t in link_terms(term.list_sessions()) if t["name"] == name)
+    model, effort = model or t.get("model"), effort or t.get("effort")
+    real = t["sid"]  # 还没提问的新终端没有记录可接,直接换一个新终端
+    term.kill_session(name)
+    if real:
+        new = term.new_session(t["cwd"], ["resume", real], cli="codex", model=model, effort=effort, sid=real)
+    else:
+        new = term.new_session(t["cwd"], cli="codex", model=model, effort=effort, sid=t["launch_sid"])
+    return {"ok": True, "applied": "restart", "term": new}
 
 
 def running_term(sid):
@@ -1536,7 +1646,9 @@ def continue_session(sid):
             raise ValueError(owner_message(owner))
         meta = cached_meta(p)
         cwd = meta["cwd"] if meta["cwd"] and os.path.isdir(meta["cwd"]) else str(Path.home())
-        return term.new_session(cwd, ["resume", sid], cli="codex", effort=cli_prefs()["effort"].get("codex"), sid=sid)
+        prefs = cli_prefs()
+        return term.new_session(cwd, ["resume", sid], cli="codex", effort=prefs["effort"].get("codex"),
+                                model=prefs["model"].get("codex"), sid=sid)
     if not p:
         cli = sid.split("-", 1)[0]
         if cli in term.CLIS and cli != "claude":
@@ -1550,7 +1662,8 @@ def continue_session(sid):
         return term.new_session(cwd, attach=owner["job"], sid=sid)
     if owner:
         raise ValueError(owner_message(owner))
-    return term.new_session(cwd, ["--resume", sid], effort=cli_prefs()["effort"].get("claude"))
+    prefs = cli_prefs()
+    return term.new_session(cwd, ["--resume", sid], effort=prefs["effort"].get("claude"), model=prefs["model"].get("claude"))
 
 
 # 每个会话最近几个版本里各轮的签名,用来算出"客户端手里的版本 → 当前版本"之间变了哪些轮
@@ -2158,6 +2271,10 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json({"ok": True})
             if u.path == "/api/cli":
                 return self._json(set_cli_prefs(self._body()))
+            m = re.fullmatch(r"/api/sessions/([\w-]+)/model", u.path)
+            if m:
+                b = self._body()
+                return self._json(set_session_model(m.group(1), b.get("model") or None, b.get("effort") or None))
             if u.path == "/api/stars":
                 b = self._body()
                 return self._json({"stars": toggle_star(b["sid"], b["ts"], bool(b.get("on", True)))})
@@ -2172,7 +2289,7 @@ class Handler(SimpleHTTPRequestHandler):
                     raise ValueError("需要绝对路径")
                 prefs = cli_prefs()
                 cli = b.get("cli") or prefs["cli"]
-                name = term.new_session(cwd, cli=cli, effort=prefs["effort"].get(cli))
+                name = term.new_session(cwd, cli=cli, effort=prefs["effort"].get(cli), model=prefs["model"].get(cli))
                 t = next((t for t in term.list_sessions() if t["name"] == name), None)
                 return self._json({"term": name, "sid": t and t["launch_sid"], "cli": cli})
             m = re.fullmatch(r"/api/sessions/([\w-]+)/send-note", u.path)
@@ -2250,6 +2367,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json({"terms": link_terms(term.list_sessions())})
             if u.path == "/api/cli":
                 return self._json(cli_state())
+            m = re.fullmatch(r"/api/sessions/([\w-]+)/cli", u.path)
+            if m:
+                return self._json(session_cli_info(m.group(1)))
             if u.path == "/api/focus":  # cca 用:网页上选中的会话
                 return self._json({"sid": focused_session()})
             if u.path == "/api/summaries":
