@@ -301,9 +301,15 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') cmenu.hidden
 $('#main').addEventListener('scroll', () => { cmenu.hidden = true; });
 
 // ---------- 会话列表 ----------
-async function loadSessions() {
+// 同时发起的几次刷新(启动时、推送连上时、记录变化时…)共用一个请求
+let sessionsReq = null;
+function loadSessions() {
+  return sessionsReq ||= fetchSessions().finally(() => { sessionsReq = null; });
+}
+async function fetchSessions() {
   const r = await api('/api/sessions').catch(() => null);
   if (!r) return;
+  state.listLoaded = true;
   // 每 5~15 秒刷新一次,数据没变就不重建整个侧栏(几百个会话的 DOM)
   const key = JSON.stringify([r.sessions, r.terms, r.qq]);
   if (key === state.listKey) return;
@@ -317,6 +323,7 @@ async function loadSessions() {
 }
 
 function renderSessions() {
+  if (!state.listLoaded) return;  // 列表还没取到:先空着,别显示"没有匹配的会话"
   const kw = $('#search').value.trim().toLowerCase();
   if (kw && searchMode() !== 'title') return renderSearch();
   renderSrcFilter();
@@ -817,9 +824,10 @@ function fillStep(budget = 12) {
   if ((j.hi < j.items.length && !below) || (j.lo > 0 && !above)) { fill.job = null; return; }  // 正文已换成别的内容
   const t0 = performance.now(), up = [], down = [];
   const fresh = list => list.filter(t => !document.getElementById('t' + t.n));
-  while (performance.now() - t0 < budget && (j.lo > 0 || j.hi < j.items.length)) {
-    if (j.hi < j.items.length) { const b = Math.min(j.items.length, j.hi + 3); down.push(j.html(fresh(j.items.slice(j.hi, b)))); j.hi = b; }
-    if (j.lo > 0) { const a = Math.max(0, j.lo - 3); up.unshift(j.html(fresh(j.items.slice(a, j.lo)))); j.lo = a; }
+  // 一次只画一轮再看用时:有的回答很长(大段代码高亮、公式),一次画几轮会让一块就卡上百毫秒
+  for (let k = 0; performance.now() - t0 < budget && (j.lo > 0 || j.hi < j.items.length); k++) {
+    if (j.hi < j.items.length && (k % 2 === 0 || j.lo === 0)) { down.push(j.html(fresh(j.items.slice(j.hi, j.hi + 1)))); j.hi++; }
+    else { up.unshift(j.html(fresh(j.items.slice(j.lo - 1, j.lo)))); j.lo--; }
   }
   const frag = h => {
     const tpl = document.createElement('template');
@@ -1349,7 +1357,13 @@ function setStars(list) {
 }
 async function loadStars() {
   const r = await fetch('/api/stars').then(r => r.json()).catch(() => null);
-  if (r) setStars(r.stars);
+  if (!r) return;
+  setStars(r.stars);
+  // 正文可能先于收藏列表画出来了:把已画的星标按收藏列表更新
+  document.querySelectorAll('#article .star').forEach(x => {
+    const on = state.starKeys.has(starKey(x.dataset.sid, x.dataset.ts));
+    if (x.classList.contains('on') !== on) x.outerHTML = starBtn(x.dataset.sid, x.dataset.ts);
+  });
 }
 document.addEventListener('click', async e => {
   const b = e.target.closest('.star');
@@ -2080,4 +2094,11 @@ setTimeout(() => (window.requestIdleCallback || (f => f()))(() => api('/api/upda
 setEco(state.eco);
 connectLive();
 initSide();
-Promise.all([loadSessions(), loadStars()]).then(() => { route(); reportFocus(); if (panelShown('files')) onFilesShown(); });
+// 会话列表、收藏、当前会话同时取:正文不必等侧栏(列表要统计所有会话,长会话多时最慢)
+// (旧的终端链接 #/t/<名字> 要靠列表里的终端信息才知道对应哪个会话,等列表到了再处理)
+loadStars();
+const listReady = loadSessions();
+(location.hash.startsWith('#/t/') ? listReady : Promise.resolve()).then(() => {
+  route(); reportFocus();
+  if (panelShown('files')) onFilesShown();
+});

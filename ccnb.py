@@ -123,126 +123,191 @@ def _clean_user_text(text):
     return "question", text.strip()
 
 
+class SessionParser:
+    """把一个 .jsonl 会话解析成问答轮次。会话记录只会在末尾追加,所以解析状态留着:
+    文件变长后 feed() 只读新增的行(进行中的长会话每秒都在写,不必每次从头解析几十 MB)。"""
+
+    TAIL = 64  # 记下已读部分最后这么多字节,续读前核对,文件被改写过就从头解析
+
+    def __init__(self, path):
+        self.path = path
+        self.meta = {"id": path.stem, "file": str(path), "cwd": None, "title": None,
+                     "ai_title": None, "first_q": None, "started": None, "updated": None, "continued_in": None}
+        self.turns = []
+        # 图片只记位置 (类型, 所在行的字节偏移, 该行第几个 base64 块),turn 里存索引;
+        # /api/image/<sid>/<k> 时再回文件读那一行。图片数据不进缓存(动辄几十 MB)
+        self.images = []
+        self.cur = None
+        self.seen_text = set()  # 同一条 assistant 消息可能被重复写入
+        self.pos = 0  # 已解析到的字节位置(总在一行的末尾)
+        self.tail = b""
+        self.ino = None
+        self.lock = threading.Lock()
+
+    def can_resume(self, st):
+        if st.st_ino != self.ino or st.st_size < self.pos:
+            return False
+        if not self.pos:
+            return True
+        with open(self.path, "rb") as f:
+            f.seek(self.pos - len(self.tail))
+            return f.read(len(self.tail)) == self.tail
+
+    def feed(self):
+        """从上次停下的地方读到文件末尾的最后一个完整行(写到一半的行留到下次)。"""
+        with open(self.path, "rb") as f:
+            self.ino = os.fstat(f.fileno()).st_ino
+            f.seek(self.pos)
+            data = f.read()
+        if not data:
+            return
+        # 之前交出去的结果和 cur 共用列表;cur 还会继续追加,先换成副本,已交出的结果不受影响
+        if self.cur is not None:
+            c = self.cur
+            self.cur = {**c, "texts": list(c["texts"]), "notes": list(c["notes"]),
+                        "q_images": list(c["q_images"]), "images": list(c["images"])}
+            self.turns[-1] = self.cur
+        lines = data.split(b"\n")
+        rest = lines.pop()  # 最后一个换行之后的部分:多半是还没写完的一行
+        pos = self.pos
+        for raw in lines:
+            self._line(raw, pos)
+            pos += len(raw) + 1
+        if rest and self._complete(rest):  # 结尾没有换行但已是完整的一条
+            self._line(rest, pos)
+            pos += len(rest)
+        self.pos = pos
+        if pos:
+            with open(self.path, "rb") as f:
+                f.seek(max(0, pos - self.TAIL))
+                self.tail = f.read(pos - max(0, pos - self.TAIL))
+
+    @staticmethod
+    def _complete(raw):
+        try:
+            json.loads(raw.decode("utf-8", errors="replace"))
+            return True
+        except ValueError:
+            return False
+
+    def _new_turn(self, kind, text, ts):
+        self.cur = {"kind": kind, "q": text, "ts": ts, "texts": [], "tools": 0, "notes": [], "q_images": [], "images": []}
+        self.turns.append(self.cur)
+
+    def _line(self, raw, offset):
+        try:
+            d = json.loads(raw.decode("utf-8", errors="replace"))
+        except ValueError:
+            return
+        if not isinstance(d, dict):
+            return
+        meta = self.meta
+        line_b64 = None  # 这一行里所有 base64 块的 id(),按出现顺序
+
+        def add_image(src):
+            nonlocal line_b64
+            if isinstance(src, dict) and src.get("type") == "base64" and src.get("data"):
+                if line_b64 is None:
+                    line_b64 = [id(x) for x in _base64_blocks(d)]
+                self.images.append((src.get("media_type") or "image/png", offset, line_b64.index(id(src))))
+                return len(self.images) - 1
+            return None
+
+        t = d.get("type")
+        if t == "ai-title":
+            meta["ai_title"] = d.get("aiTitle")
+            return
+        if t == "continued-in":  # 从 agent 视图重新进入会话时,cc 会把历史复制到新会话继续,并在旧会话末尾留下这条记录
+            meta["continued_in"] = d.get("continuedInSessionId")
+            return
+        if t in ("custom-title", "agent-name"):
+            meta["title"] = d.get("customTitle") or d.get("agentName") or meta["title"]
+            return
+        if t not in ("user", "assistant") or d.get("isSidechain"):
+            return
+        ts = d.get("timestamp")
+        meta["cwd"] = meta["cwd"] or d.get("cwd")
+        meta["started"] = meta["started"] or ts
+        meta["updated"] = ts or meta["updated"]
+        msg = d.get("message") or {}
+        cur = self.cur
+
+        if t == "user":
+            if d.get("isCompactSummary"):
+                txt = "".join(b.get("text", "") for b in _blocks(msg.get("content")) if b.get("type") == "text")
+                self._new_turn("summary", txt, ts)
+                return
+            if d.get("isMeta"):
+                return
+            blocks = _blocks(msg.get("content"))
+            if any(b.get("type") == "tool_result" for b in blocks):
+                # 工具结果里的图片(cc 用 Read 查看的截图、PDF 页等)挂到当前这一轮的回答下
+                for b in blocks:
+                    if b.get("type") == "tool_result" and isinstance(b.get("content"), list) and cur:
+                        for x in b["content"]:
+                            if x.get("type") == "image":
+                                k = add_image(x.get("source"))
+                                if k is not None:
+                                    cur["images"].append(k)
+                return
+            parts, kinds, n_img, q_imgs = [], [], 0, []
+            for b in blocks:
+                if b.get("type") == "image":
+                    n_img += 1
+                    k = add_image(b.get("source"))
+                    if k is not None:
+                        q_imgs.append(k)
+                elif b.get("type") == "text":
+                    k, txt = _clean_user_text(b.get("text", ""))
+                    if k:
+                        kinds.append(k)
+                        parts.append(txt)
+            if not kinds and not n_img:
+                return
+            kind = "question" if "question" in kinds or n_img else kinds[0]
+            text = "\n\n".join(parts)
+            if kind == "interrupt":
+                if cur:
+                    cur["notes"].append("⏹ 用户中断")
+                return
+            if kind == "output":
+                if cur:
+                    cur["notes"].append("```\n" + text[:2000] + "\n```")
+                return
+            self._new_turn(kind, text.strip() or "(图片)", ts)
+            self.cur["q_images"] = q_imgs
+            if kind == "question" and not meta["first_q"]:
+                meta["first_q"] = text.strip()[:200]
+        else:
+            if cur is None:
+                self._new_turn("question", "", ts)
+                cur = self.cur
+            for b in _blocks(msg.get("content")):
+                bt = b.get("type")
+                if bt == "text":
+                    txt = b.get("text", "").strip()
+                    key = (msg.get("id"), txt)
+                    if txt and key not in self.seen_text and txt != "No response requested.":
+                        self.seen_text.add(key)
+                        cur["texts"].append(txt)
+                elif bt == "tool_use":
+                    cur["tools"] += 1
+
+    def result(self):
+        """当前的 (meta, turns)。每次都是新的 dict,之后继续 feed() 不会改动已交出的结果。"""
+        turns = [{**t, "n": i} for i, t in enumerate((t for t in self.turns if t["q"] or t["texts"] or t["images"]), 1)]
+        meta = dict(self.meta)
+        meta["title"] = meta["title"] or meta["ai_title"] or (meta["first_q"] or meta["id"])[:60]
+        meta["questions"] = sum(1 for t in turns if t["kind"] == "question")
+        meta["_images"] = list(self.images)
+        return meta, turns
+
+
 def parse_session(path):
     """把一个 .jsonl 会话解析成问答轮次。"""
-    meta = {"id": path.stem, "file": str(path), "cwd": None, "title": None,
-            "ai_title": None, "first_q": None, "started": None, "updated": None, "continued_in": None}
-    turns = []
-    # 图片只记位置 (类型, 所在行的字节偏移, 该行第几个 base64 块),turn 里存索引;
-    # /api/image/<sid>/<k> 时再回文件读那一行。图片数据不进缓存(动辄几十 MB)
-    images = []
-    cur = None
-    seen_text = set()  # 同一条 assistant 消息可能被重复写入
-    line_b64 = None  # 当前行里所有 base64 块的 id(),按出现顺序
-
-    def add_image(src):
-        nonlocal line_b64
-        if isinstance(src, dict) and src.get("type") == "base64" and src.get("data"):
-            if line_b64 is None:
-                line_b64 = [id(x) for x in _base64_blocks(d)]
-            images.append((src.get("media_type") or "image/png", offset, line_b64.index(id(src))))
-            return len(images) - 1
-        return None
-
-    def new_turn(kind, text, ts):
-        nonlocal cur
-        cur = {"kind": kind, "q": text, "ts": ts, "texts": [], "tools": 0, "notes": [], "q_images": [], "images": []}
-        turns.append(cur)
-
-    with open(path, "rb") as f:
-        pos = 0
-        for raw in f:
-            offset, pos = pos, pos + len(raw)
-            line_b64 = None
-            try:
-                d = json.loads(raw.decode("utf-8", errors="replace"))
-            except ValueError:
-                continue
-            t = d.get("type")
-            if t == "ai-title":
-                meta["ai_title"] = d.get("aiTitle")
-                continue
-            if t == "continued-in":  # 从 agent 视图重新进入会话时,cc 会把历史复制到新会话继续,并在旧会话末尾留下这条记录
-                meta["continued_in"] = d.get("continuedInSessionId")
-                continue
-            if t in ("custom-title", "agent-name"):
-                meta["title"] = d.get("customTitle") or d.get("agentName") or meta["title"]
-                continue
-            if t not in ("user", "assistant") or d.get("isSidechain"):
-                continue
-            ts = d.get("timestamp")
-            meta["cwd"] = meta["cwd"] or d.get("cwd")
-            meta["started"] = meta["started"] or ts
-            meta["updated"] = ts or meta["updated"]
-            msg = d.get("message") or {}
-
-            if t == "user":
-                if d.get("isCompactSummary"):
-                    txt = "".join(b.get("text", "") for b in _blocks(msg.get("content")) if b.get("type") == "text")
-                    new_turn("summary", txt, ts)
-                    continue
-                if d.get("isMeta"):
-                    continue
-                blocks = _blocks(msg.get("content"))
-                if any(b.get("type") == "tool_result" for b in blocks):
-                    # 工具结果里的图片(cc 用 Read 查看的截图、PDF 页等)挂到当前这一轮的回答下
-                    for b in blocks:
-                        if b.get("type") == "tool_result" and isinstance(b.get("content"), list) and cur:
-                            for x in b["content"]:
-                                if x.get("type") == "image":
-                                    k = add_image(x.get("source"))
-                                    if k is not None:
-                                        cur["images"].append(k)
-                    continue
-                parts, kinds, n_img, q_imgs = [], [], 0, []
-                for b in blocks:
-                    if b.get("type") == "image":
-                        n_img += 1
-                        k = add_image(b.get("source"))
-                        if k is not None:
-                            q_imgs.append(k)
-                    elif b.get("type") == "text":
-                        k, txt = _clean_user_text(b.get("text", ""))
-                        if k:
-                            kinds.append(k)
-                            parts.append(txt)
-                if not kinds and not n_img:
-                    continue
-                kind = "question" if "question" in kinds or n_img else kinds[0]
-                text = "\n\n".join(parts)
-                if kind == "interrupt":
-                    if cur:
-                        cur["notes"].append("⏹ 用户中断")
-                    continue
-                if kind == "output":
-                    if cur:
-                        cur["notes"].append("```\n" + text[:2000] + "\n```")
-                    continue
-                new_turn(kind, text.strip() or "(图片)", ts)
-                cur["q_images"] = q_imgs
-                if kind == "question" and not meta["first_q"]:
-                    meta["first_q"] = text.strip()[:200]
-            else:
-                if cur is None:
-                    new_turn("question", "", ts)
-                for b in _blocks(msg.get("content")):
-                    bt = b.get("type")
-                    if bt == "text":
-                        txt = b.get("text", "").strip()
-                        key = (msg.get("id"), txt)
-                        if txt and key not in seen_text and txt != "No response requested.":
-                            seen_text.add(key)
-                            cur["texts"].append(txt)
-                    elif bt == "tool_use":
-                        cur["tools"] += 1
-
-    turns = [t for t in turns if t["q"] or t["texts"] or t["images"]]
-    for i, t in enumerate(turns, 1):
-        t["n"] = i
-    meta["title"] = meta["title"] or meta["ai_title"] or (meta["first_q"] or meta["id"])[:60]
-    meta["questions"] = sum(1 for t in turns if t["kind"] == "question")
-    meta["_images"] = images
-    return meta, turns
+    p = SessionParser(path)
+    p.feed()
+    return p.result()
 
 
 def _base64_blocks(obj):
@@ -267,9 +332,10 @@ def read_image(path, ref):
     return mt, base64.b64decode(src["data"])
 
 
-# 两级缓存:元数据(列表、索引用)很小,常驻;完整问答按文本量做 LRU。键都是 (mtime_ns, size),文件一变就失效
+# 两级缓存:元数据(列表、索引用)很小,常驻;完整问答按文本量做 LRU。键都是 (mtime_ns, size),文件一变就失效。
+# 完整问答的缓存里还留着解析器:文件只是变长了(进行中的会话)就接着读新增的行,不从头解析
 _meta_cache = {}
-_full_cache = OrderedDict()
+_full_cache = OrderedDict()  # path → (key, (meta, turns), size, parser)
 FULL_CACHE_BUDGET = 32 * 1024 * 1024  # 完整问答的文本总量上限(字符数,近似)
 _full_cache_size = 0
 _cache_lock = threading.Lock()
@@ -287,29 +353,96 @@ def _turns_size(turns):
 def cached_parse(path):
     """完整解析结果 (meta, turns),LRU 缓存。"""
     global _full_cache_size
-    key = _file_key(path)
+    st = path.stat()
+    key = st.st_mtime_ns, st.st_size
     with _cache_lock:
         hit = _full_cache.get(path)
         if hit and hit[0] == key:
             _full_cache.move_to_end(path)
             return hit[1]
-    res = parse_session(path)
+    parser = hit[3] if hit else None
+    with (parser.lock if parser else threading.Lock()):  # 同一个解析器不能两个线程同时续读
+        if parser is None or not parser.can_resume(st):
+            parser = SessionParser(path)
+        parser.feed()
+        res = parser.result()
     size = _turns_size(res[1])
     with _cache_lock:
         old = _full_cache.pop(path, None)
         if old:
             _full_cache_size -= old[2]
-        _full_cache[path] = (key, res, size)
+        _full_cache[path] = (key, res, size, parser)
         _full_cache_size += size
         while _full_cache_size > FULL_CACHE_BUDGET and len(_full_cache) > 1:
-            _, (_, _, sz) = _full_cache.popitem(last=False)
+            _, (_, _, sz, _) = _full_cache.popitem(last=False)
             _full_cache_size -= sz
         _meta_cache[path] = (key, res[0])
+    _meta_dirty.set()
     return res
+
+
+# 元数据缓存另存一份到磁盘:网站重启后第一次列会话不必把几百 MB 的记录全解析一遍。
+# 解析代码(本文件)一变,旧的缓存就不用了
+META_CACHE = ROOT / "data" / "meta-cache.json"
+_meta_dirty = threading.Event()
+_meta_loaded = False
+_meta_saved = 0.0
+
+
+def _code_stamp():
+    st = Path(__file__).stat()
+    return f"{st.st_mtime_ns}-{st.st_size}"
+
+
+def _read_meta_cache():
+    try:
+        d = json.loads(META_CACHE.read_text(encoding="utf-8"))
+        if d.get("code") == _code_stamp() and isinstance(d.get("files"), dict):
+            return d["files"]
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def _load_meta_cache():
+    global _meta_loaded
+    if _meta_loaded:
+        return
+    _meta_loaded = True
+    with _cache_lock:
+        for p, v in _read_meta_cache().items():
+            try:
+                ns, size, meta = v
+                _meta_cache.setdefault(Path(p), ((ns, size), meta))
+            except (TypeError, ValueError):
+                pass
+
+
+def _save_meta_cache(force=False):
+    """有变化时写盘,最多 10 秒一次(进行中的会话每秒都在变)。"""
+    global _meta_saved
+    if not _meta_dirty.is_set() or (not force and time.monotonic() - _meta_saved < 10):
+        return
+    _meta_dirty.clear()
+    _meta_saved = time.monotonic()
+    files = _read_meta_cache()  # 别的进程(命令行、另一个网站进程)写进去的也留着
+    with _cache_lock:
+        files.update({str(p): [k[0], k[1], {x: v for x, v in m.items() if x != "_images"}]
+                      for p, (k, m) in _meta_cache.items()})
+    files = {p: v for p, v in files.items() if os.path.exists(p)}
+    try:
+        META_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=META_CACHE.parent, prefix=".meta-cache.")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"code": _code_stamp(), "files": files}, f, ensure_ascii=False)
+        os.replace(tmp, META_CACHE)
+    except OSError:
+        pass
 
 
 def cached_meta(path):
     """只要元数据(标题、时间、问题数、接续关系…)时用这个:命中时不碰完整问答缓存。"""
+    _load_meta_cache()
     key = _file_key(path)
     hit = _meta_cache.get(path)
     if hit and hit[0] == key:
@@ -385,7 +518,8 @@ def session_index():
     with _index_lock:
         idx = _index[2] if _index and _index[1] == key else SessionIndex([(p, mt) for p, mt, _, _ in files])
         _index = (time.monotonic(), key, idx)
-        return idx
+    _save_meta_cache()
+    return idx
 
 
 def successor(path):
@@ -1697,11 +1831,24 @@ def url(sid=None):
     return f"http://localhost:{PORT}/" + (f"#/s/{sid}" if sid else "")
 
 
+def prewarm(n=8, delay=1.5):
+    """网站刚启动时在后台先解析最近的几个会话:打开最常看的长会话时不必现场解析几十 MB 的记录。
+    稍等一下再开始,先让网页本身(列表、静态文件)的请求过去。"""
+    time.sleep(delay)
+    for p in all_session_files()[:n]:
+        try:
+            cached_parse(p)
+        except OSError:
+            pass
+        time.sleep(0.05)  # 让出 GIL,别挡着同时到来的请求
+
+
 def cmd_serve(_):
     NOTES.mkdir(parents=True, exist_ok=True)
     ThreadingHTTPServer.daemon_threads = True
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     threading.Thread(target=watcher, daemon=True).start()
+    threading.Thread(target=prewarm, daemon=True).start()
     VERSION_INFO.update(updater.current())
     updater.on_change(lambda st: _publish({"update": st}))
     threading.Thread(target=updater.loop, daemon=True).start()
