@@ -514,13 +514,14 @@ function renameTab(from, to) {
   saveTabs();
 }
 function renderTabbar() {
+  if (tabset.drag) return;  // 正在拖:松手后会重画
   const bar = $('#tabbar'), info = new Map(state.sessions.map(s => [s.id, s])), cur = curTab();
   let dirty = false;
   bar.hidden = !tabset.list.length;
   setHTML(bar, tabset.list.map(t => {
     const file = isFileTab(t.id), s = file ? null : info.get(t.id);
     if (s?.title && s.title !== t.title) { t.title = s.title; dirty = true; }
-    return `<a class="tb${file ? ' file' : ''}${t.id === cur ? ' on' : ''}" href="${esc(tabHref(t.id))}" data-sid="${esc(t.id)}" draggable="true" ` +
+    return `<a class="tb${file ? ' file' : ''}${t.id === cur ? ' on' : ''}" href="${esc(tabHref(t.id))}" data-sid="${esc(t.id)}" draggable="false" ` +
       `title="${esc(file ? t.id.slice(FILE_TAB.length) : t.title)}">` +
       `${file ? `<span class="ic">${fileIcon({ name: t.title })}</span>` : s?.running || s?.active ? '<span class="dot live"></span>' : ''}<span class="tt">${esc(t.title)}</span>` +
       `<button class="tx" data-close="${esc(t.id)}" title="关闭标签(也可以中键点标签)">×</button></a>`;
@@ -549,28 +550,62 @@ function renderTabbar() {
     if (bar.scrollWidth <= bar.clientWidth || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
     e.preventDefault(); bar.scrollLeft += e.deltaY;
   }, { passive: false });
-  // 拖动排序:拖的过程中只挪 DOM 节点(重画会把正被拖的元素删掉,dragend 就收不到了),松手后按 DOM 顺序存
-  bar.addEventListener('dragstart', e => {
-    const a = e.target.closest('.tb'); if (!a) return;
-    tabset.drag = a; a.classList.add('drag'); e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/plain', location.origin + location.pathname + a.getAttribute('href'));
-  });
-  bar.addEventListener('dragover', e => {
-    const src = tabset.drag; if (!src) return;
-    e.preventDefault();
-    const a = e.target.closest('.tb');
-    if (!a || a === src) return;
-    const r = a.getBoundingClientRect();
-    e.clientX > r.left + r.width / 2 ? a.after(src) : a.before(src);
-  });
-  bar.addEventListener('drop', e => { if (tabset.drag) e.preventDefault(); });
-  bar.addEventListener('dragend', () => {
-    const src = tabset.drag; if (!src) return;
-    src.classList.remove('drag'); tabset.drag = null;
+  // 拖动排序:用指针事件自己做(桌面客户端的 WebView 会拦下 HTML5 拖放,拖不动)。
+  // 按下后横向挪过几个像素才算拖;拖的过程中只挪 DOM 节点,松手后按 DOM 顺序存,并吞掉这次松手带来的 click
+  let pd = null, eatClick = false;
+  const endDrag = () => {
+    const d = pd; pd = null;
+    if (!d?.on) return;
+    d.a.classList.remove('drag'); bar.classList.remove('dragging'); tabset.drag = null;
+    clearInterval(d.scroll);
     const order = [...bar.querySelectorAll('.tb')].map(a => a.dataset.sid);
     tabset.list.sort((a, b) => order.indexOf(a.id) - order.indexOf(b.id));
     saveTabs(); bar._h = null; renderTabbar();
+  };
+  const placeAt = x => {
+    const src = pd.a;
+    for (const a of bar.querySelectorAll('.tb')) {
+      if (a === src) continue;
+      const r = a.getBoundingClientRect();
+      if (x < r.left || x > r.right) continue;
+      x > r.left + r.width / 2 ? a.after(src) : a.before(src);
+      return;
+    }
+  };
+  bar.addEventListener('pointerdown', e => {
+    const a = e.target.closest('.tb');
+    if (!a || e.button !== 0 || e.target.closest('[data-close]') || e.pointerType === 'touch') return;
+    pd = { a, id: e.pointerId, x0: e.clientX, x: e.clientX, on: false };
   });
+  bar.addEventListener('pointermove', e => {
+    if (!pd || e.pointerId !== pd.id) return;
+    pd.x = e.clientX;
+    if (!pd.on) {
+      if (Math.abs(e.clientX - pd.x0) < 6) return;
+      pd.on = true; tabset.drag = pd.a;
+      pd.a.classList.add('drag'); bar.classList.add('dragging');
+      try { bar.setPointerCapture(e.pointerId); } catch {}
+      pd.scroll = setInterval(() => {  // 拖到两端:标签栏跟着滚
+        if (!pd) return;
+        const r = bar.getBoundingClientRect(), edge = 36;
+        const v = pd.x < r.left + edge ? -12 : pd.x > r.right - edge ? 12 : 0;
+        if (v) { bar.scrollLeft += v; placeAt(pd.x); }
+      }, 30);
+    }
+    e.preventDefault();
+    placeAt(e.clientX);
+  });
+  bar.addEventListener('pointerup', () => {
+    if (pd?.on) { eatClick = true; setTimeout(() => { eatClick = false; }, 0); }
+    endDrag();
+  });
+  bar.addEventListener('pointercancel', endDrag);
+  bar.addEventListener('lostpointercapture', endDrag);
+  bar.addEventListener('click', e => {
+    if (!eatClick) return;
+    eatClick = false; e.preventDefault(); e.stopPropagation();
+  }, true);
+  bar.addEventListener('dragstart', e => e.preventDefault());  // 不要浏览器自带的拖链接
 }
 
 // 当前显示的是哪个标签页(整理版 / 原始问答)、哪些显示选项:放回去时选项变了就得重画

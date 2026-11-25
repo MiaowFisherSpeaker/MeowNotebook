@@ -167,6 +167,8 @@ body.resizing iframe, body.resizing #termbox, body.dragging iframe, body.draggin
 .tb:hover { background: color-mix(in srgb, var(--bg) 55%, var(--panel)); color: var(--text); }
 .tb.on { background: var(--bg); color: var(--text); border-color: var(--line); font-weight: 600; }
 .tb.drag { opacity: .45; }
+.tb { -webkit-user-drag: none; user-select: none; }
+#tabbar.dragging, #tabbar.dragging .tb { cursor: grabbing; }
 .tb .tt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .tb .dot { flex: none; }
 .tb .ic { flex: none; color: var(--muted); }
