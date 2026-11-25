@@ -90,17 +90,197 @@ def list_sessions():
 
 
 _BORDER_TITLE = re.compile(r"^[─━]{2,}\s+(.+?)\s+[─━]+\s*$")
+_BORDER = re.compile(r"^\s*[─━]{8,}")
+
+
+def _option_col(line):
+    """菜单里被选中的那一行("  ❯ 2. 选项"):返回选项文字开始的列,否则 None。"""
+    m = re.match(r"^(\s*)❯\s+(?=\S)", line)
+    return m.end() if m else None
+
+
+def parse_screen(lines):
+    """从 cc 的屏幕内容看出它在干什么:
+    ready  底部有输入框(边框之间以 ❯ 开头的一行),可以输入新消息;
+    busy   正在回答(状态栏有 "esc to interrupt");
+    menu   弹着选择菜单(权限确认、AskUserQuestion、/model…)时的选项 [{text, sel}] 和上方的说明文字;
+    title  输入框上边框里显示的会话标题。"""
+    st = {"ready": False, "busy": False, "menu": None, "title": None}
+    box = None
+    for i in range(len(lines) - 1, 0, -1):
+        if lines[i].startswith("❯") and _BORDER.match(lines[i - 1]):
+            box = i
+            m = _BORDER_TITLE.match(lines[i - 1].strip())
+            st["title"] = m.group(1).strip() if m else None
+            break
+    while lines and not lines[-1].strip():  # 屏幕没写满时末尾是空行
+        lines = lines[:-1]
+    tail = "\n".join(lines[-8:]).lower()
+    st["busy"] = "esc to interrupt" in tail
+    st["ready"] = box is not None
+    if box is not None:
+        return st
+    # 没有输入框:找最下面一个被选中的菜单项,以它的文字列为准收集同一列开头的选项
+    sel = next((i for i in range(len(lines) - 1, -1, -1) if _option_col(lines[i]) is not None), None)
+    if sel is None:
+        return st
+    col = _option_col(lines[sel])
+
+    def is_opt(line):
+        if len(line) <= col or line[col] == " ":
+            return False
+        pre = line[:col]
+        return pre.strip() in ("", "❯")
+
+    def deeper(line):  # 选项下面的说明行(缩进更深)
+        return len(line) > col and not line[:col + 1].strip()
+
+    def part(i):  # 选项、说明行,或夹在选项之间的分隔线(提问菜单里最后的 "Chat about this" 在分隔线下面)
+        if i < 0 or i >= len(lines):
+            return False
+        if is_opt(lines[i]) or deeper(lines[i]):
+            return True
+        return bool(_BORDER.match(lines[i])) and i + 1 < len(lines) and is_opt(lines[i + 1]) and i - 1 >= 0 \
+            and (is_opt(lines[i - 1]) or deeper(lines[i - 1]))
+
+    lo = sel
+    while part(lo - 1):
+        lo -= 1
+    hi = sel
+    while part(hi + 1):
+        hi += 1
+    opts, dcol = [], None
+    for i in range(lo, hi + 1):
+        x = lines[i]
+        indent = len(x) - len(x.lstrip())
+        # 说明行和选项文字对齐("1. [ ] " 之后);缩进比它浅的是单独的一项(多选题下面的 "Next")
+        extra = opts and deeper(x) and x.strip() and dcol is not None and indent < dcol
+        if is_opt(x) or extra:
+            text = x[col:].strip() if is_opt(x) else x.strip()
+            m = re.match(r"\d+\.\s+(\[.\]\s+)?", text)
+            dcol = col + m.end() if m else None
+            opts.append({"text": re.sub(r"\s{2,}", "  ", text), "sel": i == sel, "desc": ""})
+        elif opts and deeper(x) and x.strip():
+            opts[-1]["desc"] = (opts[-1]["desc"] + " " + x.strip()).strip()
+    while opts and not opts[0]["text"]:
+        opts.pop(0)
+    if not 1 <= len(opts) <= 20:
+        return st
+    # 说明文字:选项上方连续的几行非空内容(问题、"Select model"…)
+    head, i = [], lo - 1
+    while i >= 0 and len(head) < 8:
+        x = lines[i].strip()
+        if x and (_BORDER.match(lines[i]) or set(x) <= set("▔▁─━")):
+            break
+        if x:  # 空行跳过:说明和选项之间、标签行和问题之间常隔空行
+            head.insert(0, x)
+        i -= 1
+    foot = next((x.strip() for x in lines[hi + 1:] if x.strip() and not _BORDER.match(x)), "")
+    st["menu"] = {"options": opts, "head": "\n".join(head), "foot": foot[:200]}
+    return st
+
+
+def screen_state(name):
+    return parse_screen(tmux("capture-pane", "-p", "-t", f"={name}:").stdout.splitlines())
 
 
 def screen_title(name):
     """读取 cc 输入框上边框里显示的会话标题(如 "──── 某某会话 ─")。没有则返回 None。
     cc 的会话可能由后台 worker 运行(/resume 时),hook 不一定触发,但界面上的标题总是对的。"""
-    lines = tmux("capture-pane", "-p", "-t", f"={name}:").stdout.splitlines()
-    for i in range(len(lines) - 1, 0, -1):
-        if lines[i].lstrip().startswith("❯"):
-            m = _BORDER_TITLE.match(lines[i - 1].strip())
-            return m.group(1).strip() if m else None
-    return None
+    return screen_state(name)["title"]
+
+
+_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def _paste(name, text):
+    """用 tmux 的粘贴(bracketed paste)输入文字:多行原样保留,cc 不会把中间的换行当成回车。
+    控制字符(ESC 等)去掉,免得文字被当成按键。"""
+    text = _CTRL.sub("", text.replace("\r\n", "\n").replace("\r", "\n")).strip("\n")
+    if not text.strip():
+        raise ValueError("消息是空的")
+    buf = f"ccnb-{uuid.uuid4().hex[:12]}"
+    r = subprocess.run(["tmux", "-L", SOCKET, "-f", str(TMUX_CONF), "load-buffer", "-b", buf, "-"],
+                       input=text.encode(), capture_output=True)
+    if r.returncode:
+        raise RuntimeError(r.stderr.decode(errors="replace").strip() or "tmux load-buffer 失败")
+    tmux("paste-buffer", "-p", "-d", "-b", buf, "-t", f"={name}:")
+    time.sleep(0.25 + min(len(text), 20000) / 100000)  # 等 cc 收完粘贴再回车,长文本多等一会儿
+
+
+def send_text(name, text):
+    """把一条消息输进 cc 的输入框并回车。"""
+    _paste(name, text)
+    tmux("send-keys", "-t", f"={name}:", "Enter")
+
+
+def steer(name, text):
+    """cc 正在回答时把消息插进去(cc 的 Ctrl+X Ctrl+S "send now"):不用等它答完,也不打断正在跑的命令。"""
+    _paste(name, text)
+    tmux("send-keys", "-t", f"={name}:", "C-x")
+    time.sleep(0.05)
+    tmux("send-keys", "-t", f"={name}:", "C-s")
+
+
+_FREE = re.compile(r"^(\d+\.\s+)?(\[.\]\s+)?Type something", re.I)
+
+
+def free_option(menu):
+    """提问菜单里可以自己填答案的那一项("Type something")的序号,没有则 None。"""
+    return next((i for i, o in enumerate((menu or {}).get("options", [])) if _FREE.match(o["text"])), None)
+
+
+def answer_free(name, text):
+    """cc 提问时用自己的话回答:移到 "Type something" 那一项直接打字(cc 就是这样填的)。
+    单选题接着回车提交;多选题打字后 cc 自动勾上这一项,再回车反而会取消,所以不回车,由网页上点 Next / Submit。"""
+    menu = screen_state(name)["menu"]
+    i = free_option(menu)
+    if i is None:
+        raise ValueError("cc 现在的菜单不能自己填答案,请点一个选项")
+    cur = next(k for k, o in enumerate(menu["options"]) if o["sel"])
+    if i != cur:
+        send_keys(name, ["Down" if i > cur else "Up"] * abs(i - cur))
+        time.sleep(0.2)
+    _paste(name, text)
+    multi = re.match(r"^(\d+\.\s+)?\[.\]", menu["options"][i]["text"])
+    if not multi:
+        tmux("send-keys", "-t", f"={name}:", "Enter")
+    return {"multi": bool(multi)}
+
+
+KEYS = {"Escape", "Enter", "Up", "Down", "Left", "Right", "Tab", "BTab", "Space", *"0123456789"}
+
+
+def send_keys(name, keys):
+    for k in keys:
+        if k not in KEYS:
+            raise ValueError(f"不支持的按键: {k}")
+    if keys:
+        tmux("send-keys", "-t", f"={name}:", *keys)
+
+
+def choose(name, index):
+    """在 cc 当前弹出的菜单里选第 index 项:按 ↑/↓ 移过去再回车(按当时的屏幕现算,不靠网页上可能过时的画面)。"""
+    menu = screen_state(name)["menu"]
+    if not menu or not 0 <= index < len(menu["options"]):
+        raise ValueError("cc 现在没有弹出这个菜单,刷新一下再选")
+    cur = next(i for i, o in enumerate(menu["options"]) if o["sel"])
+    d = index - cur
+    send_keys(name, ["Down" if d > 0 else "Up"] * abs(d) + ["Enter"])
+
+
+def wait_ready(name, timeout=30):
+    """等 cc 启动完、出现输入框。弹着菜单(比如信任目录的确认)时返回菜单状态,让网页去选。"""
+    end = time.monotonic() + timeout
+    st = {"ready": False}
+    while time.monotonic() < end:
+        if not session_exists(name):
+            raise RuntimeError("cc 启动后又退出了,打开终端看看原因")
+        st = screen_state(name)
+        if st["ready"] or st["menu"]:
+            return st
+        time.sleep(0.3)
+    return st
 
 
 def session_exists(name):

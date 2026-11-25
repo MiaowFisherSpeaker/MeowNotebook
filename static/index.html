@@ -79,6 +79,23 @@
       <nav id="toc"></nav>
       <article id="article"></article>
     </div>
+    <!-- 输入框:在本页打字,整条发给 cc(不经网页终端逐键传输) -->
+    <div id="composer" hidden>
+      <div id="cm-queue" hidden></div>
+      <div id="cm-menu" hidden></div>
+      <div class="cm-box">
+        <textarea id="cm-text" rows="1" placeholder="给 cc 发消息…(Enter 发送,Shift+Enter 换行)" enterkeyhint="send"></textarea>
+        <div class="cm-btns">
+          <button id="cm-stop" class="danger" hidden title="打断 cc 当前的回答(相当于在终端里按 Esc)">停止</button>
+          <button id="cm-steer" hidden title="马上插进 cc 正在进行的回答,不等它答完(Ctrl/⌘+Enter;cc 里的 Ctrl+X Ctrl+S)">引导</button>
+          <button id="cm-send" class="primary" title="发送(Enter)">发送</button>
+        </div>
+      </div>
+      <div class="cm-foot"><span id="cm-status"></span><span class="sp"></span>
+        <button id="cm-save" class="link" title="把输入框里的内容存进草稿箱,清空输入框">存草稿</button>
+        <button id="cm-drafts" class="link" title="草稿箱">草稿箱</button>
+        <button id="cm-term" class="link" title="打开 / 收起终端(Ctrl/⌘+J)">终端</button></div>
+    </div>
   </div>
 </main>
     <section class="zone" id="z-bottom" data-zone="bottom"><div class="zsplit"></div><div class="zhead"></div><div class="zbody"></div></section>
@@ -150,6 +167,14 @@
     </section>
   </div>
 </div>
+<div id="drafts" class="modal" hidden>
+  <div class="dlg" role="dialog" aria-labelledby="dr-title">
+    <header><h2 id="dr-title">草稿箱</h2><button class="x" id="dr-close" title="关闭(Esc)">✕</button></header>
+    <div class="dr-bar"><input id="dr-search" type="search" placeholder="搜索草稿…"><button id="dr-new">+ 新建</button></div>
+    <div id="dr-list"></div>
+  </div>
+</div>
+<div id="cm-pop" hidden><div class="dlg"><p id="cm-pop-text"></p><div class="btns"><button id="cm-pop-open">打开草稿箱</button><button id="cm-pop-ok" class="primary">知道了</button></div></div></div>
 <div id="imgview" hidden>
   <div class="iv-bar"><span id="iv-n"></span><span class="sp"></span>
     <a id="iv-raw" class="btn" target="_blank">原图</a><a id="iv-dl" class="btn" download>下载</a><button id="iv-close">关闭</button></div>

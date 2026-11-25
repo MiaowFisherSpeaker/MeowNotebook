@@ -34,6 +34,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -165,7 +166,7 @@ class SessionParser:
         if self.cur is not None:
             c = self.cur
             self.cur = {**c, "texts": list(c["texts"]), "notes": list(c["notes"]),
-                        "q_images": list(c["q_images"]), "images": list(c["images"])}
+                        "q_images": list(c["q_images"]), "images": list(c["images"]), "follows": list(c["follows"])}
             self.turns[-1] = self.cur
         lines = data.split(b"\n")
         rest = lines.pop()  # 最后一个换行之后的部分:多半是还没写完的一行
@@ -190,8 +191,29 @@ class SessionParser:
         except ValueError:
             return False
 
+    def _follow(self, d):
+        """回答进行中用户插进来的消息:cc 记成 queued_command 附件,不是 user 消息。挂到当前这一轮,编号 #n-1、#n-2…"""
+        a = d.get("attachment") or {}
+        if a.get("type") != "queued_command" or a.get("commandMode") not in (None, "prompt") \
+                or (a.get("origin") or {}).get("kind") not in (None, "human"):
+            return
+        p = a.get("prompt")
+        text = p if isinstance(p, str) else "\n\n".join(b.get("text", "") for b in _blocks(p) if b.get("type") == "text")
+        kind, text = _clean_user_text(text or "")
+        if kind != "question" or not text.strip():
+            return
+        ts = a.get("timestamp") or d.get("timestamp")
+        if self.cur is None:
+            self._new_turn("question", text.strip(), ts)
+            self.meta["first_q"] = self.meta["first_q"] or text.strip()[:200]
+            return
+        self.cur["follows"].append({"q": text.strip(), "ts": ts, "at": len(self.cur["texts"])})
+        self.meta["updated"] = ts or self.meta["updated"]
+
     def _new_turn(self, kind, text, ts):
-        self.cur = {"kind": kind, "q": text, "ts": ts, "texts": [], "tools": 0, "notes": [], "q_images": [], "images": []}
+        # follows:回答进行中插进来的追问(cc 里 Ctrl+X Ctrl+S "send now"),{q, ts, at = 插入时已有几段回答文字}
+        self.cur = {"kind": kind, "q": text, "ts": ts, "texts": [], "tools": 0, "notes": [], "q_images": [], "images": [],
+                    "follows": []}
         self.turns.append(self.cur)
 
     def _line(self, raw, offset):
@@ -222,6 +244,9 @@ class SessionParser:
             return
         if t in ("custom-title", "agent-name"):
             meta["title"] = d.get("customTitle") or d.get("agentName") or meta["title"]
+            return
+        if t == "attachment" and not d.get("isSidechain"):
+            self._follow(d)
             return
         if t not in ("user", "assistant") or d.get("isSidechain"):
             return
@@ -347,7 +372,8 @@ def _file_key(path):
 
 
 def _turns_size(turns):
-    return sum(len(t["q"] or "") + sum(map(len, t["texts"])) + sum(map(len, t["notes"])) + 200 for t in turns)
+    return sum(len(t["q"] or "") + sum(map(len, t["texts"])) + sum(map(len, t["notes"])) + 200
+               + sum(len(x["q"]) for x in t.get("follows", ())) for t in turns)
 
 
 def cached_parse(path):
@@ -698,7 +724,9 @@ def link_terms(terms):
         # 登记和 hook 都没变 → 终端没换过会话(没 /clear、/resume)
         mark = (t.get("pid"), reg and reg["sid"], hook and hook.get("session_id"), hook and hook.get("ts"))
         # 1. 屏幕上 cc 输入框边框显示的会话标题 → 同目录下标题相同、最近更新的会话
-        sid = sid_by_title(t["cwd"], term.screen_title(t["name"]))
+        scr = term.screen_state(t["name"])
+        t["screen"] = {k: scr[k] for k in ("ready", "busy", "menu")}  # 网页的输入框据此显示"回答中 / 菜单选项"
+        sid = sid_by_title(t["cwd"], scr["title"])
         if not sid:
             # cc 正在输出、弹着菜单时读不到标题。agent 视图里 fork 后,登记和 hook 仍停在原会话上,
             # 这时退回去会让网页在 fork 和原会话之间来回跳 → 沿用上次读到的标题对应的会话
@@ -809,7 +837,7 @@ def search(q, scope="all", per_session=5, max_sessions=60):
         for t in turns:
             if t["kind"] not in ("question", "summary"):
                 continue
-            fields = [("问", t["q"])]
+            fields = [("问", t["q"])] + [("问", x["q"]) for x in t.get("follows", ())]
             if scope == "all":
                 fields += [("答", x) for x in reversed(t["texts"])]  # 最终回答在最后,优先显示
             hay = "\n".join(x for _, x in fields).lower()
@@ -977,6 +1005,197 @@ def _toggle_star(sid, ts, on):
 
 
 # ---------------------------------------------------------------- 网页继续对话
+
+def running_term(sid):
+    return next((t["name"] for t in link_terms(term.list_sessions()) if (t["sid"] or t["launch_sid"]) == sid), None)
+
+
+_sent = OrderedDict()  # 网页发来的消息 id → 结果:网络差时网页会重发同一条,只输入一次
+_sent_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------- 排队 / 引导 / 草稿箱
+# cc 正在回答时发的消息有两种去处:
+#   排队:存在这里(data/queue.json),等 cc 答完、空闲下来再一条条发;网页上能看到、撤回、改
+#   引导:马上插进正在进行的回答(cc 的 Ctrl+X Ctrl+S "send now"),记录里是 #n-1 这样的追问
+QUEUE = ROOT / "data" / "queue.json"
+DRAFTS = ROOT / "data" / "drafts.json"
+_qlock = threading.Lock()
+
+
+def _read_json(path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
+def _write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".")
+    with os.fdopen(fd, "w", encoding="utf-8") as fp:
+        json.dump(data, fp, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def queue_items(sid):
+    with _qlock:
+        return _read_json(QUEUE, {}).get(sid, [])
+
+
+def _queue_edit(sid, fn):
+    """在锁里改某个会话的队列;fn(items) 原地修改并返回结果。改完推送给网页。"""
+    with _qlock:
+        q = _read_json(QUEUE, {})
+        items = q.get(sid, [])
+        res = fn(items)
+        if items:
+            q[sid] = items
+        else:
+            q.pop(sid, None)
+        _write_json(QUEUE, q)
+    _publish({"queue": {"sid": sid, "items": items}})
+    return res
+
+
+def queue_remove(sid, qid):
+    """撤回 / 编辑排队的一条:从队列里拿出来,文字交还给网页。已经发出去了返回 None。"""
+    def fn(items):
+        for i, it in enumerate(items):
+            if it["id"] == qid:
+                return items.pop(i)
+        return None
+    return {"item": _queue_edit(sid, fn), "queue": queue_items(sid)}
+
+
+_q_idle = {}  # sid → 连续空闲的次数;发完一条后的冷却截止时间
+_q_cool = {}
+
+
+def queue_worker():
+    """排队的消息:cc 空闲(有输入框、没在回答、没弹菜单)连续两次检查都是空闲才发下一条;
+    发完冷却几秒,等 cc 开始回答,免得刚发完还没显示"回答中"就把下一条也发了。cc 没在运行就等着,不替你启动。"""
+    while True:
+        time.sleep(1)
+        try:
+            with _qlock:
+                q = _read_json(QUEUE, {})
+            for sid, items in q.items():
+                if not items or time.monotonic() < _q_cool.get(sid, 0):
+                    continue
+                name = running_term(sid)
+                st = term.screen_state(name) if name else None
+                if not st or not st["ready"] or st["busy"] or st["menu"]:
+                    _q_idle[sid] = 0
+                    continue
+                _q_idle[sid] = _q_idle.get(sid, 0) + 1
+                if _q_idle[sid] < 2:
+                    continue
+                item = _queue_edit(sid, lambda its: its.pop(0) if its else None)
+                if item:
+                    try:
+                        term.send_text(name, item["text"])
+                    except Exception:  # noqa: BLE001  没送进去:放回队首
+                        _queue_edit(sid, lambda its: its.insert(0, item))
+                        raise
+                _q_idle[sid] = 0
+                _q_cool[sid] = time.monotonic() + 5
+        except Exception as e:  # noqa: BLE001
+            print("queue:", repr(e), file=sys.stderr, flush=True)
+
+
+def drafts_list():
+    with _qlock:
+        return _read_json(DRAFTS, [])
+
+
+def drafts_op(b):
+    """草稿箱:add / update / delete。草稿不分会话(记着从哪个会话放进来的,方便认)。"""
+    op = b.get("op")
+    with _qlock:
+        ds = _read_json(DRAFTS, [])
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        if op == "add":
+            text = str(b.get("text") or "")
+            if not text.strip():
+                raise ValueError("草稿是空的")
+            sid = str(b.get("sid") or "") or None
+            d = {"id": uuid.uuid4().hex[:12], "text": text, "sid": sid, "title": str(b.get("title") or "")[:120],
+                 "created": now, "updated": now}
+            ds.insert(0, d)
+            res = d
+        elif op in ("update", "delete"):
+            d = next((x for x in ds if x["id"] == b.get("id")), None)
+            if not d:
+                raise ValueError("这条草稿已经不在了")
+            if op == "delete":
+                ds.remove(d)
+            else:
+                d["text"], d["updated"] = str(b.get("text") or ""), now
+            res = d
+        else:
+            raise ValueError("未知操作")
+        _write_json(DRAFTS, ds)
+    _publish({"drafts": True})
+    return {"draft": res, "drafts": ds}
+
+
+def send_message(sid, text, mid, mode="send"):
+    """网页输入框发来的消息:输进这个会话的 cc(没在运行就先 --resume 启动)。
+    mode: send = 直接发;queue = cc 在回答(或已有排队)时排队,否则直接发;steer = cc 在回答时插进当前回答,否则直接发。"""
+    if mid:
+        with _sent_lock:
+            if mid in _sent:
+                return _sent[mid]
+            _sent[mid] = {"ok": True, "dup": True}
+            while len(_sent) > 500:
+                _sent.popitem(last=False)
+    try:
+        name = running_term(sid)
+        if not name:
+            name = continue_session(sid)
+            st = term.wait_ready(name)
+        else:
+            st = term.screen_state(name)
+        if mode == "queue" and not st.get("menu") and (st.get("busy") or queue_items(sid)):
+            item = {"id": mid or uuid.uuid4().hex[:12], "text": text,
+                    "ts": datetime.now().astimezone().isoformat(timespec="seconds")}
+            _queue_edit(sid, lambda its: its.append(item))
+            res = {"ok": True, "queued": True, "item": item}
+        elif mode == "steer" and st.get("busy") and not st.get("menu"):
+            term.steer(name, text)
+            res = {"ok": True, "steered": True}
+        elif st.get("menu"):
+            if term.free_option(st["menu"]) is None:
+                raise ValueError("cc 正弹着一个选择菜单,先在输入框上方选一项")
+            res = {"ok": True, "term": name, "answered": True, **term.answer_free(name, text)}  # cc 在提问:作为自己填的答案
+        elif not st.get("ready"):
+            raise ValueError("cc 还没准备好(启动中,或在等别的操作),稍后再发;也可以打开终端看看")
+        else:
+            term.send_text(name, text)
+            res = {"ok": True, "term": name}
+    except Exception:
+        if mid:
+            with _sent_lock:
+                _sent.pop(mid, None)  # 没送进去:允许重发
+        raise
+    if mid:
+        with _sent_lock:
+            _sent[mid] = res
+    return res
+
+
+def session_keys(sid, body):
+    """输入框上的按钮:停止(Esc)、选菜单项。只对已在运行的 cc。"""
+    name = running_term(sid)
+    if not name:
+        raise ValueError("cc 没在运行")
+    if "choose" in body:
+        term.choose(name, int(body["choose"]))
+    else:
+        term.send_keys(name, [str(k) for k in body.get("keys") or []])
+    return {"ok": True}
+
 
 def continue_session(sid):
     """返回运行这个会话的 tmux 终端;没有就以 --resume 在后台新开一个。"""
@@ -1377,9 +1596,13 @@ def to_markdown(meta, turns, start=1):
         out += [f"## [{t['n']}] {label}", "", t["q"] or "(无)", ""]
         if t["q_images"]:
             out += [f"(提问附带 {len(t['q_images'])} 张图片)", ""]
-        if t["texts"]:
+        if t["texts"] or t.get("follows"):
             out += [f"### [{t['n']}] 答" + (f"(用了 {t['tools']} 次工具)" if t["tools"] else ""), ""]
-            out += ["\n\n".join(t["texts"]), ""]
+            at = 0
+            for k, fl in enumerate(t.get("follows", ()), 1):  # 回答中途的追问插在它出现的位置
+                out += ["\n\n".join(t["texts"][at:fl["at"]]), "", f"#### [{t['n']}-{k}] 追问", "", fl["q"], ""]
+                at = fl["at"]
+            out += ["\n\n".join(t["texts"][at:]), ""]
         if t["images"]:
             out += [f"(回答过程中查看了 {len(t['images'])} 张图片)", ""]
         for n in t["notes"]:
@@ -1574,6 +1797,20 @@ class Handler(SimpleHTTPRequestHandler):
             if m:
                 name = continue_session(m.group(1))
                 return self._json({"term": name})
+            m = re.fullmatch(r"/api/sessions/([\w-]+)/send", u.path)
+            if m:
+                b = self._body()
+                mid = str(b.get("id") or "")
+                mode = b.get("mode") if b.get("mode") in ("send", "queue", "steer") else "send"
+                return self._json(send_message(m.group(1), str(b.get("text") or ""), mid if re.fullmatch(r"[\w-]{8,64}", mid) else None, mode))
+            m = re.fullmatch(r"/api/queue/([\w-]+)/remove", u.path)
+            if m:
+                return self._json(queue_remove(m.group(1), str(self._body().get("id") or "")))
+            if u.path == "/api/drafts":
+                return self._json(drafts_op(self._body()))
+            m = re.fullmatch(r"/api/sessions/([\w-]+)/keys", u.path)
+            if m:
+                return self._json(session_keys(m.group(1), self._body()))
             if u.path == "/api/focus":  # 网页切换会话时报告,cca 不带参数时进入它
                 b = self._body()
                 page, sid = str(b.get("page") or ""), b.get("sid")
@@ -1672,6 +1909,11 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json({"sid": focused_session()})
             if u.path == "/api/summaries":
                 return self._json({"summaries": list_summaries()})
+            m = re.fullmatch(r"/api/queue/([\w-]+)", u.path)
+            if m:
+                return self._json({"queue": queue_items(m.group(1))})
+            if u.path == "/api/drafts":
+                return self._json({"drafts": drafts_list()})
             m = re.fullmatch(r"/api/summaries/([\w-]+)", u.path)
             if m:
                 res = read_summary(m.group(1))
@@ -1849,6 +2091,7 @@ def cmd_serve(_):
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     threading.Thread(target=watcher, daemon=True).start()
     threading.Thread(target=prewarm, daemon=True).start()
+    threading.Thread(target=queue_worker, daemon=True).start()
     VERSION_INFO.update(updater.current())
     updater.on_change(lambda st: _publish({"update": st}))
     threading.Thread(target=updater.loop, daemon=True).start()

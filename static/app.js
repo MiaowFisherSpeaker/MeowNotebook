@@ -54,6 +54,10 @@ const MATH_RE = [
   [/(?<![\\$\w])\$(?!\s)([^$\n]+?)(?<!\s)\$(?![\d$])/g, false, (tex, next) => !/\w/.test(next) || /\\[a-zA-Z]|\^/.test(tex)],
 ];
 // 不在 \begin{…} 环境里的裸 & 是笔误(如 `$^{[Ma&Wu]}$`),KaTeX 会当成列分隔符报错 → 按字面的 & 显示
+// KaTeX 没有的命令(\dddot、\ddddot:三阶 / 四阶导数),用宏补上,点的大小和 \ddot 一样。
+// 每次传一个副本:公式里的 \gdef 会改写这个对象,不能让一处的定义漏到别处
+const dots = n => `{\\overset{\\raisebox{-0.1em}{$\\smash{${Array(n).fill('.').join('\\kern-0.04em')}}$}}{#1}}`;
+const TEX_MACROS = { '\\dddot': dots(3), '\\ddddot': dots(4) };
 const fixTex = tex => /\\begin\{/.test(tex) ? tex : tex.replace(/(?<!\\)&/g, '\\&');
 
 let mdCwd = '';  // 解析 Markdown 中相对路径图片用的目录(当前会话的 cwd)
@@ -147,7 +151,7 @@ function mdToHTML(src) {
   // 4. 把占位符换成 KaTeX
   html = html.replace(/MATHPH(\d+)XQ/g, (_, i) => {
     const { tex, display } = math[i];
-    try { return katex.renderToString(tex.trim(), { displayMode: display, throwOnError: false, strict: 'ignore' }); }
+    try { return katex.renderToString(tex.trim(), { displayMode: display, throwOnError: false, strict: 'ignore', macros: { ...TEX_MACROS } }); }
     catch { return `<span class="math-err">${esc(tex)}</span>`; }
   });
   return html;
@@ -756,8 +760,10 @@ function patchSession(redraw, oldCount) {
   if (mapKey(items) !== qmap.key) renderMap(items);  // 只是回答在变时问题地图不用重画
   syncDock();
 }
-const mapItems = turns => turns.filter(t => t.kind === 'question')
-  .map(t => ({ id: 't' + t.n, n: t.n, text: t.q.replace(/\s+/g, ' ').slice(0, 240), len: t.q.length }));
+const mapItems = turns => turns.filter(t => t.kind === 'question').flatMap(t => [
+  { id: 't' + t.n, n: t.n, text: t.q.replace(/\s+/g, ' ').slice(0, 240), len: t.q.length },
+  ...(t.follows || []).map((x, k) => ({ id: `t${t.n}-${k + 1}`, n: `${t.n}-${k + 1}`, text: x.q.replace(/\s+/g, ' ').slice(0, 240), len: x.q.length, lv: 3 })),
+]);
 
 // 打开会话时定位:指定的轮次,否则最新一问
 function jumpToTurn() {
@@ -784,20 +790,32 @@ function renderNote(note) {
 function rawHTML(turns, active, showProc, showMisc, sid, last = turns[turns.length - 1]) {
   const label = { question: '问', command: '命令', shell: 'Shell', summary: '上下文压缩摘要' };
   const items = turns.filter(t => showMisc || t.kind === 'question' || t.kind === 'summary');
+  // 一段回答:前面的过程文字收起来,最后一段是正文
+  const seg = (texts, showProc) => {
+    const main = texts.length ? texts[texts.length - 1] : '', proc = texts.slice(0, -1);
+    return (proc.length ? `<details class="proc"${showProc ? ' open' : ''}><summary>过程文字 ${proc.length} 段</summary>${proc.map(p => `<div class="md">${renderMD(p)}</div>`).join('')}</details>` : '') +
+      (main ? `<div class="md">${renderMD(main)}</div>` : '');
+  };
   return items.map(t => {
-    const main = t.texts.length ? t.texts[t.texts.length - 1] : '';
-    const proc = t.texts.slice(0, -1);
+    // 回答中途插进来的追问(#n-1、#n-2…):把回答在追问出现处切开,追问卡片插在中间
+    const fl = t.follows || [];
+    let body = '', at = 0;
+    fl.forEach((x, k) => {
+      body += seg(t.texts.slice(at, x.at), showProc) +
+        `<div class="q follow" id="t${t.n}-${k + 1}"><div class="lab"><span>#${t.n}-${k + 1} 追问</span><span>${fmtTime(x.ts)}</span></div><div class="md">${renderMD(x.q)}</div></div>`;
+      at = x.at;
+    });
+    body += seg(t.texts.slice(at), showProc);
     const q = t.kind === 'summary'
       ? `<details><summary>上下文压缩摘要(点击展开)</summary><div class="md">${renderMD(t.q)}</div></details>`
       : `<div class="md">${t.kind === 'question' ? renderMD(t.q) : `<code>${esc(t.q)}</code>`}</div>`;
-    const pending = active && t === last && !t.texts.length;
+    const pending = active && t === last && (!t.texts.length || fl.at(-1)?.at === t.texts.length);  // 追问之后还没有回答也算
     return `<section class="turn" id="t${t.n}">
       <div class="q ${t.kind}"><div class="lab"><span>#${t.n} ${label[t.kind] || t.kind}</span><span>${fmtTime(t.ts)}</span><span class="sp"></span>${
         t.kind === 'question' && sid ? starBtn(sid, t.ts) : ''}</div>${q}${sid && t.q_images?.length ? imgGrid(sid, t.q_images) : ''}</div>
-      ${t.texts.length || t.notes.length || t.images?.length || pending ? `<div class="a">
+      ${t.texts.length || t.notes.length || t.images?.length || fl.length || pending ? `<div class="a">
         <div class="lab"><span>答</span>${t.tools ? `<span>${t.tools} 次工具调用</span>` : ''}</div>
-        ${proc.length ? `<details class="proc"${showProc ? ' open' : ''}><summary>过程文字 ${proc.length} 段</summary>${proc.map(p => `<div class="md">${renderMD(p)}</div>`).join('')}</details>` : ''}
-        <div class="md">${renderMD(main)}</div>
+        ${body}
         ${sid && t.images?.length ? `<details class="proc imgsec"><summary>cc 查看的图片 ${t.images.length} 张</summary>${imgGrid(sid, t.images)}</details>` : ''}
         ${t.notes.map(n => `<div class="md">${renderMD(n)}</div>`).join('')}
         ${pending ? '<div class="pending">回答生成中…</div>' : ''}
@@ -1065,7 +1083,8 @@ function syncDock() {
     $('#dock-status').innerHTML = `<span class="badge run">${t.attach ? '后台会话' : '运行中'}</span> ${esc(t.name)} · ${t.clients} 个连接 · 点击终端后直接输入<span class="warn" id="input-wait"></span>`;
     $('#dock-kill').textContent = t.attach ? '关闭终端' : '结束会话';
     inputStatus();
-    if (tv.name !== t.name) attachTerm(t.name);
+    if (!panelShown('terminal')) detachTerm();  // 终端收着:不连网页终端,不占网络
+    else if (tv.name !== t.name) attachTerm(t.name);
   } else {
     detachTerm();
     dock.classList.remove('on');
@@ -1078,7 +1097,231 @@ function syncDock() {
     else $('#dock-tip').innerHTML = '将以 <code>--resume</code> 在后台启动(bypass 模式),这里出现与终端完全相同的输入框。';
   }
   setZoneInfo();
+  renderComposer();
 }
+
+// ---------- 输入框 ----------
+// 在本页打字,整条消息一次发给服务器,由它粘贴进 tmux 里的 cc 再回车:打字不经网络,网络差也只影响"发送"这一下。
+// cc 弹出选择菜单时(权限确认、提问、/model…)把选项列成按钮;正在回答时可以"停止"(= Esc)。
+// 草稿按会话存在本机,没发出去不会丢。
+// cc 正在回答时:Enter = 排队(等它答完依次发,列在输入框上方,可撤回 / 编辑);Ctrl/⌘+Enter = 引导(马上插进当前回答)。
+// 撤回 / 编辑的消息回到输入框;输入框里已经有字时放进草稿箱,不覆盖正在写的东西。
+const cm = { sid: null, sending: false, err: '', sentAt: 0, note: '', queue: [], drafts: [] };
+// cc 提问(AskUserQuestion)时的特殊项:"Type something" = 自己填答案(用下面的输入框);[ ] / [✔] = 多选题
+const FREE_RE = /^(\d+\.\s+)?(\[.\]\s+)?Type something/i, MULTI_RE = /^(\d+\.\s+)?\[.\]/;
+const CM_PH = '给 cc 发消息…(Enter 发送,Shift+Enter 换行)';
+const cmText = $('#cm-text');
+const draftKey = sid => 'draft.' + sid;
+function cmAutosize() { cmText.style.height = 'auto'; cmText.style.height = Math.min(cmText.scrollHeight, innerHeight * 0.4) + 'px'; }
+function renderComposer() {
+  const box = $('#composer');
+  const show = !!state.data && !$('#view').hidden && !$('#view').matches('.file, .stars, .summary');
+  box.hidden = !show;
+  if (!show) return;
+  const sid = state.data.meta.id;
+  if (cm.sid !== sid) {  // 换了会话:放回这个会话的草稿
+    cm.sid = sid; cm.err = ''; cm.sentAt = 0; cm.note = ''; cm.queue = [];
+    cmText.value = localGet(draftKey(sid), ''); cmAutosize();
+    loadQueue(sid);
+  }
+  const t = tv.bySid.get(sid), scr = t?.screen;
+  const owner = !t && !state.data.pending && state.data.owner;
+  const blocked = !!owner && !owner.job;
+  cmText.disabled = blocked;
+  $('#cm-send').disabled = blocked || cm.sending;
+  $('#cm-stop').hidden = !scr?.busy;
+  const busy = !!scr?.busy && !scr?.menu;  // 回答中:发送分成"排队"和"引导"
+  $('#cm-steer').hidden = !busy;
+  $('#cm-steer').disabled = blocked || cm.sending;
+  $('#cm-send').textContent = busy || cm.queue.length ? '排队' : '发送';
+  $('#cm-send').title = busy || cm.queue.length ? '等 cc 答完再发(Enter)' : '发送(Enter)';
+  $('#cm-drafts').textContent = cm.drafts.length ? `草稿箱 ${cm.drafts.length}` : '草稿箱';
+  renderQueue();
+  const st = $('#cm-status');
+  let msg, warn = false;
+  if (blocked) { msg = esc(owner.message); warn = true; }
+  else if (cm.sending) msg = '发送中…';
+  else if (cm.err) { msg = esc(cm.err); warn = true; }
+  else if (!t) msg = owner?.job ? '发送后接入 cc 后台会话' : '未运行 · 发送第一条消息时以 <code>--resume</code> 在后台启动 cc';
+  else if (scr?.menu) { msg = 'cc 在等你选择 ↑'; warn = true; }
+  else if (scr?.busy) msg = '<span class="dot live"></span>cc 正在回答 · Enter 排队,Ctrl+Enter 引导(插进当前回答)';
+  else if (cm.sentAt && Date.now() - cm.sentAt < 6000) msg = esc(cm.note || '已发送');
+  else if (scr && !scr.ready) msg = 'cc 还没准备好(启动中?)';
+  else msg = `<span class="dot live"></span>运行中 · ${esc(t.name)}`;
+  st.innerHTML = msg; st.classList.toggle('warn', warn); st.title = st.textContent;
+  $('#cm-term').textContent = panelShown('terminal') ? '收起终端' : '打开终端';
+  const menu = scr?.menu, mel = $('#cm-menu');
+  const free = menu ? menu.options.findIndex(o => FREE_RE.test(o.text)) : -1;
+  const multi = !!menu?.options.some(o => MULTI_RE.test(o.text));
+  cmText.placeholder = free >= 0 ? (multi ? '自己填一项:输入后 Enter,会勾上这一项(再点 Next / Submit)' : '或者输入自己的答案,Enter 发送') : CM_PH;
+  if (menu && free >= 0 && !blocked && !cm.sending && !cm.err) st.textContent = 'cc 在问你 ↑ 点一个选项,或在下面输入自己的答案';
+  mel.hidden = !menu;
+  if (menu) {
+    const tip = multi ? '多选:点选项打勾 / 取消,选好后点 Next 或 Submit' : menu.foot || '';
+    setHTML(mel, (menu.head ? `<div class="mh"><b>${esc(menu.head)}</b></div>` : '') +
+      '<div class="opts">' + menu.options.map((o, i) => i === free ? '' :  // 自己填的那项用下面的输入框
+        `<button class="opt${o.sel ? ' sel' : ''}" data-i="${i}">${esc(o.text)}${o.desc ? `<small>${esc(o.desc)}</small>` : ''}</button>`).join('') + '</div>' +
+      `<div class="mf"><span>${esc(tip)}</span><span class="sp"></span><button data-key="Escape" title="相当于在终端里按 Esc">取消</button></div>`);
+  }
+}
+async function cmKeys(body) {
+  const sid = state.data?.meta.id; if (!sid) return;
+  const r = await post(`/api/sessions/${sid}/keys`, body).catch(() => ({ error: '网络错误' }));
+  if (r.error) toast(r.error, 2500);
+  setTimeout(loadTerms, 250); setTimeout(loadTerms, 1200);  // 菜单 / 回答状态尽快刷新
+}
+function renderQueue() {
+  const q = $('#cm-queue');
+  q.hidden = !cm.queue.length;
+  if (!cm.queue.length) return setHTML(q, '');
+  setHTML(q, `<div class="qh">排队中 ${cm.queue.length} 条 · cc 答完后按顺序发送</div>` + cm.queue.map((it, i) =>
+    `<div class="qit" data-id="${esc(it.id)}"><span class="qn">#${i + 1}</span><span class="qt">${esc(it.text)}</span>` +
+    `<button class="qb" data-act="edit" title="拿回输入框修改">✎</button><button class="qb" data-act="cancel" title="撤回(文字回到输入框)">✕</button></div>`).join(''));
+}
+async function loadQueue(sid) {
+  const r = await api(`/api/queue/${sid}`).catch(() => null);
+  if (r && cm.sid === sid) { cm.queue = r.queue || []; renderComposer(); }
+}
+async function loadDrafts() {
+  const r = await api('/api/drafts').catch(() => null);
+  if (!r) return;
+  cm.drafts = r.drafts || [];
+  renderComposer(); if (!$('#drafts').hidden) renderDrafts();
+}
+// 撤回 / 编辑 / 草稿拿出来的文字:输入框空着就放进去;已经有字就存进草稿箱,弹窗说一声
+async function returnText(text, what) {
+  if (!cmText.value.trim()) {
+    cmText.value = text; cmAutosize(); if (cm.sid) localSet(draftKey(cm.sid), text);
+    cmText.focus(); cmText.setSelectionRange(text.length, text.length);
+    return true;
+  }
+  const r = await post('/api/drafts', { op: 'add', text, sid: cm.sid, title: state.data?.meta.title || '' }).catch(() => null);
+  if (!r || r.error) { toast(r?.error || '网络错误,没能存进草稿箱', 3000); return false; }
+  cm.drafts = r.drafts; renderComposer();
+  $('#cm-pop-text').textContent = `输入框里已经有内容,${what}的这条消息临时放到了草稿箱。`;
+  $('#cm-pop').hidden = false; $('#cm-pop-ok').focus();
+  return true;
+}
+$('#cm-queue').addEventListener('click', async e => {
+  const b = e.target.closest('.qb'); if (!b) return;
+  const id = b.closest('.qit').dataset.id, sid = cm.sid;
+  const r = await post(`/api/queue/${sid}/remove`, { id }).catch(() => null);
+  if (!r || r.error) return toast(r?.error || '网络错误', 2500);
+  if (cm.sid === sid) { cm.queue = r.queue; renderComposer(); }
+  if (!r.item) return toast('这条刚刚已经发出去了', 2500);
+  returnText(r.item.text, b.dataset.act === 'edit' ? '要编辑' : '撤回');
+});
+$('#cm-pop-ok').addEventListener('click', () => { $('#cm-pop').hidden = true; cmText.focus(); });
+$('#cm-pop-open').addEventListener('click', () => { $('#cm-pop').hidden = true; openDrafts(); });
+
+// ---------- 草稿箱 ----------
+const dr = { editing: null };
+function openDrafts() { $('#drafts').hidden = false; loadDrafts(); renderDrafts(); $('#dr-search').focus(); }
+function closeDrafts() { $('#drafts').hidden = true; dr.editing = null; }
+function renderDrafts() {
+  const kw = $('#dr-search').value.trim().toLowerCase();
+  const list = cm.drafts.filter(d => !kw || (d.text + ' ' + (d.title || '')).toLowerCase().includes(kw));
+  $('#dr-list').innerHTML = (dr.editing === 'new' ? `<div class="dr-item" data-id="new"><textarea placeholder="写点什么…"></textarea>
+      <div class="da"><button data-act="cancel">取消</button><button class="primary" data-act="save">保存</button></div></div>` : '') +
+    (list.map(d => `<div class="dr-item" data-id="${esc(d.id)}">
+      <div class="dm"><span>${esc(fmtTime(d.updated))}</span>${d.title ? `<span title="来自这个会话">· ${esc(d.title)}</span>` : ''}<span class="sp"></span></div>
+      ${dr.editing === d.id ? `<textarea>${esc(d.text)}</textarea>
+        <div class="da"><button data-act="cancel">取消</button><button class="primary" data-act="save">保存</button></div>`
+        : `<div class="dt">${esc(d.text)}</div>
+        <div class="da"><button class="danger" data-act="del">删除</button><button data-act="edit">编辑</button>${state.data ? '<button class="primary" data-act="use" title="放回输入框,从草稿箱里拿走">放回输入框</button>' : ''}</div>`}
+    </div>`).join('') || (dr.editing === 'new' ? '' : `<div class="hint">${kw ? '没有匹配的草稿' : '草稿箱是空的'}</div>`));
+  $('#dr-list textarea')?.focus();
+}
+async function draftOp(body) {
+  const r = await post('/api/drafts', body).catch(() => null);
+  if (!r || r.error) { toast(r?.error || '网络错误', 2500); return null; }
+  cm.drafts = r.drafts; renderComposer(); renderDrafts();
+  return r;
+}
+$('#dr-list').addEventListener('click', async e => {
+  const b = e.target.closest('button[data-act]'); if (!b) return;
+  const item = b.closest('.dr-item'), id = item.dataset.id, act = b.dataset.act;
+  const d = cm.drafts.find(x => x.id === id);
+  if (act === 'edit') { dr.editing = id; renderDrafts(); }
+  else if (act === 'cancel') { dr.editing = null; renderDrafts(); }
+  else if (act === 'save') {
+    const text = item.querySelector('textarea').value;
+    if (!text.trim()) return toast('草稿是空的');
+    dr.editing = null;
+    await draftOp(id === 'new' ? { op: 'add', text, sid: cm.sid, title: state.data?.meta.title || '' } : { op: 'update', id, text });
+  } else if (act === 'del') {
+    if (b.dataset.sure !== '1') { b.dataset.sure = '1'; b.textContent = '确定删除?'; setTimeout(() => { b.dataset.sure = ''; b.textContent = '删除'; }, 3000); return; }
+    await draftOp({ op: 'delete', id });
+  } else if (act === 'use' && d) {
+    if (cmText.value.trim()) {  // 输入框里有字:互换,原来的存成一条新草稿
+      const cur = cmText.value;
+      if (!await draftOp({ op: 'add', text: cur, sid: cm.sid, title: state.data?.meta.title || '' })) return;
+      toast('输入框原来的内容存成了一条新草稿', 2500);
+    }
+    if (!await draftOp({ op: 'delete', id })) return;
+    cmText.value = ''; returnText(d.text, '');
+    closeDrafts();
+  }
+});
+$('#dr-new').addEventListener('click', () => { dr.editing = 'new'; renderDrafts(); });
+$('#dr-search').addEventListener('input', renderDrafts);
+$('#dr-close').addEventListener('click', closeDrafts);
+$('#drafts').addEventListener('click', e => { if (e.target.id === 'drafts') closeDrafts(); });
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (!$('#cm-pop').hidden) { $('#cm-pop').hidden = true; return; }
+  if (!$('#drafts').hidden && !e.target.closest?.('#dr-list textarea')) closeDrafts();
+});
+$('#cm-drafts').addEventListener('click', openDrafts);
+$('#cm-save').addEventListener('click', async () => {
+  const text = cmText.value;
+  if (!text.trim()) return toast('输入框是空的');
+  const r = await draftOp({ op: 'add', text, sid: cm.sid, title: state.data?.meta.title || '' });
+  if (r) { cmText.value = ''; cmAutosize(); if (cm.sid) localSet(draftKey(cm.sid), ''); toast('已存进草稿箱'); }
+});
+
+async function sendMsg(mode = 'queue') {
+  const text = cmText.value;
+  if (!text.trim() || cm.sending || !state.data || cmText.disabled) return;
+  const sid = state.data.meta.id, id = crypto.randomUUID?.() || String(Math.random()).slice(2) + Date.now();
+  cm.sending = true; cm.err = ''; renderComposer();
+  let r = null;
+  for (let i = 0; i < 3 && !r; i++) {  // 网络断了就用同一个 id 重发:服务器认得,不会输入两遍
+    r = await api(`/api/sessions/${sid}/send`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, id, mode }) }, 45000).catch(() => null);
+    if (!r) await new Promise(ok => setTimeout(ok, 1000 * (i + 1)));
+  }
+  cm.sending = false;
+  if (r && !r.error) {
+    if (cmText.value === text) { cmText.value = ''; cmAutosize(); }
+    localSet(draftKey(sid), cmText.value);
+    cm.sentAt = Date.now(); cm.err = '';
+    cm.note = r.queued ? '已排队,cc 答完后发送' : r.steered ? '已插进当前回答(引导)' : '已发送';
+    if (r.queued) { cm.queue = [...cm.queue.filter(x => x.id !== r.item.id), r.item]; }
+    if (r.answered && r.multi) toast('已填入并勾选,选好后点 Next / Submit', 2500);
+    if (state.data?.meta.id === sid) {
+      if (shownTab() !== 'raw') { state.tab = 'raw'; renderSession(); }  // 去看原始问答,新的一问会出现在最后
+      $('#main').scrollTop = $('#main').scrollHeight;
+    }
+    loadTerms(); setTimeout(loadTerms, 1500); setTimeout(renderComposer, 6500);
+  } else cm.err = r?.error || '网络不通,消息没有送出(草稿还在,稍后再发)';
+  if (state.data?.meta.id === sid) renderComposer();
+}
+cmText.addEventListener('input', () => { cmAutosize(); if (cm.sid) localSet(draftKey(cm.sid), cmText.value); });
+cmText.addEventListener('keydown', e => {
+  // 输入法组字时的回车是确认候选词,不是发送
+  if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229 || e.shiftKey || e.altKey) return;
+  e.preventDefault(); sendMsg(e.ctrlKey || e.metaKey ? 'steer' : 'queue');
+});
+$('#cm-send').addEventListener('click', () => sendMsg('queue'));
+$('#cm-steer').addEventListener('click', () => sendMsg('steer'));
+$('#cm-stop').addEventListener('click', () => { cm.sentAt = 0; cmKeys({ keys: ['Escape'] }); });
+$('#cm-term').addEventListener('click', () => showPanel('terminal', true));
+$('#cm-menu').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  if (b.dataset.i != null) cmKeys({ choose: +b.dataset.i });
+  else if (b.dataset.key) cmKeys({ keys: [b.dataset.key] });
+});
 
 function fitTerm() {
   if (!tv.term || $('#termbox').offsetWidth === 0) return;
@@ -1581,16 +1824,16 @@ const PANELS = {
 const ZONE_NAMES = { left: '左侧', right: '右侧', bottom: '底部' };
 const SIZE = { left: [200, 640], right: [280, 1400], bottom: [120, 2000] };
 function defaultLayout() {
-  return { v: 1, zones: {
+  return { v: 2, zones: {
     left: { panels: ['sessions', 'files'], active: 'sessions', open: true, size: 300 },
     right: { panels: [], active: null, open: true, size: 560 },
-    bottom: { panels: ['terminal'], active: 'terminal', open: true, size: 300 },
+    bottom: { panels: ['terminal'], active: 'terminal', open: false, size: 300 },
   } };
 }
 function loadLayout() {
   let l = null;
   try { l = JSON.parse(localGet('layout', 'null')); } catch {}
-  if (!l || l.v !== 1) {  // 从旧版本迁移:终端位置 / 尺寸、侧栏开关、侧栏标签
+  if (!l || !(l.v >= 1)) {  // 从旧版本迁移:终端位置 / 尺寸、侧栏开关、侧栏标签
     l = defaultLayout();
     const z = l.zones;
     if (localGet('dockPos', '') === 'right') { z.bottom.panels = []; z.bottom.active = null; z.right.panels = ['terminal']; z.right.active = 'terminal'; }
@@ -1599,6 +1842,11 @@ function loadLayout() {
     if (h) z.bottom.size = h + 31;  // 旧版只记终端本身的高度,新版含标题栏
     if (localGet('side', '1') === '0') z.left.open = false;
     if (localGet('side-tab', '') === 'files') z.left.active = 'files';
+  }
+  // v1 → v2:有了正文下方的输入框,终端默认收起(只有终端单独占着的那一处才收,和别的面板放在一起的不动)
+  if (l.v === 1) {
+    for (const z of Object.values(l.zones || {})) if (z.panels?.length === 1 && z.panels[0] === 'terminal') z.open = false;
+    l.v = 2;
   }
   // 少了的面板补回默认位置,多余 / 重复的去掉
   const seen = new Set();
@@ -1651,7 +1899,7 @@ function renderZones() {
   }
   document.querySelectorAll('#rail [data-panel]').forEach(b => b.classList.toggle('on', panelShown(b.dataset.panel)));
   setZoneInfo();
-  requestAnimationFrame(() => { fitTerm(); layoutMap(); spy(); });
+  requestAnimationFrame(() => { fitTerm(); layoutMap(); spy(); syncDock(); });  // 终端显示 / 收起 → 连上 / 断开
 }
 // 底部收起成一条时,标题栏上显示终端状态
 function setZoneInfo() {
@@ -1803,7 +2051,7 @@ document.querySelectorAll('.zone .zsplit').forEach(sp => sp.addEventListener('po
 }));
 // Ctrl/⌘+B 收起 / 展开左侧,Ctrl/⌘+J 底部。焦点在终端里时不拦截(cc 自己用 Ctrl+B)
 document.addEventListener('keydown', e => {
-  if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.target.closest?.('.xterm, input, textarea')) return;
+  if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.target.closest?.('.xterm, input, textarea:not(#cm-text)')) return;
   const k = e.key.toLowerCase();
   if (k === 'b') { e.preventDefault(); narrow.matches ? showSide(document.body.classList.contains('side-hidden')) : toggleZone('left'); }
   else if (k === 'j') { e.preventDefault(); toggleZone(zoneOf('terminal') === 'bottom' ? 'bottom' : zoneOf('terminal')); }
@@ -1953,10 +2201,13 @@ function connectLive() {
     if (ev.hello) {  // 连上 / 重连:断开期间的变化不会补推,全量刷新一次
       live.ok = true; netState(true);
       loadTerms(); loadSessions(); loadSession(false, true); reportFocus();  // 服务器可能刚重启过,不记得选中的会话
+      loadDrafts(); if (cm.sid) loadQueue(cm.sid);
       return;
     }
     if (ev.terms) onTerms(ev.terms);
     if (ev.changed) onChanged(ev.changed);
+    if (ev.queue && ev.queue.sid === cm.sid) { cm.queue = ev.queue.items; renderComposer(); }
+    if (ev.drafts) loadDrafts();
   };
   es.onerror = () => { live.ok = false; };
 }
