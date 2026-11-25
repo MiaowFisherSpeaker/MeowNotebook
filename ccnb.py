@@ -1366,7 +1366,15 @@ def session_cli_info(sid):
     info = next((c for c in term.cli_info() if c["id"] == cli), {})
     return {"cli": cli, "running": bool(t), "models": term.models(cli), "efforts": info.get("efforts") or term.EFFORTS,
             "model": cur_model, "effort": cur_effort, "default_model": prefs["model"].get(cli), "default_effort": prefs["effort"].get(cli),
-            "commands": slash_commands(cli, (t or {}).get("cwd") or (meta or {}).get("cwd"))}
+            "commands": slash_commands(cli, (t or {}).get("cwd") or (meta or {}).get("cwd")),
+            "info_cmds": sorted(term.INFO_CMDS.get(cli, {}))}
+
+
+def session_info_command(sid, cmd):
+    name = running_term(sid)
+    if not name:
+        raise ValueError("会话没在运行:先发一条消息或在终端里启动,再看这些信息")
+    return term.info_command(name, cmd)
 
 
 def set_session_model(sid, model=None, effort=None):
@@ -2271,6 +2279,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json({"ok": True})
             if u.path == "/api/cli":
                 return self._json(set_cli_prefs(self._body()))
+            m = re.fullmatch(r"/api/sessions/([\w-]+)/info", u.path)
+            if m:
+                return self._json(session_info_command(m.group(1), str(self._body().get("cmd") or "")))
             m = re.fullmatch(r"/api/sessions/([\w-]+)/model", u.path)
             if m:
                 b = self._body()

@@ -509,6 +509,105 @@ def claude_set_model(name, model=None, effort=None):
         set_session_opt(name, "effort", effort)
 
 
+# ---------------------------------------------------------------- 只看信息的命令:/usage、/status…
+# cc 的 /usage /status /cost /stats 打开一个设置面板,要按 Esc 才关;/context、codex 的 /status 直接打印在终端里。
+# 这些信息不进会话记录,网页上看不到。网页发这些命令时由这里代办:发出去,等它显示完,抓下内容,面板就按 Esc 关掉。
+INFO_CMDS = {"claude": {"/usage": "panel", "/status": "panel", "/cost": "panel", "/stats": "panel", "/context": "inline"},
+             "codex": {"/status": "inline"}}
+_BAR = re.compile(r"[█▉▊▋▌▍▎▏░▒▓⛀⛁⛂⛃⛶⛝]")
+
+
+def _capture(name, history=0):
+    args = ["capture-pane", "-p", "-J", "-t", f"={name}:"] + (["-S", f"-{history}"] if history else [])
+    return tmux(*args).stdout.splitlines()
+
+
+def _dedent(lines):
+    lines = [x.rstrip() for x in lines]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    pad = min((len(x) - len(x.lstrip()) for x in lines if x.strip()), default=0)
+    return "\n".join(x[pad:] for x in lines)
+
+
+def _info_items(text):
+    """从输出里挑出关键的几项 [{k, v}]:"名称: 值" 的行,和 "38% used" 这类进度条(标题取它上面一行,重置时间取下面一行)。"""
+    # /context:左边是格子图,右边才是 "⛁ System prompt: 3.2k (0.3%)";先去掉行首的格子和图标
+    items, lines = [], [re.sub(r"^[\s⛀⛁⛂⛃⛶⛝]+", "", x).strip() for x in text.splitlines()]
+    for i, x in enumerate(lines):
+        tok = re.match(r"^([\d.]+[kKmM]?\s*/\s*[\d.]+[kKmM]?)\s+tokens\s*\(([^)]*)\)", x)
+        if tok:
+            items.append({"k": "上下文", "v": f"{tok.group(1)} tokens({tok.group(2)})"})
+            continue
+        m = re.match(r"^([^:：]{1,40}?)[:：]\s{2,}(.+)$", x) or re.match(r"^([A-Za-z][^:]{1,30}):\s+(.+)$", x)
+        pct = re.search(r"(\d+(?:\.\d+)?%)\s*(used|left)", x)
+        if pct and _BAR.search(x):
+            title = next((lines[j] for j in range(i - 1, max(-1, i - 3), -1) if lines[j] and not _BAR.search(lines[j])), "")
+            nxt = lines[i + 1] if i + 1 < len(lines) and lines[i + 1].lower().startswith("resets") else ""
+            k = m.group(1).strip() if m else title or "用量"
+            items.append({"k": k, "v": f"{pct.group(1)} {pct.group(2)}" + (f" · {nxt}" if nxt else
+                         (" · " + re.search(r"\(([^)]*reset[^)]*)\)", x, re.I).group(1) if re.search(r"\(([^)]*reset[^)]*)\)", x, re.I) else ""))})
+        elif m and not _BAR.search(m.group(2)):
+            items.append({"k": m.group(1).strip(), "v": m.group(2).strip()})
+    return items[:30]
+
+
+def info_command(name, cmd):
+    """代办一个只看信息的命令,返回 {cmd, text, items}。"""
+    cli = session_cli(name)
+    kind = INFO_CMDS.get(cli, {}).get(cmd)
+    if not kind:
+        raise ValueError(f"{cmd} 不是能在网页上看结果的命令")
+    st = screen_state(name)
+    if st["busy"] or st["menu"] or not st["ready"]:
+        raise ValueError(f"{CLIS[cli]['label']} 正在回答或弹着菜单,等它停下再看")
+    send_text(name, cmd)
+    end, text = time.monotonic() + 10, None
+    if kind == "panel":
+        while time.monotonic() < end:
+            time.sleep(0.4)
+            lines = _capture(name)
+            foot = next((i for i in range(len(lines) - 1, -1, -1) if "esc to close" in lines[i].lower()), None)
+            if foot is None:
+                continue
+            time.sleep(0.6)  # 用量等数据是异步取的,多等一下再抓
+            lines = _capture(name)
+            foot = next((i for i in range(len(lines) - 1, -1, -1) if "esc to close" in lines[i].lower()), len(lines))
+            tabs = next((i for i in range(foot - 1, -1, -1) if re.search(r"\bStatus\b.*\bUsage\b", lines[i])), None)
+            top = tabs if tabs is not None else next((i for i in range(foot - 1, -1, -1) if set(lines[i].strip()) <= set("▔─━")
+                                                      and lines[i].strip()), -1)
+            text = _dedent(lines[top + 1:foot])
+            break
+        send_keys(name, ["Escape"])
+        for _ in range(15):  # 等面板关掉、输入框回来,免得紧接着发的消息落空
+            time.sleep(0.2)
+            if screen_state(name)["ready"]:
+                break
+    else:
+        prev = None
+        while time.monotonic() < end:  # 打印完、屏幕不再变化
+            time.sleep(0.5)
+            lines = _capture(name, 300)
+            if lines == prev and screen_state(name)["ready"]:
+                break
+            prev = lines
+        echo = (lambda x: x.strip() in (f"❯ {cmd}", f"> {cmd}")) if cli == "claude" else (lambda x: x.strip() == cmd)
+        lines = prev or _capture(name, 300)
+        at = next((i for i in range(len(lines) - 1, -1, -1) if echo(lines[i])), None)
+        if at is not None:
+            body = []
+            for x in lines[at + 1:]:
+                if (cli == "claude" and _BORDER.match(x)) or (cli != "claude" and x.lstrip().startswith(CLIS[cli]["prompt"] + " ")):
+                    break
+                body.append(re.sub(r"^(\s*)⎿\s?", r"\1  ", x))
+            text = _dedent(body)
+    if not text:
+        raise RuntimeError(f"没抓到 {cmd} 的输出,打开终端看看")
+    return {"cmd": cmd, "text": text, "items": _info_items(text)}
+
+
 def wait_ready(name, timeout=30):
     """等 cc 启动完、出现输入框。弹着菜单(比如信任目录的确认)时返回菜单状态,让网页去选。"""
     end = time.monotonic() + timeout

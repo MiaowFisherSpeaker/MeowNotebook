@@ -310,11 +310,25 @@ $('#main').addEventListener('scroll', () => { cmenu.hidden = true; });
 const cli = { cur: 'claude', effort: {}, list: [] };
 const cliInfo = id => cli.list.find(c => c.id === id);
 const cliName = id => !id || id === 'claude' ? 'cc' : cliInfo(id)?.label || id;
+// 每个命令行一个标签:会话数、有没有在运行 / 在等你选择;选中的那个决定侧栏列谁的会话、new 用谁打开
+const sessCli = s => s.cli || 'claude';
 function renderCli() {
-  const sel = $('#cli-sel'), c = cliInfo(cli.cur);
-  if (cli.list.length) sel.innerHTML = cli.list.map(x =>
-    `<option value="${esc(x.id)}"${x.available || x.id === cli.cur ? '' : ' disabled'}>${esc(x.label)}${x.available ? '' : '(未安装)'}</option>`).join('');
-  sel.value = cli.cur;
+  const box = $('#cli-tabs'), c = cliInfo(cli.cur);
+  const list = cli.list.length ? cli.list : [{ id: 'claude', label: 'Claude Code', available: true }];
+  const stat = id => {
+    const ss = state.sessions.filter(x => sessCli(x) === id);
+    const run = ss.filter(x => x.running), scr = run.map(x => tv.bySid.get(x.id)?.screen).filter(Boolean);
+    return { n: ss.filter(x => x.questions || x.running).length, run: run.length, wait: scr.some(x => x.menu), busy: scr.some(x => x.busy) };
+  };
+  setHTML(box, list.map(x => {
+    const st = stat(x.id), on = x.id === cli.cur;
+    const dot = st.wait ? '<span class="ct-dot wait" title="有会话在等你选择"></span>' : st.busy ? '<span class="ct-dot busy" title="有会话正在回答"></span>'
+      : st.run ? '<span class="ct-dot" title="有会话在运行"></span>' : '';
+    return `<button class="ct${on ? ' on' : ''}" role="tab" aria-selected="${on}" data-cli="${esc(x.id)}"${x.available || on ? '' : ' disabled'} ` +
+      `title="${esc(x.available ? `${x.label}:侧栏只列它的会话,new 也用它打开` : `${x.label} 未安装`)}">` +
+      `<svg class="ct-i"><use href="#i-cli-${esc(x.id)}"/></svg><span class="ct-l">${esc(x.id === 'claude' ? 'Claude' : x.label)}</span>` +
+      `${x.available ? `<span class="ct-n">${st.n}</span>` : '<span class="ct-n off">未装</span>'}${dot}</button>`;
+  }).join(''));
   document.querySelectorAll('.proj-new').forEach(b => { b.title = `用 ${c?.label || 'Claude Code'} 在这个项目里新开会话`; });
 }
 function setCli(r) {
@@ -326,9 +340,13 @@ async function loadCli() { setCli(await api('/api/cli').catch(() => null)); }
 async function saveCli(body) {
   const r = await post('/api/cli', body).catch(() => ({ error: '网络错误' }));
   if (!setCli(r)) { toast(r?.error || '没能保存', 2500); loadCli(); return; }
-  toast(`新会话用 ${cliInfo(cli.cur)?.label} 打开`, 1800);
+  renderSessions();
 }
-$('#cli-sel').addEventListener('change', e => saveCli({ cli: e.target.value }));
+$('#cli-tabs').addEventListener('click', e => {
+  const b = e.target.closest('.ct'); if (!b || b.disabled || b.dataset.cli === cli.cur) return;
+  cli.cur = b.dataset.cli; renderCli(); renderSessions();  // 先切过去,再存到服务器
+  saveCli({ cli: b.dataset.cli });
+});
 loadCli();
 
 // ---------- 会话列表 ----------
@@ -358,8 +376,11 @@ function renderSessions() {
   const kw = $('#search').value.trim().toLowerCase();
   if (kw && searchMode() !== 'title') return renderSearch();
   renderSrcFilter();
-  const groups = new Map();
+  renderCli();
+  const groups = new Map(), allCwds = new Set();
   for (const s of state.sessions) {
+    if (s.cwd?.startsWith('/')) allCwds.add(s.cwd);
+    if (sessCli(s) !== cli.cur) continue;  // 每个命令行的会话分开列,不混在一起
     if (state.src !== 'all' && (s.via?.platform || 'local') !== state.src) continue;
     if (kw && !`${s.title} ${s.first_q} ${s.cwd} ${s.id} ${s.via?.label || ''}`.toLowerCase().includes(kw)) continue;
     if (!groups.has(s.cwd)) groups.set(s.cwd, []);
@@ -377,10 +398,26 @@ function renderSessions() {
       `${live}<span class="cnt">${list.length}</span></div><div class="proj-list">` +
       list.map(s => `<a class="sess${s.id === state.sid ? ' on' : ''}" href="#/s/${s.id}">
         <div class="t">${esc(s.title)}</div>
-        <div class="m">${s.running ? '<span class="badge run">运行中</span>' : ''}${s.cli && s.cli !== 'claude' ? `<span class="badge cli">${esc(cliName(s.cli))}</span>` : ''}${s.via ? `<span class="badge via" title="在 ${esc(s.via.label)} 里开的会话">${esc(s.via.label)}</span>` : ''}${s.active ? '<span class="dot live" title="记录正在更新"></span>' : ''}${fmtTime(s.mtime)} · ${s.questions} 问
+        <div class="m">${s.running ? statusBadge(s) : ''}${s.via ? `<span class="badge via" title="在 ${esc(s.via.label)} 里开的会话">${esc(s.via.label)}</span>` : ''}${s.active ? '<span class="dot live" title="记录正在更新"></span>' : ''}${fmtTime(s.mtime)} · ${s.questions} 问
         ${s.noted ? '<span class="badge">整理版</span>' : ''}</div></a>`).join('') + '</div>';
   }).join('');
-  $('#sessions').innerHTML = html || '<div class="hint">没有匹配的会话</div>';
+  // 别的项目(只有其他命令行的会话):收在底下,也能用当前命令行新开
+  const label = cliInfo(cli.cur)?.label || 'Claude Code';
+  const others = kw ? [] : [...allCwds].filter(c => !groups.has(c)).sort();
+  const other = others.length ? `<div class="proj-other-h">其他项目 · 用 ${esc(label)} 新开</div>` + others.map(cwd => {
+    const name = cwd.startsWith('/home/') ? '~/' + cwd.split('/').slice(3).join('/') : cwd, cut = name.lastIndexOf('/') + 1;
+    return `<div class="proj other" data-cwd="${esc(cwd)}" title="${esc(cwd)}"><span class="pn"><span class="pp">${esc(name.slice(0, cut))}</span>` +
+      `${esc(name.slice(cut) || name)}</span><button class="proj-new" title="用 ${esc(label)} 在这个项目里新开会话">new</button></div>`;
+  }).join('') : '';
+  const empty = kw ? '<div class="hint">没有匹配的会话</div>' : `<div class="hint sm">还没有 ${esc(label)} 的会话。<br>在下面的项目上点 new 开一个。</div>`;
+  $('#sessions').innerHTML = (html || empty) + other;
+}
+// 运行中的会话:看它的终端画面,标出在回答 / 在等你选择 / 空闲(多个会话同时跑时一眼看出该去哪个)
+function statusBadge(s) {
+  const scr = tv.bySid.get(s.id)?.screen;
+  if (scr?.menu) return '<span class="badge wait" title="弹着菜单或在问你问题">等你选择</span>';
+  if (scr?.busy) return '<span class="badge busy">回答中</span>';
+  return '<span class="badge run">运行中</span>';
 }
 
 // 来源筛选:有在 QQ 里开的会话时才显示
@@ -444,9 +481,11 @@ function renderSearch() {
   }
   if (!sr.data) { $('#sessions').innerHTML = '<div class="sr-sum">搜索中…</div>'; return; }
   const words = searchWords(), d = sr.data;
-  $('#sessions').innerHTML = !d.results?.length ? '<div class="hint">没有匹配的问答</div>'
-    : `<div class="sr-sum">${d.sessions} 个会话 · ${d.hits} 处命中${d.sessions > d.results.length ? `(显示前 ${d.results.length} 个会话)` : ''}</div>` +
-      d.results.map(s => `<a class="sess${s.id === state.sid ? ' on' : ''}" href="#/s/${s.id}" title="${esc(s.cwd)}">
+  const cliOf = new Map(state.sessions.map(x => [x.id, sessCli(x)]));
+  const res = (d.results || []).filter(x => (cliOf.get(x.id) || 'claude') === cli.cur);  // 只看当前命令行的会话
+  $('#sessions').innerHTML = !res.length ? `<div class="hint">${esc(cliInfo(cli.cur)?.label || 'Claude Code')} 的会话里没有匹配的问答</div>`
+    : `<div class="sr-sum">${res.length} 个会话有命中${d.sessions > d.results.length ? `(只搜了最相关的 ${d.results.length} 个会话)` : ''}</div>` +
+      res.map(s => `<a class="sess${s.id === state.sid ? ' on' : ''}" href="#/s/${s.id}" title="${esc(s.cwd)}">
         <div class="t">${esc(s.title)}</div><div class="m">${fmtTime(s.mtime)} · ${s.count} 处命中</div></a>` +
         s.hits.map(h => `<a class="sr-hit" href="#/s/${s.id}${h.n ? '/' + h.n : ''}"><b>${h.n ? '#' + h.n + ' ' : ''}${h.where}</b>${markSnip(h.snip, words)}</a>`).join('') +
         (s.count > s.hits.length ? `<div class="sr-more">还有 ${s.count - s.hits.length} 处,打开会话后可用浏览器查找</div>` : '')).join('');
@@ -1227,7 +1266,7 @@ function renderComposer() {
   const sid = state.data.meta.id;
   if (cm.sid !== sid) {  // 换了会话:先把上一个会话没存完的草稿存掉,再放回这个会话的草稿
     if (cmSaveT) cmSaveDraft(true);
-    sg.info = null; sg.sid = null; sgClose(); loadSessionCli(sid);
+    sg.info = null; sg.sid = null; sgClose(); loadSessionCli(sid); $('#cm-info').hidden = true;
     cm.sid = sid; cm.err = ''; cm.sentAt = 0; cm.note = ''; cm.queue = [];
     cmText.value = localGet(draftKey(sid), ''); cmAutosize();
     loadQueue(sid);
@@ -1316,7 +1355,8 @@ function sgItems(text) {
     const kw = m[1].toLowerCase();
     const list = i.commands.filter(c => c.name.slice(1).toLowerCase().startsWith(kw))
       .concat(kw ? i.commands.filter(c => !c.name.slice(1).toLowerCase().startsWith(kw) && (c.name + ' ' + c.desc).toLowerCase().includes(kw)) : []);
-    return { mode: 'cmd', items: list.slice(0, 40).map(c => ({ kind: 'cmd', v: c.name, title: c.name, desc: c.desc, skill: c.skill })) };
+    return { mode: 'cmd', items: list.slice(0, 40).map(c => ({ kind: 'cmd', v: c.name, title: c.name, skill: c.skill,
+      desc: i.info_cmds?.includes(c.name) ? `${c.desc} · 结果显示在这里` : c.desc })) };
   }
   return null;
 }
@@ -1382,9 +1422,41 @@ async function applyModel(body) {
   await loadTerms(); await loadSessionCli(sid);
   if (r.applied === 'restart') setTimeout(loadTerms, 2500);
 }
+// /usage、/status、/cost、/context…:命令行里是要按 Esc 才关的面板,或只打印在终端里,网页看不到。
+// 网页发这些命令时由服务器代办(发出去、抓下内容、关掉面板),结果显示在输入框上方。
+const INFO_ZH = { '/usage': '用量', '/status': '状态', '/cost': '花费', '/stats': '统计', '/context': '上下文' };
+async function runInfo(cmd) {
+  const sid = state.data?.meta.id, box = $('#cm-info');
+  if (!sid) return;
+  box.hidden = false;
+  setHTML(box, `<div class="ci-h"><b>${esc(cmd)}</b><span class="muted">正在读取…</span><span class="sp"></span><button class="x" data-close>✕</button></div>`);
+  const r = await post(`/api/sessions/${sid}/info`, { cmd }).catch(() => ({ error: '网络错误' }));
+  if (state.data?.meta.id !== sid) return;
+  if (r.error) { box.hidden = true; return toast(r.error, 3000); }
+  const rows = r.items.map(x => {
+    const pct = /^(\d+(?:\.\d+)?)%\s*(used|left)/.exec(x.v), used = pct ? (pct[2] === 'used' ? +pct[1] : 100 - +pct[1]) : null;
+    return `<div class="ci-row"><span class="k">${esc(x.k)}</span><span class="v">${esc(x.v)}` +
+      (used != null ? `<i class="ci-bar"><i style="width:${Math.min(100, used)}%"></i></i>` : '') + '</span></div>';
+  }).join('');
+  setHTML(box, `<div class="ci-h"><b>${esc(cmd)}</b><span class="muted">${esc(INFO_ZH[cmd] || '')} · ${esc(cliName(sg.info?.cli))}</span>` +
+    `<span class="sp"></span><button class="link" data-copy-info title="复制原文">复制</button><button class="x" data-close title="关闭">✕</button></div>` +
+    (rows ? `<div class="ci-rows">${rows}</div>` : '') +
+    `<details${rows ? '' : ' open'}><summary>原文</summary><pre>${esc(r.text)}</pre></details>`);
+  box.dataset.text = r.text;
+}
+$('#cm-info').addEventListener('click', async e => {
+  const box = $('#cm-info');
+  if (e.target.closest('[data-close]')) box.hidden = true;
+  else if (e.target.closest('[data-copy-info]')) { await navigator.clipboard?.writeText(box.dataset.text || '').catch(() => {}); toast('已复制'); }
+});
 // 发送 "/model xxx" "/effort xxx":网页处理;不带参数就打开候选
 async function slashIntercept(text) {
   const i = sg.info, t = text.trim();
+  if (i?.info_cmds?.includes(t)) {
+    runInfo(t);
+    cmText.value = ''; cmAutosize(); cmSaveDraft(true); sgClose();
+    return true;
+  }
   if (!i || i.cli === 'agy') return false;
   let m = /^\/model(?:\s+(\S+))?(?:\s+(\S+))?$/.exec(t);
   const e = /^\/effort(?:\s+(\S+))?$/.exec(t);
